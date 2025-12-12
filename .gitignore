@@ -1,0 +1,10 @@
+note.md
+data/
+
+*.env
+*.log
+*.pth
+*.pt
+
+**/node_modules/
+**/__pycache__/
