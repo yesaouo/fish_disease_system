@@ -2,26 +2,10 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import datetime
 from pathlib import Path
 from typing import Dict, List
-from copy import deepcopy
-
-DEFAULT_INFO = {
-    "description": "Merged COCO dataset",
-    "url": "",
-    "version": "1.0",
-    "year": 2025,
-    "contributor": "",
-    "date_created": ""
-}
-
-DEFAULT_LICENSES = [
-    {
-        "id": 1,
-        "name": "CC BY 4.0",
-        "url": "https://creativecommons.org/licenses/by/4.0/"
-    }
-]
+from tqdm import tqdm
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,7 +99,7 @@ def merge_coco_splits(
         id_map: Dict[int, int] = {}
         ds_name = ds_dir.name  # 用子資料夾名稱當前綴，避免檔名衝突
 
-        for img in coco.get("images", []):
+        for img in tqdm(coco.get("images", []), desc=f"  Merging {ds_name}", leave=False):
             old_id = img["id"]
             old_file_name = img["file_name"]
 
@@ -156,10 +140,21 @@ def merge_coco_splits(
         # 沒有任何子資料集有這個 split
         return False
 
+    current_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     merged_coco = {
-        # 這裡放我們自己創的 info / licenses
-        "info": deepcopy(DEFAULT_INFO),
-        "licenses": deepcopy(DEFAULT_LICENSES),
+        "info": {
+            "year": int(current_date.split("-")[0]),
+            "version": "1.0",
+            "description": "Merged Dataset",
+            "contributor": "Auto-Merger",
+            "url": "",
+            "date_created": current_date
+        },
+        "licenses": [{
+            "id": 1,
+            "name": "CC BY 4.0",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+        }],
         "images": merged_images,
         "annotations": merged_annotations,
         "categories": merged_categories,
@@ -170,6 +165,12 @@ def merge_coco_splits(
         json.dump(merged_coco, f, ensure_ascii=False, indent=2)
 
     print(f"[INFO] 已產生合併後標註：{out_ann_path}")
+    print(f"  [統計] split: {split}")
+    print(f"    - 來源資料集數量: {len(dataset_dirs)}")
+    print(f"    - 合併後圖片總數: {len(merged_images)}")
+    print(f"    - 合併後標註總數: {len(merged_annotations)}")
+    print(f"    - 類別數量: {len(merged_categories)}")
+
     return True
 
 
@@ -237,8 +238,6 @@ def main() -> None:
         raise NotADirectoryError(f"{root_dir} 不是一個資料夾")
 
     merged_dir = build_merged_dataset(root_dir, merged_name=args.merged_name)
-
-    print("\n[完成] 合併好的資料集路徑：", merged_dir)
 
 
 if __name__ == "__main__":
