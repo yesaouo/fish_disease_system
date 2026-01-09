@@ -56,14 +56,43 @@ def parse_args() -> argparse.Namespace:
 
 
 # =========================
-# 載入模型
+# 新增: 從 COCO JSON 讀取類別數量
 # =========================
-def load_model():
+def get_num_classes_from_coco(dataset_root: str) -> int:
+    """
+    嘗試從 train, valid, test 的 annotation 檔案中讀取 categories 數量。
+    """
+    # 優先順序: train -> valid -> test
+    splits_to_check = ["train", "valid", "test"]
+    
+    for split in splits_to_check:
+        ann_path = os.path.join(dataset_root, split, "_annotations.coco.json")
+        if os.path.exists(ann_path):
+            print(f"[INFO] Detecting num_classes from: {ann_path}")
+            try:
+                with open(ann_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    cats = data.get('categories', [])
+                    num_classes = len(cats)
+                    print(f"[INFO] Found {num_classes} categories: {[c['name'] for c in cats]}")
+                    return num_classes
+            except Exception as e:
+                print(f"[WARN] Failed to read {ann_path}: {e}")
+                continue
+    
+    raise FileNotFoundError(f"無法在 {dataset_root} 的任何 split 中找到 _annotations.coco.json 來確認 num_classes")
+
+
+# =========================
+# 載入模型 (修改: 接受 num_classes 參數)
+# =========================
+def load_model(num_classes: int):
     print(f"[INFO] Loading RFDETRMedium from {CHECKPOINT_PATH} ...")
-    # 這裡依據原本 valid_rfdetr.py 的寫法設定 num_classes=2
+    print(f"[INFO] Setting model num_classes = {num_classes}")
+    
     model = RFDETRMedium(
         pretrain_weights=CHECKPOINT_PATH,
-        num_classes=2,
+        num_classes=num_classes,  # 使用動態取得的數值
     )
     # RF-DETR 特有的優化
     model.optimize_for_inference(compile=False)
@@ -374,7 +403,16 @@ def main():
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"[ERROR] Checkpoint not found at {CHECKPOINT_PATH}")
         return
-    model = load_model()
+    
+    # === 新增：自動偵測 num_classes ===
+    try:
+        num_classes = get_num_classes_from_coco(DATA_ROOT)
+    except FileNotFoundError as e:
+        print(f"[ERROR] {e}")
+        return
+    # ==================================
+
+    model = load_model(num_classes)
 
     splits = ["train", "valid", "test"]
     all_metrics = {}

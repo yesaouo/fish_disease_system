@@ -13,9 +13,9 @@ def parse_args() -> argparse.Namespace:
                    help="訓練輸出資料夾（預設為 dataset_dir/outputs/rfdetr）")
 
     # 僅保留常用的幾個關鍵超參；其餘均交由 rfdetr 預設
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--grad_accum_steps", type=int, default=2)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     return p.parse_args()
 
@@ -28,7 +28,7 @@ def main() -> None:
         args.output_dir = os.path.join(args.dataset_dir, "outputs", "rfdetr")
     os.makedirs(args.output_dir, exist_ok=True)
     
-    model = RFDETRMedium(num_classes=2)
+    model = RFDETRMedium()
     
     model.train(
         dataset_dir=args.dataset_dir,
