@@ -31,7 +31,7 @@ IMGSZ = 640                 # 推論圖片大小
 # 解析參數
 # =========================
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate YOLOv8 with Consolidated Charts")
+    p = argparse.ArgumentParser(description="Evaluate YOLO with Consolidated Charts")
 
     p.add_argument(
         "--dataset_dir",
@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="輸出資料夾",
     )
+    p.add_argument(
+        "--model",
+        type=str,
+        default="yolo11s",
+        help="模型名稱或識別字串（用於命名輸出/顯示）",
+    )
 
     return p.parse_args()
 
@@ -59,7 +65,7 @@ def parse_args() -> argparse.Namespace:
 # 載入模型
 # =========================
 def load_model():
-    print(f"[INFO] Loading YOLOv8 model from {CHECKPOINT_PATH} ...")
+    print(f"[INFO] Loading YOLO model from {CHECKPOINT_PATH} ...")
     model = YOLO(CHECKPOINT_PATH)
     return model
 
@@ -341,7 +347,7 @@ def visualize_all_predictions(model, split: str, score_thresh: float = VIS_SCORE
                     bbox=dict(facecolor="black", alpha=0.3, pad=1))
 
         ax.set_axis_off()
-        ax.set_title(f"YOLOv8 {split} | id={img_id}")
+        ax.set_title(f"{args.model} {split} | id={img_id}")
         plt.tight_layout()
 
         file_basename = os.path.splitext(os.path.basename(img_info["file_name"]))[0]
@@ -362,12 +368,12 @@ def main():
     IMG_DIR_PATTERN = os.path.join(DATA_ROOT, "{split}")
 
     if args.checkpoint_path is None:
-        CHECKPOINT_PATH = os.path.join(DATA_ROOT, "outputs", "yolov8", "train", "weights", "best.pt")
+        CHECKPOINT_PATH = os.path.join(DATA_ROOT, "outputs", args.model, "train", "weights", "best.pt")
     else:
         CHECKPOINT_PATH = args.checkpoint_path
 
     if args.output_dir is None:
-        OUTPUT_DIR = os.path.join(DATA_ROOT, "outputs", "yolov8_eval")
+        OUTPUT_DIR = os.path.join(DATA_ROOT, "outputs", f"{args.model}_eval")
     else:
         OUTPUT_DIR = args.output_dir
     os.makedirs(OUTPUT_DIR, exist_ok=True)

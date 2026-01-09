@@ -6,7 +6,7 @@ from ultralytics import YOLO
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train YOLOv8 with Ultralytics")
+    p = argparse.ArgumentParser(description="Train YOLO with Ultralytics")
     p.add_argument(
         "--dataset_dir",
         type=str,
@@ -17,7 +17,13 @@ def parse_args() -> argparse.Namespace:
         "--output_dir",
         type=str,
         default=None,
-        help="訓練輸出資料夾（預設為 dataset_dir/outputs/yolov8）",
+        help="訓練輸出資料夾（預設為 dataset_dir/outputs/yolo11s）",
+    )
+    p.add_argument(
+        "--model",
+        type=str,
+        default="yolo11s",
+        help="模型名稱或權重路徑，例如 yolo11s、yolo8n、best.pt",
     )
     return p.parse_args()
 
@@ -25,9 +31,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # 若未指定 output_dir，則自動用 dataset_dir/outputs/yolov8
+    # 若未指定 output_dir，則自動用 dataset_dir/outputs/yolo11s
     if args.output_dir is None:
-        args.output_dir = os.path.join(args.dataset_dir, "outputs", "yolov8")
+        args.output_dir = os.path.join(args.dataset_dir, "outputs", args.model)
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 假設你的 YOLO data.yaml 放在 dataset_dir/data.yaml
@@ -35,8 +41,7 @@ def main() -> None:
     if not os.path.isfile(data_cfg):
         raise FileNotFoundError(f"找不到 data.yaml：{data_cfg}")
 
-    # 載入預訓練 YOLOv8 模型（你可以改成 yolov8m.pt / yolov8l.pt 等）
-    model = YOLO("yolov8s.pt")
+    model = YOLO(args.model if args.model.endswith(".pt") else f"{args.model}.pt")
 
     model.train(
         data=data_cfg,
