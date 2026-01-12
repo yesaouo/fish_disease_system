@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 import json
-import cv2
+from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -12,6 +12,7 @@ from ultralytics import YOLO
 
 import argparse
 from matplotlib import patches
+import itertools
 
 # =========================
 # 全域變數
@@ -24,6 +25,8 @@ OUTPUT_DIR = None
 
 INFER_SCORE_THRESH = 0.001  # 計算 mAP 用 (盡可能包含低分框)
 VIS_SCORE_THRESH = 0.3      # 視覺化繪圖用 (過濾雜訊)
+DECISION_SCORE_THRESH = 0.25   # 用來產生 confusion matrix / TPR / FPR
+IOU_MATCH_THRESH      = 0.45   # 用來判定是否命中 GT
 IMGSZ = 640                 # 推論圖片大小
 
 
@@ -31,7 +34,7 @@ IMGSZ = 640                 # 推論圖片大小
 # 解析參數
 # =========================
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate YOLO with Consolidated Charts")
+    p = argparse.ArgumentParser(description="Evaluate YOLO with Consolidated Charts and Confusion Matrix")
 
     p.add_argument(
         "--dataset_dir",
@@ -62,12 +65,230 @@ def parse_args() -> argparse.Namespace:
 
 
 # =========================
+# 從 COCO JSON 讀取類別數量
+# =========================
+def get_num_classes_from_coco(dataset_root: str) -> int:
+    splits_to_check = ["train", "valid", "test"]
+    for split in splits_to_check:
+        ann_path = os.path.join(dataset_root, split, "_annotations.coco.json")
+        if os.path.exists(ann_path):
+            print(f"[INFO] Detecting num_classes from: {ann_path}")
+            try:
+                with open(ann_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    cats = data.get('categories', [])
+                    num_classes = len(cats)
+                    print(f"[INFO] Found {num_classes} categories: {[c['name'] for c in cats]}")
+                    return num_classes
+            except Exception as e:
+                print(f"[WARN] Failed to read {ann_path}: {e}")
+                continue
+    
+    raise FileNotFoundError(f"無法在 {dataset_root} 的任何 split 中找到 _annotations.coco.json 來確認 num_classes")
+
+
+# =========================
 # 載入模型
 # =========================
 def load_model():
     print(f"[INFO] Loading YOLO model from {CHECKPOINT_PATH} ...")
     model = YOLO(CHECKPOINT_PATH)
     return model
+
+
+# =========================
+# 輔助函式: 計算 IoU
+# =========================
+def box_iou_numpy(boxes1, boxes2):
+    """
+    計算兩個 bbox 陣列的 IoU matrix。
+    boxes1: (N, 4) [x1, y1, x2, y2]
+    boxes2: (M, 4) [x1, y1, x2, y2]
+    Return: (N, M) IoU values
+    """
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+
+    lt = np.maximum(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
+    rb = np.minimum(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
+
+    wh = (rb - lt).clip(min=0)  # [N,M,2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
+
+    union = area1[:, None] + area2 - inter
+    return inter / union
+
+
+# =========================
+# Confusion Matrix 計算與繪製
+# =========================
+def compute_confusion_matrix(model, split: str, num_classes: int):
+    """
+    計算 Confusion Matrix。
+    矩陣大小為 (num_classes + 1) x (num_classes + 1)。
+    最後一個索引代表 'Background'。
+    Rows: Ground Truth
+    Cols: Predictions
+    """
+    ann_file = ANN_FILE_PATTERN.format(split=split)
+    img_dir = IMG_DIR_PATTERN.format(split=split)
+    
+    if not os.path.exists(ann_file):
+        print(f"[WARN] No annotation file for CM: {ann_file}")
+        return None, None
+
+    coco_gt = COCO(ann_file)
+    img_ids = coco_gt.getImgIds()
+    
+    # 取得類別名稱列表 (確保順序正確，根據 id 排序)
+    cats = coco_gt.loadCats(coco_gt.getCatIds())
+    cats = sorted(cats, key=lambda x: x['id'])
+    class_names = [c['name'] for c in cats]
+    class_names.append("Background") # 最後一類為背景
+
+    # 初始化 Confusion Matrix: (GT + Background) x (Pred + Background)
+    # confusion_matrix[gt_cls][pred_cls]
+    cm = np.zeros((num_classes + 1, num_classes + 1), dtype=np.int32)
+
+    for img_id in tqdm(img_ids, desc=f"Calculating CM ({split})"):
+        img_info = coco_gt.loadImgs(img_id)[0]
+        img_path = os.path.join(img_dir, img_info["file_name"])
+
+        img = load_image_pil(img_path)
+        if img is None: continue
+
+        # 1. 取得 Ground Truth
+        ann_ids = coco_gt.getAnnIds(imgIds=[img_id])
+        anns = coco_gt.loadAnns(ann_ids)
+        
+        gt_boxes = []
+        gt_classes = []
+        for ann in anns:
+            x, y, w, h = ann['bbox']
+            gt_boxes.append([x, y, x + w, y + h]) # 轉為 xyxy
+            cat_id = ann['category_id']
+            # 尋找 cat_id 在 cats 列表中的 index
+            cls_idx = next((i for i, c in enumerate(cats) if c['id'] == cat_id), -1)
+            gt_classes.append(cls_idx)
+        
+        gt_boxes = np.array(gt_boxes) if gt_boxes else np.empty((0, 4))
+        gt_classes = np.array(gt_classes, dtype=int)
+
+        # 2. 模型預測 (YOLO)
+        # 使用 DECISION_SCORE_THRESH 過濾預測
+        results = model.predict(img, imgsz=IMGSZ, conf=DECISION_SCORE_THRESH, verbose=False)
+        result = results[0]
+        
+        pred_boxes = result.boxes.xyxy.cpu().numpy()
+        pred_scores = result.boxes.conf.cpu().numpy()
+        pred_classes = result.boxes.cls.cpu().numpy()
+        
+        if len(pred_boxes) == 0:
+            # 只有 FN (所有 GT 都變成 Background)
+            for gt_cls in gt_classes:
+                cm[gt_cls, num_classes] += 1
+            continue
+
+        if len(gt_boxes) == 0:
+            # 只有 FP (所有 Pred 都來自 Background)
+            for pred_cls in pred_classes:
+                cm[num_classes, int(pred_cls)] += 1
+            continue
+
+        # 3. 計算 IoU Matrix [Num_Pred, Num_GT]
+        iou_mat = box_iou_numpy(pred_boxes, gt_boxes) # Shape: (N_pred, N_gt)
+
+        # 4. 匹配邏輯
+        gt_matched = np.zeros(len(gt_boxes), dtype=bool)
+        
+        # 對每個預測框進行檢查
+        for i, pred_cls in enumerate(pred_classes):
+            pred_cls = int(pred_cls)
+            
+            # 找出這個 Pred 與所有 GT 的最大 IoU
+            max_iou = -1
+            best_gt_idx = -1
+            
+            if iou_mat.shape[1] > 0:
+                max_iou = np.max(iou_mat[i])
+                best_gt_idx = np.argmax(iou_mat[i])
+
+            if max_iou >= IOU_MATCH_THRESH:
+                # 命中某個物體
+                if not gt_matched[best_gt_idx]:
+                    # 該 GT 尚未被其他 Pred 匹配 -> 這是 TP 或 Classification Error
+                    gt_cls = gt_classes[best_gt_idx]
+                    cm[gt_cls, pred_cls] += 1
+                    gt_matched[best_gt_idx] = True # 鎖定這個 GT
+                else:
+                    # 該 GT 已經被匹配過了 (Duplicate Detection) -> FP
+                    cm[num_classes, pred_cls] += 1
+            else:
+                # IoU 不夠高，或是根本沒撞到 -> FP
+                cm[num_classes, pred_cls] += 1
+
+        # 5. 處理剩下的 FN (未被匹配的 GT)
+        for i, gt_cls in enumerate(gt_classes):
+            if not gt_matched[i]:
+                # GT 存在但沒被檢出 -> FN
+                cm[gt_cls, num_classes] += 1
+
+    return cm, class_names
+
+
+def plot_confusion_matrix(cm, class_names, save_path, title='Confusion Matrix', normalize=False):
+    """
+    繪製並儲存 Confusion Matrix 圖像
+    """
+    if cm is None: return
+
+    # 計算正規化 (Normalized)
+    if normalize:
+        # 按行 (Row) 正規化：看該 GT 類別被預測成什麼的比例
+        row_sums = cm.sum(axis=1)[:, np.newaxis]
+        cm_norm = cm.astype('float') / (row_sums + 1e-9)
+        display_cm = cm_norm
+        fmt = '.2f'
+    else:
+        display_cm = cm
+        fmt = 'd'
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(display_cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+
+    ax.set(xticks=np.arange(cm.shape[1]),
+           yticks=np.arange(cm.shape[0]),
+           xticklabels=class_names, 
+           yticklabels=class_names,
+           title=title,
+           ylabel='True Label (Ground Truth)',
+           xlabel='Predicted Label')
+
+    # 旋轉 X 軸標籤以防重疊
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    # 在每個格子內標註數值
+    thresh = display_cm.max() / 2.
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        val = display_cm[i, j]
+        if normalize and val < 0.01:
+            continue
+        
+        color = "white" if val > thresh else "black"
+        ax.text(j, i, format(val, fmt),
+                ha="center", va="center",
+                color=color, fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"[INFO] Confusion Matrix saved to {save_path}")
+    
+    # 額外儲存原始數據 CSV
+    csv_path = save_path.replace('.png', '.csv')
+    np.savetxt(csv_path, cm, delimiter=",", fmt='%d')
+    print(f"[INFO] CM raw data saved to {csv_path}")
 
 
 # =========================
@@ -82,7 +303,6 @@ def summarize_coco_eval(coco_eval: COCOeval):
         "AP_small": float(s[3]),
         "AP_medium": float(s[4]),
         "AP_large": float(s[5]),
-        # AR 指標保留在 JSON 供查閱，不畫圖
         "AR_1": float(s[6]),
         "AR_10": float(s[7]),
         "AR_100": float(s[8]),
@@ -108,7 +328,7 @@ def evaluate_coco_split(model, split: str, score_thresh: float = INFER_SCORE_THR
     
     if not os.path.exists(ann_file):
         print(f"[WARN] Annotation file not found: {ann_file}. Skipping {split}.")
-        return None  # 回傳 None 代表該 split 不存在
+        return None
 
     coco_gt = COCO(ann_file)
     img_ids = coco_gt.getImgIds()
@@ -118,11 +338,10 @@ def evaluate_coco_split(model, split: str, score_thresh: float = INFER_SCORE_THR
         img_info = coco_gt.loadImgs(img_id)[0]
         img_path = os.path.join(img_dir, img_info["file_name"])
 
-        img = cv2.imread(img_path)
+        img = load_image_pil(img_path)
         if img is None: continue
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        results = model.predict(img_rgb, imgsz=IMGSZ, conf=score_thresh, verbose=False)
+        results = model.predict(img, imgsz=IMGSZ, conf=score_thresh, verbose=False)
         result = results[0]
 
         boxes = result.boxes.xyxy.cpu().numpy()
@@ -178,7 +397,6 @@ def analyze_size_distribution(split: str):
 # =========================
 
 def plot_mAP_summary(all_metrics, save_path):
-    """圖表 1: Train/Valid/Test 整體 mAP 比較"""
     splits = [s for s in ['train', 'valid', 'test'] if s in all_metrics and all_metrics[s] is not None]
     if not splits: return
 
@@ -193,7 +411,7 @@ def plot_mAP_summary(all_metrics, save_path):
     plt.bar(x + width/2, ap50_95, width, label='mAP@0.5:0.95', color='#f28e2b')
     
     plt.ylabel('Score (%)')
-    plt.title('Model Performance Summary (mAP)')
+    plt.title('YOLO Performance Summary (mAP)')
     plt.xticks(x, splits)
     plt.ylim(0, 100)
     plt.legend()
@@ -205,7 +423,6 @@ def plot_mAP_summary(all_metrics, save_path):
 
 
 def plot_ap_size_comparison(all_metrics, save_path):
-    """圖表 2: 各 Split 在不同物件大小上的 AP 表現 (分組長條圖)"""
     splits = [s for s in ['train', 'valid', 'test'] if s in all_metrics and all_metrics[s] is not None]
     if not splits: return
 
@@ -213,16 +430,13 @@ def plot_ap_size_comparison(all_metrics, save_path):
     size_labels = ['Small', 'Medium', 'Large']
     
     x = np.arange(len(sizes))
-    width = 0.25 # 每個 split 的 bar 寬度
+    width = 0.25 
     
     plt.figure(figsize=(10, 6))
-    
-    # 定義顏色
     colors = {'train': '#a0cbe8', 'valid': '#f28e2b', 'test': '#59a14f'}
 
     for i, split in enumerate(splits):
         values = [all_metrics[split][k] * 100 for k in sizes]
-        # 計算偏移量讓 bar 並排
         offset = (i - len(splits)/2 + 0.5) * width
         plt.bar(x + offset, values, width, label=split, color=colors.get(split, 'gray'))
 
@@ -239,7 +453,6 @@ def plot_ap_size_comparison(all_metrics, save_path):
 
 
 def plot_data_distribution_comparison(all_size_info, save_path):
-    """圖表 3: 各 Split 的物件大小分佈比例 (堆疊長條圖)"""
     splits = [s for s in ['train', 'valid', 'test'] if s in all_size_info and all_size_info[s] is not None]
     if not splits: return
 
@@ -251,21 +464,16 @@ def plot_data_distribution_comparison(all_size_info, save_path):
         d = all_size_info[s]
         total = d['count_small'] + d['count_medium'] + d['count_large']
         if total == 0:
-            small_ratios.append(0)
-            medium_ratios.append(0)
-            large_ratios.append(0)
+            small_ratios.append(0); medium_ratios.append(0); large_ratios.append(0)
         else:
             small_ratios.append(d['count_small'] / total * 100)
             medium_ratios.append(d['count_medium'] / total * 100)
             large_ratios.append(d['count_large'] / total * 100)
 
     x = splits
-    
     plt.figure(figsize=(8, 6))
-    # 堆疊繪製
     plt.bar(x, small_ratios, label='Small', color='#76b7b2')
     plt.bar(x, medium_ratios, bottom=small_ratios, label='Medium', color='#edc948')
-    # bottom 要累加
     bottom_large = [i+j for i,j in zip(small_ratios, medium_ratios)]
     plt.bar(x, large_ratios, bottom=bottom_large, label='Large', color='#e15759')
 
@@ -275,15 +483,11 @@ def plot_data_distribution_comparison(all_size_info, save_path):
     plt.legend(loc='upper right')
     plt.grid(axis='y', linestyle='--', alpha=0.3)
     
-    # 在 Bar 上標示數值
     for i, s in enumerate(splits):
-        # 標示 Small
         if small_ratios[i] > 5:
             plt.text(i, small_ratios[i]/2, f"{small_ratios[i]:.1f}%", ha='center', va='center', color='black', fontsize=9)
-        # 標示 Medium
         if medium_ratios[i] > 5:
             plt.text(i, small_ratios[i] + medium_ratios[i]/2, f"{medium_ratios[i]:.1f}%", ha='center', va='center', color='black', fontsize=9)
-        # 標示 Large
         if large_ratios[i] > 5:
             plt.text(i, small_ratios[i] + medium_ratios[i] + large_ratios[i]/2, f"{large_ratios[i]:.1f}%", ha='center', va='center', color='black', fontsize=9)
 
@@ -314,20 +518,19 @@ def visualize_all_predictions(model, split: str, score_thresh: float = VIS_SCORE
         img_info = coco_gt.loadImgs(img_id)[0]
         img_path = os.path.join(img_dir, img_info["file_name"])
         
-        img = cv2.imread(img_path)
+        img = load_image_pil(img_path)
         if img is None: continue
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         ann_ids = coco_gt.getAnnIds(imgIds=[img_id])
         anns = coco_gt.loadAnns(ann_ids)
 
-        results = model.predict(img_rgb, imgsz=IMGSZ, conf=score_thresh, verbose=False)
+        results = model.predict(img, imgsz=IMGSZ, conf=score_thresh, verbose=False)
         result = results[0]
         pred_boxes = result.boxes.xyxy.cpu().numpy()
         pred_scores = result.boxes.conf.cpu().numpy()
 
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-        ax.imshow(img_rgb)
+        ax.imshow(img)
 
         # GT (Lime)
         for ann in anns:
@@ -356,11 +559,21 @@ def visualize_all_predictions(model, split: str, score_thresh: float = VIS_SCORE
         plt.close(fig)
 
 
+def load_image_pil(img_path):
+    try:
+        # 開啟圖片並強制轉為 RGB (避免 RGBA 或 Grayscale 導致錯誤)
+        img = Image.open(img_path).convert('RGB')
+        return img
+    except Exception as e:
+        print(f"[WARN] Failed to load image {img_path}: {e}")
+        return None
+
+
 # =========================
 # Main
 # =========================
 def main():
-    global DATA_ROOT, ANN_FILE_PATTERN, IMG_DIR_PATTERN, CHECKPOINT_PATH, OUTPUT_DIR
+    global DATA_ROOT, ANN_FILE_PATTERN, IMG_DIR_PATTERN, CHECKPOINT_PATH, OUTPUT_DIR, args
 
     args = parse_args()
     DATA_ROOT = args.dataset_dir
@@ -384,8 +597,14 @@ def main():
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"[ERROR] Checkpoint not found at {CHECKPOINT_PATH}")
         return
-    model = load_model()
+    
+    try:
+        num_classes = get_num_classes_from_coco(DATA_ROOT)
+    except FileNotFoundError as e:
+        print(f"[ERROR] {e}")
+        return
 
+    model = load_model()
     splits = ["train", "valid", "test"]
     all_metrics = {}
     all_size_info = {}
@@ -394,11 +613,9 @@ def main():
     for split in splits:
         metrics = evaluate_coco_split(model, split)
         all_metrics[split] = metrics
-        
         size_info = analyze_size_distribution(split)
         all_size_info[split] = size_info
 
-    # 存下完整數據
     with open(os.path.join(OUTPUT_DIR, "metrics_all_splits.json"), "w") as f:
         json.dump(all_metrics, f, indent=2)
 
@@ -408,10 +625,20 @@ def main():
     plot_ap_size_comparison(all_metrics, os.path.join(OUTPUT_DIR, "Analysis_by_Size_Comparison.png"))
     plot_data_distribution_comparison(all_size_info, os.path.join(OUTPUT_DIR, "Data_Distribution_Comparison.png"))
 
-    # 3. 全量視覺化 (可視需求註解掉 train)
-    # visualize_all_predictions(model, split="train")
-    visualize_all_predictions(model, split="valid")
-    visualize_all_predictions(model, split="test")
+    # 3. 繪製 Confusion Matrix
+    target_cm_split = splits[2]
+    print(f"\n[INFO] Generating Confusion Matrix for split: {target_cm_split}")
+    cm, class_names = compute_confusion_matrix(model, target_cm_split, num_classes)
+    if cm is not None:
+        cm_save_path = os.path.join(OUTPUT_DIR, f"confusion_matrix_{target_cm_split}.png")
+        plot_confusion_matrix(cm, class_names, cm_save_path)
+        plot_confusion_matrix(cm, class_names, cm_save_path.replace('.png', '_normalized.png'), 
+                              title="Confusion Matrix Normalized", normalize=True)
+
+    # # 4. 全量視覺化
+    target_vis_split = splits[2]
+    print(f"\n[INFO] Visualizing all predictions for split: {target_vis_split}")
+    visualize_all_predictions(model, split=target_vis_split)
 
     print("\n=== Done. 評估完成 ===")
     print(f"圖表與結果已儲存至: {os.path.abspath(OUTPUT_DIR)}")
