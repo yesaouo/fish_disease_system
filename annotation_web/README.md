@@ -84,7 +84,7 @@ If you need to serve the app under a subpath (for example `https://example.com/f
   - If using a reverse proxy (nginx), also forward `X-Forwarded-Prefix: /fish`.
 
 - Frontend (Vite + React):
-  - Set the Vite `base` option in `frontend/vite.config.ts` (must end with a slash), for example `base: "/fish/"`, so assets and router paths are generated under the subpath. The current repo default is `"/fish_disease_diagnosis/"`—change it if you serve from another path.
+  - Set the Vite `base` option in `frontend/vite.config.ts` (must end with a slash), for example `base: "/fish/"`, so assets and router paths are generated under the subpath. The current repo default is `"/annotation_web/"`—change it if you serve from another path.
   - The router and API client are wired to honor `import.meta.env.BASE_URL`, so navigation and API calls use `/fish/...` automatically.
 
 - Proxy example (nginx):
@@ -99,6 +99,7 @@ With the above, the UI runs at `/fish/`, API at `/fish/api/*`, and image links r
 - `POST /api/login` – returns `{token, name}`; use `Authorization: Bearer <token>`
 - `GET /api/datasets` / `GET /api/datasets/{dataset}/classes`
 - `GET /api/datasets/{dataset}/labels_zh` – English→Chinese label mapping (if available)
+- `GET /api/datasets/{dataset}/evidence_options_zh` – evidence caption options per label (Chinese preferred)
 - `GET /api/datasets/{dataset}/annotated` – tasks that have been edited, sorted by last modified
 - `GET /api/datasets/{dataset}/commented` – tasks with comments, sorted by last modified
 - `POST /api/tasks/next` – random dispatch among untouched tasks
@@ -122,7 +123,7 @@ All writes are atomic (temp file + rename). Audit entries append to `<DATA_ROOT>
 - Dataset picker loads class list from `symptoms.json` (falling back to `classes.txt` if needed); selection persisted locally
 - Annotation workspace
   - `react-konva` canvas with drag/resize in normalized 0–1000 coordinates
-  - Side panel for label + evidence; ordered global causes/treatments
+  - Side panel for label + evidence (dropdown); ordered global causes/treatments
   - Shortcuts: `N` add, `Del` remove, `S` submit, `K` skip, `Ctrl+Z/Y` undo/redo
   - Validation for boxes, labels, and list constraints before submission
   - Skip reasons: `暫時跳過` / `無法辨識`

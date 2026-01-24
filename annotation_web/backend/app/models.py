@@ -32,6 +32,7 @@ class Detection(BaseModel):
     box_xyxy: List[int]
     confidence: Optional[float] = None
     evidence_zh: str = ""
+    evidence_index: Optional[int] = None
 
     @field_validator("label", mode="before")
     def _clean_label(cls, value: Any) -> str:
@@ -44,6 +45,18 @@ class Detection(BaseModel):
         if value is None:
             return ""
         return str(value).replace("\n", " ").strip()
+
+    @field_validator("evidence_index", mode="before")
+    def _validate_evidence_index(cls, value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            idx = int(value)
+        except Exception as exc:
+            raise ValueError("evidence_index must be an integer") from exc
+        if idx < 0:
+            raise ValueError("evidence_index must be >= 0")
+        return idx
 
     @field_validator("box_xyxy", mode="before")
     def _validate_box(cls, value: Any) -> List[int]:
@@ -336,3 +349,6 @@ class CommentedListResponse(BaseModel):
 
 
 # NPUST symptoms mapping response
+class EvidenceOptionsZhResponse(BaseModel):
+    # Mapping from English class value to evidence caption options (Chinese preferred)
+    evidence_options_zh: Dict[str, List[str]]

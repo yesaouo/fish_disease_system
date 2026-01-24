@@ -69,7 +69,18 @@ export const validateTaskDocument = (
         message: `需選擇表徵類別`
       });
     }
-    // evidence_zh 改為選填，不做強制檢查
+    if (det.label && classes.length > 0 && !classSet.has(det.label)) {
+      errors.push({
+        field: `detections.${idx}.label`,
+        message: `表徵類別不在清單中`
+      });
+    }
+    if (det.label && det.evidence_index == null) {
+      errors.push({
+        field: `detections.${idx}.evidence_index`,
+        message: `需選擇外觀敘述`
+      });
+    }
   });
 
   const seenCauses = new Set<string>();
@@ -115,8 +126,7 @@ export const ensureSingleLine = (value: string) =>
 export const defaultDetection = (
   imageWidth: number,
   imageHeight: number,
-  label?: string,
-  evidence?: string
+  label?: string
 ): Detection => {
   const safeWidth = Math.max(1, Math.round(imageWidth || 1000));
   const safeHeight = Math.max(1, Math.round(imageHeight || 1000));
@@ -127,7 +137,8 @@ export const defaultDetection = (
 
   return {
     label: label ?? "",
-    evidence_zh: evidence ?? "",
+    evidence_zh: "",
+    evidence_index: null,
     box_xyxy: normalizeBox(
       x1,
       y1,

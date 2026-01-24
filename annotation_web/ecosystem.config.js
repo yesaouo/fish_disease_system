@@ -1,41 +1,49 @@
+const path = require("path");
+
+// conda info --base
+const CONDA_BASE = "/opt/miniconda3";           // 改成你的 conda base
+const CONDA_ENV  = "annotation_web";            // 固定 conda env 名稱
+const LOG_ROOT   = "/opt/data/annotation/logs"; // 固定 log 目錄
+
+// conda 可執行檔路徑
+const CONDA =
+  process.platform === "win32"
+    ? path.join(CONDA_BASE, "Scripts", "conda.exe")
+    : path.join(CONDA_BASE, "bin", "conda");
+
 module.exports = {
   apps: [
     {
       name: "backend",
       cwd: "./backend",
-      // 用 uvicorn 啟動 FastAPI
-      script: "uvicorn",
-      // 將原本參數搬過來（是否用 --reload 視你的需求，見下方說明）
-      args: "app.main:app --host 0.0.0.0 --port 5174 --reload",
-      interpreter: "python3", // 或填入絕對路徑，例如 /usr/bin/python3
-      watch: false,           // 若想由 PM2 監控檔案變動可改為 true（記得搭配 ignore_watch）
-      env: {
-        // 在這裡放後端需要的環境變數
-        // NODE_ENV: "development"
-      },
-      out_file: "backend.log",    // 與你原本相同的檔名
-      error_file: "backend.err.log",
+      script: CONDA,
+      args: `run -n ${CONDA_ENV} python -m uvicorn app.main:app --host 0.0.0.0 --port 5174`,
+      watch: false,
+      env: { NODE_ENV: "production" },
+
+      out_file: path.join(LOG_ROOT, "backend.log"),
+      error_file: path.join(LOG_ROOT, "backend.err.log"),
       merge_logs: true,
       max_memory_restart: "512M",
       instances: 1,
-      exec_mode: "fork"
+      exec_mode: "fork",
+      autorestart: true,
     },
     {
       name: "frontend",
       cwd: "./frontend",
-      // 直接用專案內的 Vite 執行檔
       script: "node",
-      args: "./node_modules/vite/bin/vite.js --host --port 5173",
-      watch: false,        // dev server 自己會熱更新，通常不需要 PM2 watch
-      env: {
-        // 前端需要的環境變數放這裡
-      },
-      out_file: "frontend.log",
-      error_file: "frontend.err.log",
+      args: "./node_modules/vite/bin/vite.js --host 0.0.0.0 --port 5173",
+      watch: false,
+      env: { NODE_ENV: "production" },
+
+      out_file: path.join(LOG_ROOT, "frontend.log"),
+      error_file: path.join(LOG_ROOT, "frontend.err.log"),
       merge_logs: true,
       max_memory_restart: "512M",
       instances: 1,
-      exec_mode: "fork"
-    }
-  ]
-}
+      exec_mode: "fork",
+      autorestart: true,
+    },
+  ],
+};

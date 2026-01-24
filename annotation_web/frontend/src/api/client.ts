@@ -10,6 +10,7 @@ import type {
   SubmitTaskRequest,
   SubmitTaskResponse,
   LabelMapZhResponse,
+  EvidenceOptionsZhResponse,
   SaveTaskRequest,
   SaveTaskResponse,
   AnnotatedListResponse,
@@ -154,6 +155,15 @@ export const fetchLabelMapZh = async (
     `/datasets/${encodeURIComponent(dataset)}/labels_zh`
   );
   return data.label_map_zh;
+};
+
+export const fetchEvidenceOptionsZh = async (
+  dataset: string
+): Promise<Record<string, string[]>> => {
+  const { data } = await http.get<EvidenceOptionsZhResponse>(
+    `/datasets/${encodeURIComponent(dataset)}/evidence_options_zh`
+  );
+  return data.evidence_options_zh;
 };
 
 export const fetchAnnotatedList = async (

@@ -1,6 +1,7 @@
 export type Detection = {
   label: string;
   evidence_zh?: string;
+  evidence_index?: number | null;
   box_xyxy: [number, number, number, number];
   confidence?: number;
 };
@@ -135,4 +136,6 @@ export type LabelMapZhResponse = {
   label_map_zh: Record<string, string>;
 };
 
-// NPUST symptoms mapping types
+export type EvidenceOptionsZhResponse = {
+  evidence_options_zh: Record<string, string[]>;
+};

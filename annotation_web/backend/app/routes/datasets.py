@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 
 from .. import dependencies
 from ..config import Settings
-from ..models import ClassesResponse, DatasetListResponse, LabelMapZhResponse, AnnotatedListResponse, AnnotatedItem, CommentedListResponse, CommentedItem
+from ..models import ClassesResponse, DatasetListResponse, LabelMapZhResponse, EvidenceOptionsZhResponse, AnnotatedListResponse, AnnotatedItem, CommentedListResponse, CommentedItem
 from ..services import datasets as datasets_service
 from ..services import storage as storage_service
 
@@ -72,6 +72,16 @@ def get_label_map_zh(
 ) -> LabelMapZhResponse:
     mapping = datasets_service.load_label_map_zh(dataset, settings)
     return LabelMapZhResponse(label_map_zh=mapping)
+
+
+@router.get("/datasets/{dataset}/evidence_options_zh", response_model=EvidenceOptionsZhResponse)
+def get_evidence_options_zh(
+    dataset: str,
+    settings: Settings = Depends(dependencies.get_app_settings),
+    _token: str = Depends(dependencies.require_api_key),
+) -> EvidenceOptionsZhResponse:
+    mapping = datasets_service.load_evidence_options_zh(dataset, settings)
+    return EvidenceOptionsZhResponse(evidence_options_zh=mapping)
 
 
 

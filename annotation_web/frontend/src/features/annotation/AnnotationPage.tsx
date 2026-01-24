@@ -3,7 +3,7 @@ import { AxiosError } from "axios";
 import { useCallback, useContext, useEffect, useMemo, useReducer, useState, useRef } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { UNSAFE_NavigationContext as NavigationContext } from "react-router";
-import { fetchNextTask, skipTask, submitTask, fetchClasses, fetchLabelMapZh, fetchTaskByIndex, saveTask } from "../../api/client";
+import { fetchNextTask, skipTask, submitTask, fetchClasses, fetchLabelMapZh, fetchEvidenceOptionsZh, fetchTaskByIndex, saveTask } from "../../api/client";
 import type {
   NextTaskResponse,
   TaskDocument
@@ -319,7 +319,8 @@ const AnnotationPage: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [labelMapZh, setLabelMapZh] = useState<Record<string, string>>({});
-  // 以 symptoms.json 派生的類別清單供應標籤；證據說明為自由輸入
+  const [evidenceOptionsZh, setEvidenceOptionsZh] = useState<Record<string, string[]>>({});
+  // 以 symptoms.json 派生的類別清單供應標籤；外觀敘述改為下拉選單（顯示中文、保存 index）
   const [commentDraft, setCommentDraft] = useState("");
 
   // 自動在 6 秒後清除 server/network 錯誤訊息（不影響驗證錯誤 Banner）
@@ -330,8 +331,8 @@ const AnnotationPage: React.FC = () => {
   }, [error]);
 
   // Refs for error-jump UX
-  const labelRef = useRef<HTMLElement | null>(null);
-  const evidenceRef = useRef<HTMLElement | null>(null);
+  const labelRef = useRef<HTMLSelectElement | null>(null);
+  const evidenceRef = useRef<HTMLSelectElement | null>(null);
   const listItemRefs = useRef<Record<number, HTMLButtonElement | null>>({});
 
   // ✅ 只在我們允許的短時間內放行導頁（例如提交成功後）
@@ -408,22 +409,26 @@ const AnnotationPage: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key]);
 
-  // Ensure classes and zh label map are loaded
+  // Ensure dataset metadata (classes + zh mapping + evidence options) are loaded
   useEffect(() => {
-    const loadClasses = async () => {
+    const loadDatasetMeta = async () => {
       if (!dataset) return;
       try {
         if (classes.length === 0) {
           const cls = await fetchClasses(dataset);
           setClasses(cls);
         }
-        const map = await fetchLabelMapZh(dataset);
+        const [map, evidenceOpts] = await Promise.all([
+          fetchLabelMapZh(dataset),
+          fetchEvidenceOptionsZh(dataset),
+        ]);
         setLabelMapZh(map);
+        setEvidenceOptionsZh(evidenceOpts);
       } catch (err) {
         console.error("Failed to load classes/labels for dataset", dataset, err);
       }
     };
-    void loadClasses();
+    void loadDatasetMeta();
   }, [dataset, classes.length, setClasses]);
 
   const getDisplayLabel = useCallback(
@@ -496,12 +501,11 @@ const AnnotationPage: React.FC = () => {
           selectedIndex != null && draft.detections[selectedIndex]
             ? draft.detections[selectedIndex]
             : undefined;
-        // Default to previous detection's selections if exists; otherwise leave empty
+        // Default to previous detection's label if exists; evidence must be selected each time
         const det = defaultDetection(
           draft.image_width,
           draft.image_height,
-          (prev as any)?.label,
-          (prev as any)?.evidence_zh
+          (prev as any)?.label
         );
         draft.detections.push(det);
       },
@@ -550,7 +554,7 @@ const AnnotationPage: React.FC = () => {
     const m = /^detections\.(\d+)\.(.+)$/.exec(first.field);
     if (!m) return;
     const idx = Number(m[1]);
-    const field = m[2]; // e.g., label or evidence_zh
+    const field = m[2]; // e.g., label or evidence_index
     dispatch({ type: "SET_SELECTED", index: idx });
     // Scroll list item into view
     const el = listItemRefs.current[idx];
@@ -559,7 +563,7 @@ const AnnotationPage: React.FC = () => {
     }
     // Focus appropriate control after DOM updates
     setTimeout(() => {
-      if (field.includes("evidence_zh")) {
+      if (field.includes("evidence_index")) {
         evidenceRef.current?.focus();
       } else if (field.includes("label")) {
         labelRef.current?.focus();
@@ -572,7 +576,7 @@ const AnnotationPage: React.FC = () => {
 
   const handleDetectionField = (
     index: number,
-    field: "label" | "evidence_zh",
+    field: "label" | "evidence_index",
     value: string
   ) => {
     updateDoc((draft) => {
@@ -580,8 +584,14 @@ const AnnotationPage: React.FC = () => {
       if (!target) return;
       if (field === "label") {
         target.label = value;
+        target.evidence_index = null;
       } else {
-        target.evidence_zh = ensureSingleLine(value);
+        if (!value) {
+          target.evidence_index = null;
+          return;
+        }
+        const parsed = Number.parseInt(value, 10);
+        target.evidence_index = Number.isFinite(parsed) ? parsed : null;
       }
     });
   };
@@ -1320,23 +1330,34 @@ const AnnotationPage: React.FC = () => {
                     <option key={cls} value={cls}>{getDisplayLabel(cls)}</option>
                   ))}
                 </select>
-                <label className="mb-2 block text-sm font-medium text-slate-600">外觀敘述（選填）</label>
-                <textarea
+                <label className="mb-2 block text-sm font-medium text-slate-600">外觀敘述</label>
+                <select
                   ref={(el) => { evidenceRef.current = el; }}
-                  rows={3}
-                  value={selectedDetection.evidence_zh ?? ""}
-                  onChange={(e) => handleDetectionField(selectedIndex, "evidence_zh", e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); } }}
-                  className={`w-full min-h-[6rem] resize-y rounded border px-3 py-2 leading-relaxed focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 ${
-                    detectionErrors.get(`detections.${selectedIndex}.evidence_zh`)
+                  value={selectedDetection.evidence_index == null ? "" : String(selectedDetection.evidence_index)}
+                  onChange={(e) => handleDetectionField(selectedIndex, "evidence_index", e.target.value)}
+                  disabled={!selectedDetection.label}
+                  className={`w-full rounded border px-3 py-2 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 ${
+                    detectionErrors.get(`detections.${selectedIndex}.evidence_index`)
                       ? "border-red-400"
                       : "border-slate-300"
                   }`}
-                  placeholder="請輸入外觀敘述（Enter 不換行）"
-                />
-                {detectionErrors.get(`detections.${selectedIndex}.evidence_zh`) && (
+                >
+                  <option value="" disabled>
+                    {!selectedDetection.label
+                      ? "請先選擇類別"
+                      : (evidenceOptionsZh[selectedDetection.label] || []).length
+                        ? "選擇外觀敘述"
+                        : "（此類別沒有外觀敘述選項）"}
+                  </option>
+                  {(evidenceOptionsZh[selectedDetection.label] || []).map((txt, i) => (
+                    <option key={`${selectedDetection.label}-${i}`} value={i}>
+                      {txt}
+                    </option>
+                  ))}
+                </select>
+                {detectionErrors.get(`detections.${selectedIndex}.evidence_index`) && (
                   <p className="mt-2 text-sm text-red-500">
-                    {detectionErrors.get(`detections.${selectedIndex}.evidence_zh`)}
+                    {detectionErrors.get(`detections.${selectedIndex}.evidence_index`)}
                   </p>
                 )}
               </div>

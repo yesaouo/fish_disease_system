@@ -1,5 +1,5 @@
-note.md
 data/
+note/
 
 *.env
 *.log

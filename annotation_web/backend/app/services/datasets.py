@@ -16,6 +16,7 @@ _settings = get_settings()
 _datasets_cache = TTLCache[str, List[str]](_settings.dataset_cache_seconds)
 _classes_cache = TTLCache[str, Tuple[float, List[str]]](_settings.classes_cache_seconds)
 _label_map_cache = TTLCache[str, Tuple[float, Dict[str, str]]](_settings.classes_cache_seconds)
+_evidence_options_cache = TTLCache[str, Tuple[float, Dict[str, List[str]]]](_settings.classes_cache_seconds)
 
 
 def _ensure_settings(settings: Settings | None) -> Settings:
@@ -143,5 +144,67 @@ def load_label_map_zh(dataset: str, settings: Settings | None = None) -> Dict[st
     if current_mtime != mtime:
         _label_map_cache.clear(dataset)
         mtime, mapping = _label_map_cache.get_or_set(dataset, loader)
+
+    return mapping
+
+
+def load_evidence_options_zh(dataset: str, settings: Settings | None = None) -> Dict[str, List[str]]:
+    """Load evidence caption options (Chinese preferred) for a dataset.
+
+    Reads symptoms.json under the dataset directory and converts its label_map + data
+    sections into a mapping: `en_label` -> `captions_zh[]` (falling back to captions_en).
+    """
+    settings = _ensure_settings(settings)
+    dataset_dir = resolve_dataset_path(dataset, settings)
+    json_path = dataset_dir / "symptoms.json"
+    if not json_path.exists():
+        return {}
+
+    def loader() -> Tuple[float, Dict[str, List[str]]]:
+        try:
+            raw = json.loads(json_path.read_text(encoding="utf-8"))
+            label_map = raw.get("label_map") or {}
+            data = raw.get("data") or {}
+
+            result: Dict[str, List[str]] = {}
+            for _id, entry in label_map.items():
+                if not isinstance(entry, dict):
+                    continue
+                en = entry.get("en")
+                if not isinstance(en, str):
+                    continue
+                en = en.strip()
+                if not en:
+                    continue
+
+                data_entry = data.get(_id) if isinstance(data, dict) else None
+                captions: List[str] = []
+
+                if isinstance(data_entry, dict):
+                    raw_caps = data_entry.get("captions_zh")
+                    if not isinstance(raw_caps, list) or not raw_caps:
+                        raw_caps = data_entry.get("captions_en")
+                    if isinstance(raw_caps, list):
+                        for cap in raw_caps:
+                            if cap is None:
+                                continue
+                            text = str(cap).replace("\n", " ").strip()
+                            if text:
+                                captions.append(text)
+
+                result[en] = captions
+
+            return (json_path.stat().st_mtime, result)
+        except Exception:
+            # On error, fall back to empty mapping so frontend can still work
+            return (json_path.stat().st_mtime if json_path.exists() else 0.0, {})
+
+    cached = _evidence_options_cache.get_or_set(dataset, loader)
+    mtime, mapping = cached
+
+    current_mtime = json_path.stat().st_mtime
+    if current_mtime != mtime:
+        _evidence_options_cache.clear(dataset)
+        mtime, mapping = _evidence_options_cache.get_or_set(dataset, loader)
 
     return mapping

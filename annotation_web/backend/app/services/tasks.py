@@ -133,19 +133,48 @@ def select_next_task(
     )
 
 
-def validate_labels(dataset: str, document: TaskDocument, classes: List[str], settings: Settings | None = None) -> None:
-    """Validate detection labels against the configured class list.
+def validate_detections(
+    dataset: str,
+    document: TaskDocument,
+    classes: List[str],
+    *,
+    require_evidence_index: bool,
+    settings: Settings | None = None,
+) -> None:
+    """Validate detection labels (and evidence index, if required) against dataset config.
 
-    The class list is derived from `symptoms.json` (preferred) or `classes.txt`
-    under the dataset directory.
+    - Allowed labels come from `symptoms.json` (preferred) or legacy `classes.txt`.
+    - Evidence options are derived from `symptoms.json` and validated by index.
     """
     settings = _ensure_settings(settings)
     allowed = set(classes)
+    evidence_options = datasets_service.load_evidence_options_zh(dataset, settings)
+
     for det in document.detections:
         if det.label not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"label {det.label} 不在症狀類別清單中",
+            )
+
+        if det.evidence_index is None:
+            if require_evidence_index:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="外觀敘述未選擇（請從下拉選單選一項）",
+                )
+            continue
+
+        options = evidence_options.get(det.label) or []
+        if not options:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"label {det.label} 未提供外觀敘述選項（請檢查 symptoms.json:data）",
+            )
+        if det.evidence_index < 0 or det.evidence_index >= len(options):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"evidence_index {det.evidence_index} 超出範圍（0-{len(options) - 1}）",
             )
 
 
@@ -161,7 +190,7 @@ def submit_task(
     current = storage_service.load_task(dataset, task_id, settings)
 
     classes = datasets_service.load_classes(dataset, settings)
-    validate_labels(dataset, incoming, classes, settings)
+    validate_detections(dataset, incoming, classes, require_evidence_index=True, settings=settings)
 
     now = _now_iso()
 
@@ -261,7 +290,7 @@ def save_task(
     settings = _ensure_settings(settings)
     current = storage_service.load_task(dataset, task_id, settings)
     classes = datasets_service.load_classes(dataset, settings)
-    validate_labels(dataset, incoming, classes, settings)
+    validate_detections(dataset, incoming, classes, require_evidence_index=False, settings=settings)
 
     now = _now_iso()
     updated = incoming.model_copy()
