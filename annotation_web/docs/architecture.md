@@ -5,51 +5,51 @@ The system comprises a FastAPI backend serving JSON tasks and image streams from
 
 ## Backend (FastAPI)
 - `app/main.py`: FastAPI entrypoint, middleware (CORS off by default), and router registration.
-- `app/config.py`: Environment-driven settings (e.g., `DATA_ROOT`, `REVISIT_PROBABILITY`, cache TTLs).
+- `app/config.py`: Environment-driven settings (e.g., `DATA_ROOT`, `ROOT_PATH`, cache TTLs, backup settings).
 - `app/models.py`: Pydantic schemas for requests/responses, internal task metadata, and validation.
+- `app/routes/*`: API routers (`/api/login`, `/api/tasks/*`, `/api/datasets/*`, `/api/*/stats`).
 - `app/services/datasets.py`: Dataset discovery, class loading from `symptoms.json` (or legacy `classes.txt`) with timestamp-aware caching.
-- `app/services/tasks.py`: Task cataloguing, dispatch algorithm (5% light revisit), version conflict checks, JSON normalization, skip handling, and per-user exclusion of "unrecognizable" tasks.
+- `app/services/tasks.py`: Task cataloguing, dispatch algorithm, and submit/save/skip flows.
 - `app/services/storage.py`: Atomic JSON writes via temp files, audit-log append, and image path resolution.
 - `app/services/stats.py`: Aggregated statistics with 60s in-memory cache and CSV rendering helpers.
+- `app/services/backup.py`: Idle-time backup worker that snapshots annotation JSON files.
 - `app/utils/cache.py`: Shared memoization utilities keyed by dataset with TTL.
 - `app/dependencies.py`: Common dependency providers (e.g., dataset validator, settings injection).
 
 Data model notes:
-- Each task corresponds to `{DATA_ROOT}/{dataset}/annotations/{stem}.json`.
-- Images resolve via `{stem}` stem lookup within allowed extensions (`IMAGE_EXTS` from settings).
-- JSON normalization ensures all system-managed fields (`dataset`, `version`, `editors`, etc.) exist; coordinate validation enforces integer 0-1000 bounds and ordering.
-- Audit log stored at `{DATA_ROOT}/audit_log.jsonl` with append-only atomic writes.
-- Do not persist `skip_history` in annotations; use `unrecognizable_users` to record users who marked the image as "unrecognizable".
+- Each task corresponds to `{DATA_ROOT}/{dataset}/annotations/{stem}.json` and references an image under `{DATA_ROOT}/{dataset}/images/`.
+- On submit, a snapshot is written to `{DATA_ROOT}/{dataset}/annotations_versions/{stem}_vN.json` (monotonically increasing per image).
+- Task JSON uses role editors: `general_editor` / `expert_editor` (single editor name per role).
+- Detection boxes are stored in `box_xyxy` as pixel coordinates and validated against `image_width` / `image_height`.
+- Legacy inputs are normalized on load (e.g., `box_2d` -> `box_xyxy`, `main_category/sub_category` -> `label/evidence_zh`).
+- Audit log is stored at `{DATA_ROOT}/audit_log.jsonl` (append-only).
 
 ## Frontend (Vite + React + TypeScript)
-- Directory `frontend/` contains Vite project with Tailwind + shadcn UI and `react-konva` for canvas rendering.
-- `src/app.tsx`: Router setup (login, dataset selection, annotation workspace, admin dashboard).
+- Directory `frontend/` contains Vite project with Tailwind CSS and `react-konva` for canvas rendering.
+- `src/App.tsx`: Router setup (login, dataset selection, annotation workspace, admin dashboard).
 - `src/api/client.ts`: Fetch wrapper with token handling and TypeScript interfaces (mirroring backend schemas).
 - `src/features/auth`: Name entry page storing display name in `localStorage`.
 - `src/features/datasets`: Dataset picker, class list management, and React Query hooks for caches.
 - `src/features/annotation`: Main workspace with canvas layer (Konva stage), bounding box editing tools, side panel forms, keyboard shortcuts, validation feedback, submit/skip flows.
-- `src/features/admin`: Admin metrics view with charts/table and CSV export trigger.
-- Shared utilities for coordinate transforms between normalized (0-1000) and pixel space, validation helpers, and drag-and-drop ordering for global causes/treatments.
+- `src/features/admin`: Admin metrics view (tables + CSV export).
+- Shared utilities for coordinate clamping/normalization, validation helpers, and ordered list editing (▲/▼ buttons) for global causes/treatments.
 
 ## Task Dispatch Algorithm
-- First exclude any tasks the requesting user previously marked as "unrecognizable" (via `unrecognizable_users`).
-- Split the remaining tasks into two buckets:
-  - A: `editors` is empty (never edited).
-  - B: previously edited and `editors` does not include the current user.
-- On each `/tasks/next` call: with probability `p=REVISIT_PROBABILITY` (default 0.05) choose randomly from B (fallback to A). Otherwise choose from A (fallback to B). Tasks missing JSON are skipped silently; missing images return HTTP 404 and are recorded in the audit log.
+- `/api/tasks/next` scans all `{dataset}/annotations/*.json` and returns a random candidate.
+- A task is considered dispatchable when `expert_editor` is empty and the requesting user is not already the `general_editor` or `expert_editor` for that task.
+- General and expert roles share the same candidate pool (tasks pending expert review); the difference is which editor field gets set on submit (`general_editor` vs `expert_editor`).
+- `/api/tasks/by_index` returns a task by 1-based index in the sorted `annotations/*.json` list.
 
-## Concurrency & Versioning
-- Clients submit `base_version`; backend compares to JSON’s `version`. Mismatch -> HTTP 409 and no write.
-- Successful submit increments version, appends editor name to `editors` (deduped), and appends a new `edit_history` entry.
-- Skip actions do not change version:
-  - Skip: only move to the next task; nothing is written to annotations (an audit log entry is still appended).
-  - Unrecognizable: add the user to `unrecognizable_users` and save (also append to audit log); the task will not be assigned to that user again.
-- Special case: submissions by username `test` save content and append to audit log but do not increment `version`, and do not modify `editors`/`edit_history`.
+## Editing Model
+- `submit`: sets the role editor (`general_editor` or `expert_editor`), saves the task JSON, writes a version snapshot, and appends an audit entry.
+- `save`: saves the task JSON without changing editor fields (does not mark completion).
+- `skip`: appends an audit entry only (no task JSON is modified).
+- No optimistic concurrency (no `version`/`base_version` checks): last write wins.
 
 ## Caching & Performance
 - In-memory caches keyed by dataset for classes list and statistics with configurable TTL (default 60s).
 - Dataset listing caches root directory snapshot for TTL.
-- All writes occur via `NamedTemporaryFile` followed by `os.replace` for atomicity (NFS-safe).
+- All JSON writes occur via a temp file followed by `os.replace` for atomicity.
 
 ## Security & Validation
 - Display names validated to contain only CJK/Latin letters (no digits/punctuation).
@@ -57,8 +57,9 @@ Data model notes:
 - Image responses stream file contents with correct MIME type; no external URLs.
 
 ## Deployment Notes
-- Docker compose with services: `frontend`, `backend`, and `nginx` (static frontend + reverse proxy).
-- Environment variables supply roots and probabilities; defaults align with spec.
+- Dev: run backend (Uvicorn) + frontend (Vite); Vite proxies `/api` to the backend to avoid CORS.
+- Production (example): run both via PM2 using `ecosystem.config.js` (backend + frontend processes).
+- Environment variables supply data root, cache TTLs, and backup settings.
 - Idle backup (optional): when no annotations occur for a configured idle window, the backend snapshots `annotations` for all datasets into a timestamped folder under `{DATA_ROOT}/backup/YYYYMMDD-HHMMSS/`. Controlled by env:
   - `IDLE_BACKUP_ENABLED` (default `true`)
   - `IDLE_BACKUP_SECONDS` (default `21600`, i.e. 6 hours)

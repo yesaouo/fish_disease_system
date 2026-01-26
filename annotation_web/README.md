@@ -2,12 +2,14 @@
 
 Expert-facing annotation platform for fish disease labeling. Backend is FastAPI (file-backed JSON tasks + images under `data/` with audit logging and atomic writes); frontend is React + Vite for bounding-box editing, label management, and basic admin metrics.
 
+中文說明：`README_zh.md`
+
 ## Prerequisites
 
 - Python 3.11+
 - Node.js 18+ and `npm`
+- Recommended: Conda/Mamba (lets you manage Python + Node.js in one env)
 - Datasets under `data/{dataset}` with images and JSON cache
-- Optional: Conda on Windows (see `docs/start.md`)
 
 ## Quick Start
 
@@ -27,24 +29,61 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```bash
 cd frontend
 npm install
-cp .env.example .env  # optional; base/proxy are set in vite.config.ts
 npm run dev -- --host --port 5173
 ```
 
 3) Open UI
 
 - Visit `http://localhost:5173`
-- The dev server proxies `/api/*` to `http://localhost:8000` (adjust `frontend/vite.config.ts` if you run the backend on another port, e.g. 5174 as in `docs/start.md`/`ecosystem.config.js`)
+- The dev server proxies `/api/*` to `http://localhost:8000` (adjust `frontend/vite.config.ts` if you run the backend on another port)
 
-Windows setup with Conda: follow `docs/start.md` for a copy/paste sequence.
+## Run with Conda + PM2 (Linux/systemd)
+
+This repo includes `ecosystem.config.js` for running backend + frontend via PM2. The flow below follows a typical deployment on a Linux server.
+
+```bash
+git clone https://github.com/yesaouo/fish_disease_system.git
+cd fish_disease_system/annotation_web
+
+conda info --base
+conda create -n annotation_web python=3.11.13
+conda activate annotation_web
+conda install -c conda-forge nodejs
+
+cd frontend
+npm install
+cd ..
+pip install -r backend/requirements.txt
+
+npm install -g pm2
+
+# Edit parameters in:
+# - ecosystem.config.js (CONDA_BASE / CONDA_ENV / LOG_ROOT / ports)
+# - backend/.env (DATA_ROOT / ROOT_PATH / cache settings / etc.)
+
+pm2 start ecosystem.config.js
+pm2 status
+pm2 logs
+```
+
+Auto-start on boot (systemd):
+
+```bash
+pm2 startup
+# If your Node/PM2 lives inside a conda env, systemd may not find `node` unless PATH is set.
+# Example (replace placeholders with your own values):
+sudo env PATH=$PATH:<conda_env_bin> <pm2_bin> startup systemd -u <user> --hp <home>
+pm2 save
+```
 
 ## Directory Layout
 
 - `backend/` – FastAPI application (entry: `app.main:app`)
 - `frontend/` – Vite + React UI (`npm install && npm run dev`)
-- `docs/` – architecture notes, startup tips, and user guide
+- `docs/` – architecture notes and user guides
 - `data/{dataset}` – images and JSON cache
 - `backend/scripts/` – maintenance utilities
+- `ecosystem.config.js` – PM2 process definition (backend + frontend)
 
 ## Configuration
 
@@ -71,7 +110,7 @@ Health check: `GET /healthz` returns `{status: "ok"}` when the API is healthy.
 
 - Backend reads environment variables from `backend/.env` by default. See `.env.example`.
 - You can override the env file path via `ENV_FILE=...`.
-- Frontend (Vite) reads from `frontend/.env`. See `frontend/.env.example`.
+- Frontend is configured via `frontend/vite.config.ts` (proxy/base). If you need Vite env vars, add `frontend/.env` following Vite conventions.
 
 
 ### Deploying Under a Subpath
@@ -89,7 +128,7 @@ If you need to serve the app under a subpath (for example `https://example.com/f
 
 - Proxy example (nginx):
   - `location /fish/ { try_files $uri /fish/index.html; }`
-  - `location /fish/api/ { proxy_pass http://127.0.0.1:5174/; proxy_set_header X-Forwarded-Prefix /fish; }`
+  - `location /fish/api/ { proxy_pass http://127.0.0.1:8000/; proxy_set_header X-Forwarded-Prefix /fish; }`
 
 With the above, the UI runs at `/fish/`, API at `/fish/api/*`, and image links returned by the API include the prefix.
 
@@ -134,8 +173,8 @@ Unsaved changes trigger a `beforeunload` warning.
 ## Documentation
 
 - Architecture: `docs/architecture.md`
-- Startup (Windows/Conda): `docs/start.md`
-- 前端使用說明（養殖專家）: `docs/前端使用說明_養殖專家.md`
+- 影像標註 SOP: `docs/影像標註_SOP.md`
+- 前端使用說明（養殖專家）: `docs/使用說明_養殖專家.md`
 
 ## Next Steps
 
