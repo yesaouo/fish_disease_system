@@ -14,6 +14,8 @@ class Settings(BaseSettings):
         # Default stays at repo /data; override via DATA_ROOT in backend/.env or env vars.
         default_factory=lambda: (Path(__file__).resolve().parents[2] / "data")
     )
+    # Per-dataset SQLite filename under each dataset directory.
+    db_filename: str = Field(default="annotations.db")
     # If deploying under a subpath (e.g., "/fish"), set this to that path.
     # FastAPI will serve all routes under this root and generate correct URLs.
     root_path: str = Field(default="")

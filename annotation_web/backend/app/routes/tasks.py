@@ -59,6 +59,15 @@ def get_task_by_index(
     editor_name = body.editor_name or "anonymous"
     return tasks_service.get_task_by_index(body.dataset, body.index, editor_name, body.is_expert, settings)
 
+@router.post("/healthy_tasks/by_index", response_model=NextTaskResponse)
+def get_healthy_task_by_index(
+    body: TaskByIndexRequest,
+    settings: Settings = Depends(dependencies.get_app_settings),
+    _token: str = Depends(dependencies.require_api_key),
+) -> NextTaskResponse:
+    editor_name = body.editor_name or "anonymous"
+    return tasks_service.get_healthy_task_by_index(body.dataset, body.index, editor_name, body.is_expert, settings)
+
 
 @router.post("/tasks/{task_id}/skip", response_model=SkipTaskResponse)
 def skip_task(

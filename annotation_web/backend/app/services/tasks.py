@@ -1,20 +1,21 @@
 from __future__ import annotations
+
+import json
+import random
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple, Set
-import random
+from typing import Any, List
 
 from fastapi import HTTPException, status
 
 from ..config import Settings, get_settings
-from ..models import (
-    NextTaskResponse,
-    TaskDocument,
-)
+from ..models import NextTaskResponse, TaskDocument
 from ..services import datasets as datasets_service
 from ..services import storage as storage_service
 
 _settings = get_settings()
+
+HEALTHY_LABEL = storage_service.HEALTHY_LABEL
 
 
 def _ensure_settings(settings: Settings | None) -> Settings:
@@ -25,69 +26,66 @@ def _now_iso() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _scan_task_metadata(dataset_dir: Path) -> List[Dict]:
-    json_dir = storage_service.get_json_dir(dataset_dir)
-    if not json_dir.exists():
-        return []
-    metadata: List[Dict] = []
-    for path in json_dir.glob("*.json"):
-        try:
-            raw = storage_service.read_raw_json(path)
-        except Exception:
-            continue
-        general_editor = str(raw.get("general_editor") or "").strip()
-        expert_editor = str(raw.get("expert_editor") or "").strip()
-        untouched = (not general_editor) and (not expert_editor)
-        edited_by_general = bool(general_editor)
-        edited_by_expert = bool(expert_editor)
-        has_comments = bool(raw.get("comments") or [])
-        metadata.append(
-            {
-                "stem": path.stem,
-                "general_editor": general_editor,
-                "expert_editor": expert_editor,
-                "untouched": untouched,
-                "edited_by_general": edited_by_general,
-                "edited_by_expert": edited_by_expert,
-                "has_comments": has_comments,
-            }
-        )
-    return metadata
+def _is_blank(value: Any) -> bool:
+    return not str(value or "").strip()
 
 
-def _filter_candidates(
-    metadata: List[Dict],
-    current_user: str,
-    is_expert: bool,
-) -> List[Dict]:
-    """
-    Select candidate tasks for dispatch based on role.
+def _is_healthy_from_raw(raw: dict[str, Any]) -> bool:
+    dets = raw.get("detections", [])
+    if not isinstance(dets, list) or len(dets) == 0:
+        return True
+    for d in dets:
+        if not isinstance(d, dict):
+            return False
+        if str(d.get("label") or "").strip() != HEALTHY_LABEL:
+            return False
+    return True
 
-    - 一般標註（is_expert=False）：
-      不會拿到「專家已提交」的任務（有 expert_editor），其他都可以。
-    - 專家標註（is_expert=True）：
-      只要「尚未有專家標註」，就可派發（包含已由一般標註、或已經有留言的任務），
-      如此可確保「專家沒標就不算標完」，且有註解的影像也會送給專家。
-    - 任何角色都不會收到自己已經標註過的任務（避免自我複審）。
-    """
-    if is_expert:
-        # Expert: any task without expert_editor, regardless of general_editor or comments,
-        # as long as it wasn't edited by this user.
-        return [
-            m
-            for m in metadata
-            if (not m.get("edited_by_expert"))
-            and current_user not in {m.get("general_editor"), m.get("expert_editor")}
-        ]
 
-    # General annotator: any task without expert_editor,
-    # as long as it wasn't edited by this user (避免自己改自己).
-    return [
-        m
-        for m in metadata
-        if (not m.get("edited_by_expert"))
-        and current_user not in {m.get("general_editor"), m.get("expert_editor")}
-    ]
+def _required_fields_ok(raw: dict[str, Any]) -> bool:
+    # Healthy: no required fields.
+    if _is_healthy_from_raw(raw):
+        return True
+
+    overall = raw.get("overall") if isinstance(raw.get("overall"), dict) else {}
+    if _is_blank(overall.get("colloquial_zh")):
+        return False
+    if _is_blank(overall.get("medical_zh")):
+        return False
+
+    dets = raw.get("detections")
+    if not isinstance(dets, list) or len(dets) == 0:
+        return False
+
+    for d in dets:
+        if not isinstance(d, dict):
+            return False
+        label = str(d.get("label") or "").strip()
+        if _is_blank(label):
+            return False
+        if label != HEALTHY_LABEL and d.get("evidence_index") in (None, ""):
+            return False
+
+    causes = raw.get("global_causes_zh")
+    if not isinstance(causes, list) or len(causes) == 0:
+        return False
+
+    treatments = raw.get("global_treatments_zh")
+    if not isinstance(treatments, list) or len(treatments) == 0:
+        return False
+
+    return True
+
+
+def _is_expert_complete(
+    *,
+    expert_editors: list[str],
+    has_comments: bool,
+    required_fields_ok: bool,
+) -> bool:
+    # Completion is not based on "has expert editor" alone:
+    # expert must have submitted AND required fields are filled (or there are comments to justify omissions).
+    return bool(expert_editors) and (required_fields_ok or has_comments)
 
 
 def select_next_task(
@@ -97,35 +95,69 @@ def select_next_task(
     settings: Settings | None = None,
 ) -> NextTaskResponse:
     settings = _ensure_settings(settings)
-    dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
+    datasets_service.resolve_dataset_path(dataset, settings)
 
-    metadata = _scan_task_metadata(dataset_dir)
-    if not metadata:
+    image_filenames = storage_service.list_images(dataset, settings)
+    total = len(image_filenames)
+    if total <= 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="沒有可用任務")
 
-    candidates = _filter_candidates(metadata, editor_name, is_expert)
+    # Map task_id (stem) -> (index in `/images`, filename)
+    index_map: dict[str, tuple[int, str]] = {}
+    ordered_task_ids: list[str] = []
+    for i, fn in enumerate(image_filenames, start=1):
+        task_id = Path(fn).stem
+        ordered_task_ids.append(task_id)
+        index_map[task_id] = (i, fn)
+
+    rows = storage_service.list_task_rows(dataset, settings)
+    row_by_task_id = {str(r["task_id"]): r for r in rows if str(r["task_id"]) in index_map}
+
+    candidates: list[str] = []
+    for task_id in ordered_task_ids:
+        row = row_by_task_id.get(task_id)
+        if row is None:
+            candidates.append(task_id)
+            continue
+        try:
+            has_comments = int(row["comments_count"] or 0) > 0
+            general_editors = json.loads(row["general_editors_json"] or "[]")
+            expert_editors = json.loads(row["expert_editors_json"] or "[]")
+            if not isinstance(general_editors, list):
+                general_editors = []
+            if not isinstance(expert_editors, list):
+                expert_editors = []
+            general_editors = [str(x).strip() for x in general_editors if str(x).strip()]
+            expert_editors = [str(x).strip() for x in expert_editors if str(x).strip()]
+
+            if editor_name in set(general_editors) or editor_name in set(expert_editors):
+                continue
+
+            raw = json.loads(row["doc_json"])
+            required_ok = _required_fields_ok(raw)
+            expert_complete = _is_expert_complete(
+                expert_editors=expert_editors,
+                has_comments=has_comments,
+                required_fields_ok=required_ok,
+            )
+            if expert_complete:
+                continue
+            candidates.append(task_id)
+        except Exception:
+            candidates.append(task_id)
+
     if not candidates:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="沒有可用任務")
 
-    choice = random.choice(candidates)
-    stem = choice["stem"]
+    task_id = random.choice(candidates)
+    index, image_filename = index_map[task_id]
 
-    document = storage_service.load_task(dataset, stem, settings)
-
-    image_url = f"/api/datasets/{dataset}/images/{document.image_filename}"
-
-    # Compute index and total based on sorted task files
-    dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
-    files = list(storage_service.iter_task_files(dataset_dir))
-    stems = [p.stem for p in files]
-    total = len(stems)
-    try:
-        index = stems.index(stem) + 1
-    except ValueError:
-        index = 0
+    storage_service.ensure_task_for_image(dataset, task_id, image_filename, settings)
+    document = storage_service.load_task(dataset, task_id, settings)
+    image_url = f"/api/datasets/{dataset}/images/{image_filename}"
 
     return NextTaskResponse(
-        task_id=stem,
+        task_id=task_id,
         task=document,
         image_url=image_url,
         index=index,
@@ -151,6 +183,9 @@ def validate_detections(
     evidence_options = datasets_service.load_evidence_options_zh(dataset, settings)
 
     for det in document.detections:
+        if det.label == HEALTHY_LABEL:
+            # Healthy regions are accepted even if they are not present in dataset classes/options.
+            continue
         if det.label not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -190,7 +225,30 @@ def submit_task(
     current = storage_service.load_task(dataset, task_id, settings)
 
     classes = datasets_service.load_classes(dataset, settings)
-    validate_detections(dataset, incoming, classes, require_evidence_index=True, settings=settings)
+    allow_incomplete = bool(getattr(incoming, "comments", []) or [])
+    is_healthy_task = (len(getattr(incoming, "detections", []) or []) == 0) or all(
+        (getattr(d, "label", "") or "").strip() == HEALTHY_LABEL for d in (getattr(incoming, "detections", []) or [])
+    )
+    validate_detections(
+        dataset,
+        incoming,
+        classes,
+        require_evidence_index=(not allow_incomplete) and (not is_healthy_task),
+        settings=settings,
+    )
+
+    # Extra completion checks (skip when user left comments to justify omissions)
+    if (not allow_incomplete) and (not is_healthy_task):
+        if _is_blank(getattr(incoming.overall, "colloquial_zh", "")):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="口語描述未填寫")
+        if _is_blank(getattr(incoming.overall, "medical_zh", "")):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="醫學描述未填寫")
+        if not (getattr(incoming, "global_causes_zh", []) or []):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="病因未填寫")
+        if not (getattr(incoming, "global_treatments_zh", []) or []):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="處置未填寫")
+        if not (getattr(incoming, "detections", []) or []):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="未新增任何框選目標")
 
     now = _now_iso()
 
@@ -200,20 +258,27 @@ def submit_task(
     updated.image_width = getattr(current, "image_width", updated.image_width)
     updated.image_height = getattr(current, "image_height", updated.image_height)
     updated.last_modified_at = now
+    updated.is_healthy = is_healthy_task
 
-    # Set single editor per role
+    # Append editor per role (list)
+    updated.general_editor = list(getattr(current, "general_editor", []) or [])
+    updated.expert_editor = list(getattr(current, "expert_editor", []) or [])
     if is_expert:
-        updated.expert_editor = editor_name
-        updated.general_editor = current.general_editor
+        if editor_name not in updated.expert_editor:
+            updated.expert_editor.append(editor_name)
     else:
-        updated.general_editor = editor_name
-        updated.expert_editor = current.expert_editor
+        if editor_name not in updated.general_editor:
+            updated.general_editor.append(editor_name)
 
-    storage_service.save_task(updated, settings)
-    # Snapshot versioned JSON for offline/long-term analysis.
-    # Version files are named as `<image_stem>_vN.json` and are only
-    # incremented on submit (not on intermediate saves).
-    storage_service.save_task_version(updated, settings)
+    storage_service.upsert_task(
+        dataset,
+        task_id,
+        sort_index=None,
+        document=updated,
+        updated_by=editor_name,
+        action="submit",
+        settings=settings,
+    )
     storage_service.append_audit_log(
         {
             "who": editor_name,
@@ -237,19 +302,54 @@ def get_task_by_index(
     settings = _ensure_settings(settings)
     if index <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="index must be >= 1")
-    dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
-    files = list(storage_service.iter_task_files(dataset_dir))
-    if not files:
+    datasets_service.resolve_dataset_path(dataset, settings)
+    image_filenames = storage_service.list_images(dataset, settings)
+    total = len(image_filenames)
+    if total <= 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="沒有可用任務")
-    total = len(files)
     if index > total:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="index out of range")
-    target = files[index - 1]
-    stem = target.stem
-    document = storage_service.load_task(dataset, stem, settings)
-    image_url = f"/api/datasets/{dataset}/images/{document.image_filename}"
+
+    image_filename = image_filenames[index - 1]
+    task_id = Path(image_filename).stem
+
+    storage_service.ensure_task_for_image(dataset, task_id, image_filename, settings)
+    document = storage_service.load_task(dataset, task_id, settings)
+    image_url = f"/api/datasets/{dataset}/images/{image_filename}"
     return NextTaskResponse(
-        task_id=stem,
+        task_id=task_id,
+        task=document,
+        image_url=image_url,
+        index=index,
+        total_tasks=total,
+    )
+
+def get_healthy_task_by_index(
+    dataset: str,
+    index: int,
+    editor_name: str,
+    is_expert: bool,
+    settings: Settings | None = None,
+) -> NextTaskResponse:
+    settings = _ensure_settings(settings)
+    if index <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="index must be >= 1")
+    datasets_service.resolve_dataset_path(dataset, settings)
+    image_filenames = storage_service.list_healthy_images(dataset, settings)
+    total = len(image_filenames)
+    if total <= 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="瘝??舐隞餃?")
+    if index > total:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="index out of range")
+
+    image_filename = image_filenames[index - 1]
+    task_id = Path(image_filename).stem
+
+    storage_service.ensure_task_for_image(dataset, task_id, image_filename, settings, in_healthy_images=True)
+    document = storage_service.load_task(dataset, task_id, settings)
+    image_url = f"/api/datasets/{dataset}/healthy_images/{image_filename}"
+    return NextTaskResponse(
+        task_id=task_id,
         task=document,
         image_url=image_url,
         index=index,
@@ -299,11 +399,22 @@ def save_task(
     updated.image_width = getattr(current, "image_width", updated.image_width)
     updated.image_height = getattr(current, "image_height", updated.image_height)
     updated.last_modified_at = now
+    updated.is_healthy = (len(getattr(updated, "detections", []) or []) == 0) or all(
+        (getattr(d, "label", "") or "").strip() == HEALTHY_LABEL for d in (getattr(updated, "detections", []) or [])
+    )
     # Do NOT set editors on save; keep completion state unchanged
-    updated.general_editor = current.general_editor
-    updated.expert_editor = current.expert_editor
+    updated.general_editor = list(getattr(current, "general_editor", []) or [])
+    updated.expert_editor = list(getattr(current, "expert_editor", []) or [])
 
-    storage_service.save_task(updated, settings)
+    storage_service.upsert_task(
+        dataset,
+        task_id,
+        sort_index=None,
+        document=updated,
+        updated_by=editor_name,
+        action="save",
+        settings=settings,
+    )
     storage_service.append_audit_log(
         {
             "who": editor_name,

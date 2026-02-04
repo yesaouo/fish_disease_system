@@ -3,7 +3,7 @@ import { AxiosError } from "axios";
 import { useCallback, useContext, useEffect, useMemo, useReducer, useState, useRef } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { UNSAFE_NavigationContext as NavigationContext } from "react-router";
-import { fetchNextTask, skipTask, submitTask, fetchClasses, fetchLabelMapZh, fetchEvidenceOptionsZh, fetchTaskByIndex, saveTask } from "../../api/client";
+import { fetchNextTask, skipTask, submitTask, fetchClasses, fetchLabelMapZh, fetchEvidenceOptionsZh, fetchTaskByIndex, saveTask, moveImageToHealthyImages } from "../../api/client";
 import type {
   NextTaskResponse,
   TaskDocument
@@ -32,6 +32,7 @@ import {
   ArrowLeft,
   MessageSquareQuote,
   CheckCheck,
+  Images,
   SkipForward,
   AlertTriangle,
   XCircle
@@ -241,11 +242,13 @@ const Banner: React.FC<{
  * 專家    : 藍色語意 (高可信/權威感)
  */
 const SubmissionCapsules: React.FC<{
-  generalEditor?: string | null;
-  expertEditor?: string | null;
+  generalEditor?: string[];
+  expertEditor?: string[];
 }> = ({ generalEditor, expertEditor }) => {
-  const hasGeneral = !!(generalEditor && generalEditor.trim() !== "");
-  const hasExpert = !!(expertEditor && expertEditor.trim() !== "");
+  const general = (generalEditor ?? []).map((s) => String(s).trim()).filter(Boolean);
+  const expert = (expertEditor ?? []).map((s) => String(s).trim()).filter(Boolean);
+  const hasGeneral = general.length > 0;
+  const hasExpert = expert.length > 0;
 
   if (!hasGeneral && !hasExpert) return null;
 
@@ -262,7 +265,7 @@ const SubmissionCapsules: React.FC<{
         >
           <span>用戶已提交</span>
           <span className="ml-1 text-[10px] text-emerald-600/80 font-normal">
-            ({generalEditor})
+            ({general[general.length - 1]}{general.length > 1 ? ` +${general.length - 1}` : ""})
           </span>
         </span>
       )}
@@ -277,7 +280,7 @@ const SubmissionCapsules: React.FC<{
         >
           <span>專家已提交</span>
           <span className="ml-1 text-[10px] text-sky-600/80 font-normal">
-            ({expertEditor})
+            ({expert[expert.length - 1]}{expert.length > 1 ? ` +${expert.length - 1}` : ""})
           </span>
         </span>
       )}
@@ -677,7 +680,8 @@ const AnnotationPage: React.FC = () => {
     const confirm = window.confirm("確定要送出標註嗎？送出後此影像將視為完成，不會再次分派。");
     if (!confirm) return;
     const errors = validateTaskDocument(doc, classes, false);
-    if (errors.length) {
+    const hasComments = ((doc as any).comments ?? []).length > 0;
+    if (errors.length && !hasComments) {
       dispatch({ type: "SET_ERRORS", errors });
       // Move selection and focus to the first error to guide user
       setTimeout(() => jumpToFirstError(), 0);
@@ -761,6 +765,38 @@ const AnnotationPage: React.FC = () => {
         setError(axiosErr.response.data.detail);
       } else {
         setError("跳過失敗，請稍後再試。");
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleMoveToHealthyImages = async () => {
+    if (!task || !dataset || !doc) return;
+
+    // Warn if there are unsaved changes.
+    if (dirty) {
+      const ok = window.confirm("目前有未保存的修改。仍要把影像移到 healthy_images 嗎？");
+      if (!ok) return;
+    }
+
+    const confirm = window.confirm("確定要把此影像移到 healthy_images 嗎？移動後此影像將不會出現在 /images 清單。");
+    if (!confirm) return;
+
+    setSaving(true);
+    dispatch({ type: "RESET_ERRORS" });
+
+    try {
+      await moveImageToHealthyImages(dataset, doc.image_filename);
+      const currentIdx = routeIndex != null ? routeIndex : task.index;
+      // Reload the same index; after removal, the next image becomes this index.
+      await runWithBypass(() => navigate(`/annotate/${currentIdx}`, { replace: true }));
+    } catch (err) {
+      const axiosErr = err as AxiosError<{ detail?: string }>;
+      if (axiosErr.response?.data?.detail) {
+        setError(axiosErr.response.data.detail);
+      } else {
+        setError("移動影像失敗。");
       }
     } finally {
       setSaving(false);
@@ -880,6 +916,7 @@ const AnnotationPage: React.FC = () => {
   const saveDisabled = !!(loading || saving || !doc || !task);
   const skipDisabled = !!(loading || saving || !task);
   const submitDisabled = !!(loading || saving || !doc || !task);
+  const moveToHealthyDisabled = !!(loading || saving || !doc || !task);
 
   const withBase = (p: string) => (p.startsWith("/") ? `${baseUrl.replace(/\/$/, "")}${p}` : p);
 
@@ -945,6 +982,13 @@ const AnnotationPage: React.FC = () => {
               >
                 <CheckCheck className="h-4 w-4" />
                 查看已提交
+              </button>
+              <button
+                onClick={() => confirmAndNavigate("/healthy")}
+                className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+              >
+                <Images className="h-4 w-4" />
+                健康影像
               </button>
             </div>
           </div>
@@ -1026,6 +1070,16 @@ const AnnotationPage: React.FC = () => {
               >
                 <SkipForward className="mr-1 h-4 w-4" />
                 跳過
+              </button>
+
+              <button
+                type="button"
+                onClick={handleMoveToHealthyImages}
+                className="inline-flex items-center justify-center rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 disabled:pointer-events-none disabled:opacity-50"
+                disabled={moveToHealthyDisabled}
+                title="移到 healthy_images"
+              >
+                移到 healthy_images
               </button>
 
               <button
@@ -1193,9 +1247,18 @@ const AnnotationPage: React.FC = () => {
                     handleOverallChange("colloquial_zh", e.target.value)
                   }
                   onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); } }}
-                  className="mb-3 w-full min-h-[6rem] resize-y rounded border border-slate-300 px-3 py-2 leading-relaxed focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                  className={`mb-3 w-full min-h-[6rem] resize-y rounded border px-3 py-2 leading-relaxed focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 ${
+                    detectionErrors.get("overall.colloquial_zh")
+                      ? "border-red-400"
+                      : "border-slate-300"
+                  }`}
                   placeholder="請輸入口語描述（Enter 不換行）"
                 />
+                {detectionErrors.get("overall.colloquial_zh") && (
+                  <p className="mb-3 text-sm text-red-500">
+                    {detectionErrors.get("overall.colloquial_zh")}
+                  </p>
+                )}
                 <label className="mb-2 block text-sm font-medium text-slate-600">
                   醫學描述
                 </label>
@@ -1206,9 +1269,18 @@ const AnnotationPage: React.FC = () => {
                     handleOverallChange("medical_zh", e.target.value)
                   }
                   onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); } }}
-                  className="w-full min-h-[6rem] resize-y rounded border border-slate-300 px-3 py-2 leading-relaxed focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                  className={`w-full min-h-[6rem] resize-y rounded border px-3 py-2 leading-relaxed focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 ${
+                    detectionErrors.get("overall.medical_zh")
+                      ? "border-red-400"
+                      : "border-slate-300"
+                  }`}
                   placeholder="請輸入醫學描述（Enter 不換行）"
                 />
+                {detectionErrors.get("overall.medical_zh") && (
+                  <p className="mt-2 text-sm text-red-500">
+                    {detectionErrors.get("overall.medical_zh")}
+                  </p>
+                )}
               </div>
 
               <div className="rounded-xl bg-white p-4 shadow">

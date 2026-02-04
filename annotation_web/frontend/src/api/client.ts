@@ -3,6 +3,7 @@ import type {
   AdminStatsResponse,
   AdminTasksResponse,
   DatasetStats,
+  ImageListResponse,
   LoginResponse,
   NextTaskResponse,
   SkipTaskRequest,
@@ -181,5 +182,49 @@ export const fetchCommentedList = async (
   const { data } = await http.get<CommentedListResponse>(
     `/datasets/${encodeURIComponent(dataset)}/commented`
   );
+  return data;
+};
+
+export const fetchHealthyImagesList = async (
+  dataset: string
+): Promise<string[]> => {
+  const { data } = await http.get<ImageListResponse>(
+    `/datasets/${encodeURIComponent(dataset)}/healthy_images`
+  );
+  return data.images;
+};
+
+export const moveImageToHealthyImages = async (
+  dataset: string,
+  filename: string
+): Promise<{ ok: boolean }> => {
+  const { data } = await http.post<{ ok: boolean }>(
+    `/datasets/${encodeURIComponent(dataset)}/images/${encodeURIComponent(filename)}/move_to_healthy_images`
+  );
+  return data;
+};
+
+export const moveHealthyImageToImages = async (
+  dataset: string,
+  filename: string
+): Promise<{ ok: boolean }> => {
+  const { data } = await http.post<{ ok: boolean }>(
+    `/datasets/${encodeURIComponent(dataset)}/healthy_images/${encodeURIComponent(filename)}/move_to_images`
+  );
+  return data;
+};
+
+export const fetchHealthyTaskByIndex = async (
+  dataset: string,
+  index: number,
+  editorName: string | undefined,
+  isExpert: boolean
+): Promise<NextTaskResponse> => {
+  const { data } = await http.post<NextTaskResponse>("/healthy_tasks/by_index", {
+    dataset,
+    index,
+    editor_name: editorName,
+    is_expert: isExpert
+  });
   return data;
 };

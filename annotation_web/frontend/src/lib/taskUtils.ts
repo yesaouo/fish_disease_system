@@ -47,6 +47,45 @@ export const validateTaskDocument = (
   const classSet = new Set(classes);
   const width = doc.image_width || 0;
   const height = doc.image_height || 0;
+  const HEALTHY_LABEL = "healthy_region";
+  const dets = doc.detections ?? [];
+  const isHealthy =
+    dets.length === 0 ||
+    dets.every((d) => (d.label ?? "").trim() === HEALTHY_LABEL);
+
+  // Healthy: no required fields.
+  if (!isHealthy) {
+    if (!doc.overall?.colloquial_zh?.trim()) {
+      errors.push({
+        field: "overall.colloquial_zh",
+        message: "通俗描述未填寫"
+      });
+    }
+    if (!doc.overall?.medical_zh?.trim()) {
+      errors.push({
+        field: "overall.medical_zh",
+        message: "醫學描述未填寫"
+      });
+    }
+    if (!doc.detections?.length) {
+      errors.push({
+        field: "detections",
+        message: "需新增至少一個框選目標"
+      });
+    }
+    if (!doc.global_causes_zh?.length) {
+      errors.push({
+        field: "global_causes_zh",
+        message: "病徵原因未填寫"
+      });
+    }
+    if (!doc.global_treatments_zh?.length) {
+      errors.push({
+        field: "global_treatments_zh",
+        message: "處置未填寫"
+      });
+    }
+  }
 
   doc.detections.forEach((det, idx) => {
     const [x1, y1, x2, y2] = det.box_xyxy;
@@ -70,12 +109,13 @@ export const validateTaskDocument = (
       });
     }
     if (det.label && classes.length > 0 && !classSet.has(det.label)) {
+      if ((det.label ?? "").trim() === HEALTHY_LABEL) return;
       errors.push({
         field: `detections.${idx}.label`,
         message: `表徵類別不在清單中`
       });
     }
-    if (det.label && det.evidence_index == null) {
+    if (det.label && (det.label ?? "").trim() !== HEALTHY_LABEL && det.evidence_index == null) {
       errors.push({
         field: `detections.${idx}.evidence_index`,
         message: `需選擇外觀敘述`

@@ -81,7 +81,9 @@ const AnnotatedListPage: React.FC = () => {
                     {new Date(item.last_modified_at).toLocaleString()}
                   </td>
                   <td className="px-4 py-3 text-slate-700">
-                    {item.expert_editor || item.general_editor || ""}
+                    {(item.expert_editor && item.expert_editor[item.expert_editor.length - 1]) ||
+                      (item.general_editor && item.general_editor[item.general_editor.length - 1]) ||
+                      ""}
                   </td>
                 </tr>
               ))}

@@ -20,26 +20,10 @@ from backend.app.services import storage as storage_service
 from backend.app.models import TaskDocument
 
 
-def find_image_filename(dataset_dir: Path, stem: str, settings: Settings) -> Optional[str]:
-    image_dir = storage_service.get_image_dir(dataset_dir)
-    if not image_dir.exists():
-        return None
-    # Try allowed extensions
-    for ext in settings.image_extensions:
-        candidate = image_dir / f"{stem}{ext}"
-        if candidate.exists():
-            return candidate.name
-    # Fallback: any extension
-    for p in image_dir.glob(f"{stem}.*"):
-        if p.is_file():
-            return p.name
-    return None
-
-
 def scan_dataset(dataset: str, settings: Settings) -> Tuple[int, int, List[Tuple[str, str]]]:
     """Return (total_json, included_count, excluded_list[(stem, reason)])"""
     dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
-    json_dir = storage_service.get_json_dir(dataset_dir)
+    json_dir = storage_service.get_annotations_dir(dataset_dir)
     if not json_dir.exists():
         return (0, 0, [])
 
@@ -56,8 +40,11 @@ def scan_dataset(dataset: str, settings: Settings) -> Tuple[int, int, List[Tuple
             continue
 
         # Locate image
-        image_filename = find_image_filename(dataset_dir, stem, settings)
-        if not image_filename:
+        try:
+            image_filename, _is_healthy = storage_service.find_image_filename(
+                dataset, dataset_dir, stem, settings, is_healthy=None
+            )
+        except Exception:
             excluded.append((stem, "missing_image"))
             continue
 

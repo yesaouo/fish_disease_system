@@ -26,8 +26,8 @@ const AdminDashboard: React.FC = () => {
       rows.push([
         t.dataset,
         t.image_filename,
-        t.general_editor ?? "",
-        t.expert_editor ?? ""
+        (t.general_editor ?? []).join(";"),
+        (t.expert_editor ?? []).join(";")
       ]);
     });
     const csv = rows.map((r) => r.map((v) => String(v)).join(",")).join("\n");

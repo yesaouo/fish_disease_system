@@ -7,6 +7,8 @@ import AnnotationPage from "./features/annotation/AnnotationPage";
 import AdminDashboard from "./features/admin/AdminDashboard";
 import AnnotatedListPage from "./features/annotated/AnnotatedListPage";
 import CommentedListPage from "./features/commented/CommentedListPage";
+import HealthyImagesPage from "./features/healthy/HealthyImagesPage";
+import HealthyAnnotationPage from "./features/healthy/HealthyAnnotationPage";
 
 const RequireAuth: React.FC<{ children: React.ReactElement }> = ({
   children
@@ -85,6 +87,26 @@ const AppRoutes = () => {
           <RequireAuth>
             <RequireDataset>
               <CommentedListPage />
+            </RequireDataset>
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/healthy"
+        element={
+          <RequireAuth>
+            <RequireDataset>
+              <HealthyImagesPage />
+            </RequireDataset>
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/healthy/:index"
+        element={
+          <RequireAuth>
+            <RequireDataset>
+              <HealthyAnnotationPage />
             </RequireDataset>
           </RequireAuth>
         }

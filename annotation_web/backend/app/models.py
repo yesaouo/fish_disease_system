@@ -99,12 +99,15 @@ class TaskDocument(BaseModel):
 
     dataset: str
     image_filename: str
+    # Distinguish healthy vs non-healthy tasks when images are split into
+    # `/images` and `/healthy_images` directories.
+    is_healthy: bool = False
     image_width: int = Field(default=1000)
     image_height: int = Field(default=1000)
     last_modified_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    # Single editor per role
-    general_editor: Optional[str] = None
-    expert_editor: Optional[str] = None
+    # Editors per role (append-only at submit time)
+    general_editor: List[str] = Field(default_factory=list)
+    expert_editor: List[str] = Field(default_factory=list)
     overall: OverallText = Field(default_factory=OverallText)
     detections: List[Detection] = Field(default_factory=list)
     global_causes_zh: List[str] = Field(default_factory=list)
@@ -120,6 +123,30 @@ class TaskDocument(BaseModel):
         if not isinstance(value, (list, tuple)):
             value = [value]
         return [str(v).replace("\n", " ").strip() for v in value if v is not None]
+
+    @field_validator("general_editor", "expert_editor", mode="before")
+    def _coerce_editors(cls, value: Any) -> List[str]:
+        if value is None or value == "":
+            return []
+        # Legacy: single string
+        if isinstance(value, str):
+            name = value.strip()
+            return [name] if name else []
+        # New: list/tuple
+        if isinstance(value, (list, tuple)):
+            result: List[str] = []
+            for item in value:
+                if item is None:
+                    continue
+                name = str(item).strip()
+                if not name:
+                    continue
+                if name not in result:
+                    result.append(name)
+            return result
+        # Fallback: coerce anything else to string
+        name = str(value).strip()
+        return [name] if name else []
 
     @field_validator("image_width", "image_height", mode="before")
     def _validate_image_dims(cls, value: Any) -> int:
@@ -194,6 +221,9 @@ class DatasetListResponse(BaseModel):
 
 class ClassesResponse(BaseModel):
     classes: List[str]
+
+class ImageListResponse(BaseModel):
+    images: List[str]
 
 class LabelMapZhResponse(BaseModel):
     # Mapping from English class value to Chinese display text
@@ -299,8 +329,8 @@ class TaskSummary(BaseModel):
     dataset: str
     image_filename: str
     annotations_count: int
-    general_editor: Optional[str] = None
-    expert_editor: Optional[str] = None
+    general_editor: List[str] = Field(default_factory=list)
+    expert_editor: List[str] = Field(default_factory=list)
 
 class AdminTasksResponse(BaseModel):
     tasks: List[TaskSummary]
@@ -329,8 +359,8 @@ class AnnotatedItem(BaseModel):
     task_id: str
     image_filename: str
     last_modified_at: datetime
-    general_editor: Optional[str] = None
-    expert_editor: Optional[str] = None
+    general_editor: List[str] = Field(default_factory=list)
+    expert_editor: List[str] = Field(default_factory=list)
 
 class AnnotatedListResponse(BaseModel):
     items: List[AnnotatedItem]

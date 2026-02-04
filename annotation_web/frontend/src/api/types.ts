@@ -15,11 +15,12 @@ export type Comment = {
 export type TaskDocument = {
   dataset: string;
   image_filename: string;
+  is_healthy?: boolean;
   image_width: number;
   image_height: number;
   last_modified_at: string;
-  general_editor?: string | null;
-  expert_editor?: string | null;
+  general_editor?: string[];
+  expert_editor?: string[];
   overall: {
     colloquial_zh: string;
     medical_zh: string;
@@ -82,8 +83,8 @@ export type TaskSummary = {
   dataset: string;
   image_filename: string;
   annotations_count: number;
-  general_editor?: string | null;
-  expert_editor?: string | null;
+  general_editor?: string[];
+  expert_editor?: string[];
 };
 
 export type AdminTasksResponse = {
@@ -106,8 +107,8 @@ export type AnnotatedItem = {
   task_id: string;
   image_filename: string;
   last_modified_at: string;
-  general_editor?: string | null;
-  expert_editor?: string | null;
+  general_editor?: string[];
+  expert_editor?: string[];
 };
 
 export type AnnotatedListResponse = {
@@ -125,6 +126,10 @@ export type CommentedItem = {
 
 export type CommentedListResponse = {
   items: CommentedItem[];
+};
+
+export type ImageListResponse = {
+  images: string[];
 };
 
 export type LoginResponse = {
