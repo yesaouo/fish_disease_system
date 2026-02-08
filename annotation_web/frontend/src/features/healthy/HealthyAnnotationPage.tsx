@@ -658,13 +658,11 @@ const HealthyAnnotationPage: React.FC = () => {
     if (!task || !dataset || !doc) return;
 
     if (dirty) {
-      const ok = window.confirm("目前有未保存的修改。仍要把影像移回 /images 嗎？");
+      const ok = window.confirm("目前有未保存的修改。仍要將這張影像判定為異常嗎？");
       if (!ok) return;
     }
 
-    const confirm = window.confirm(
-      "確定要把影像移回 /images 嗎？移回後將會出現在標註列表中。"
-    );
+    const confirm = window.confirm("確定要將這張影像判定為異常嗎？判定後會移回 /images。");
     if (!confirm) return;
 
     setSaving(true);
@@ -886,11 +884,11 @@ const HealthyAnnotationPage: React.FC = () => {
               <button
                 type="button"
                 onClick={handleMoveToImages}
-                className="inline-flex items-center justify-center rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 disabled:pointer-events-none disabled:opacity-50"
+                className="inline-flex items-center justify-center rounded-md border border-rose-400 bg-rose-50 px-4 py-2 text-sm font-medium text-rose-700 shadow-sm transition-colors hover:bg-rose-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:pointer-events-none disabled:opacity-50"
                 disabled={moveDisabled}
-                title="移回 /images"
+                title="判定為異常"
               >
-                移回 /images
+                判定為異常
               </button>
 
               <button

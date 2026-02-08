@@ -776,11 +776,13 @@ const AnnotationPage: React.FC = () => {
 
     // Warn if there are unsaved changes.
     if (dirty) {
-      const ok = window.confirm("目前有未保存的修改。仍要把影像移到 healthy_images 嗎？");
+      const ok = window.confirm("目前有未保存的修改。仍要將這張影像判定為健康嗎？");
       if (!ok) return;
     }
 
-    const confirm = window.confirm("確定要把此影像移到 healthy_images 嗎？移動後此影像將不會出現在 /images 清單。");
+    const confirm = window.confirm(
+      "確定要將這張影像判定為健康嗎？判定後會移到 /healthy_images。"
+    );
     if (!confirm) return;
 
     setSaving(true);
@@ -1075,11 +1077,11 @@ const AnnotationPage: React.FC = () => {
               <button
                 type="button"
                 onClick={handleMoveToHealthyImages}
-                className="inline-flex items-center justify-center rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 disabled:pointer-events-none disabled:opacity-50"
+                className="inline-flex items-center justify-center rounded-md border border-emerald-400 bg-emerald-50 px-4 py-2 text-sm font-medium text-emerald-700 shadow-sm transition-colors hover:bg-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 disabled:pointer-events-none disabled:opacity-50"
                 disabled={moveToHealthyDisabled}
-                title="移到 healthy_images"
+                title="判定為健康"
               >
-                移到 healthy_images
+                判定為健康
               </button>
 
               <button

@@ -1,10 +1,18 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import { ArrowLeft, Images, MessageSquareQuote } from "lucide-react";
+
 import { fetchAnnotatedList } from "../../api/client";
-import { useDataset } from "../../context/DatasetContext";
+import TaskImageBrowser, {
+  TaskImageBrowserColumn,
+  TaskImageBrowserItem,
+} from "../../components/TaskImageBrowser";
 import ProjectHeader from "../../components/ProjectHeader";
-import { ArrowLeft, MessageSquareQuote } from "lucide-react";
+import { useDataset } from "../../context/DatasetContext";
+
+const baseUrl = import.meta.env.BASE_URL || "/";
+const apiBase = baseUrl.replace(/\/$/, "");
 
 const AnnotatedListPage: React.FC = () => {
   const navigate = useNavigate();
@@ -21,13 +29,41 @@ const AnnotatedListPage: React.FC = () => {
     if (dataset) void refetch();
   }, [dataset, refetch]);
 
+  const columns: TaskImageBrowserColumn[] = useMemo(
+    () => [
+      { key: "index", label: "編號", cellClassName: "font-mono tabular-nums" },
+      { key: "updated_at", label: "最後更新", headerClassName: "w-56" },
+      { key: "editor", label: "最近提交者", headerClassName: "w-40" },
+    ],
+    []
+  );
+
+  const items: TaskImageBrowserItem[] = useMemo(() => {
+    return (data?.items ?? []).map((item) => ({
+      id: `${item.dataset}-${item.task_id}`,
+      filename: item.image_filename,
+      imageUrl: `${apiBase}/api/datasets/${encodeURIComponent(
+        dataset || item.dataset
+      )}/images/${encodeURIComponent(item.image_filename)}`,
+      onOpen: () => navigate(`/annotate/${item.index}`),
+      fields: {
+        index: item.index,
+        updated_at: new Date(item.last_modified_at).toLocaleString(),
+        editor:
+          (item.expert_editor && item.expert_editor[item.expert_editor.length - 1]) ||
+          (item.general_editor && item.general_editor[item.general_editor.length - 1]) ||
+          "-",
+      },
+    }));
+  }, [data, dataset, navigate]);
+
   return (
-    <div className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-10">
+    <div className="mx-auto flex min-h-screen max-w-6xl flex-col gap-6 px-6 py-10">
       <ProjectHeader />
-      <header className="flex items-center justify-between">
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="text-2xl font-semibold text-slate-800">已提交清單</h1>
-          <p className="text-sm text-slate-500">顯示最近提交的影像，點擊可前往編號</p>
+          <h1 className="text-2xl font-semibold text-slate-800">已提交</h1>
+          <p className="text-sm text-slate-500">顯示已提交的影像，可切換網格/列表檢視。</p>
         </div>
         <div className="flex gap-2">
           <button
@@ -38,59 +74,29 @@ const AnnotatedListPage: React.FC = () => {
             查看有註解
           </button>
           <button
+            onClick={() => navigate("/healthy")}
+            className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+          >
+            <Images className="h-4 w-4" />
+            健康影像
+          </button>
+          <button
             onClick={() => navigate("/annotate")}
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <ArrowLeft className="h-4 w-4" />
-            返回標註
+            回到標註
           </button>
         </div>
       </header>
 
-      {isLoading && <p className="text-slate-500">載入中...</p>}
-      {isError && <p className="text-red-600">載入失敗，請稍後再試。</p>}
-
-      {data && (
-        <section className="rounded-xl bg-white shadow">
-          <table className="min-w-full divide-y divide-slate-200">
-            <thead className="bg-slate-50 text-sm uppercase text-slate-500">
-              <tr>
-                <th className="px-4 py-3 text-left">編號</th>
-                <th className="px-4 py-3 text-left">檔名</th>
-                <th className="px-4 py-3 text-left w-56">最後更新</th>
-                <th className="px-4 py-3 text-left w-28">標註者</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 text-sm">
-              {data.items.length === 0 && (
-                <tr>
-                  <td colSpan={4} className="px-4 py-4 text-center text-slate-500">
-                    尚無資料
-                  </td>
-                </tr>
-              )}
-              {data.items.map((item) => (
-                <tr
-                  key={`${item.dataset}-${item.task_id}`}
-                  className="hover:bg-slate-50 cursor-pointer"
-                  onClick={() => navigate(`/annotate/${item.index}`)}
-                >
-                  <td className="px-4 py-3 font-mono tabular-nums">{item.index}</td>
-                  <td className="px-4 py-3">{item.image_filename}</td>
-                  <td className="px-4 py-3 text-slate-600">
-                    {new Date(item.last_modified_at).toLocaleString()}
-                  </td>
-                  <td className="px-4 py-3 text-slate-700">
-                    {(item.expert_editor && item.expert_editor[item.expert_editor.length - 1]) ||
-                      (item.general_editor && item.general_editor[item.general_editor.length - 1]) ||
-                      ""}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
+      <TaskImageBrowser
+        items={items}
+        columns={columns}
+        loading={isLoading}
+        error={isError}
+        emptyText="目前沒有已提交項目。"
+      />
     </div>
   );
 };
