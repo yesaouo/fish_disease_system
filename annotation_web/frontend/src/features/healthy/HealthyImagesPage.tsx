@@ -59,7 +59,7 @@ const HealthyImagesPage: React.FC = () => {
         <div>
           <h1 className="text-2xl font-semibold text-slate-800">健康影像</h1>
           <p className="text-sm text-slate-500">
-            顯示 `healthy_images` 的影像，可切換網格/列表檢視。
+            顯示健康的影像，可切換網格/列表檢視。
           </p>
         </div>
         <div className="flex gap-2">
@@ -68,14 +68,14 @@ const HealthyImagesPage: React.FC = () => {
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <CheckCheck className="h-4 w-4" />
-            查看已提交
+            查看提交
           </button>
           <button
             onClick={() => navigate("/commented")}
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <MessageSquareQuote className="h-4 w-4" />
-            查看有註解
+            查看註解
           </button>
           <button
             onClick={() => navigate("/annotate")}

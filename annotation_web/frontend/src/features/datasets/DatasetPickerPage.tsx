@@ -173,6 +173,9 @@ const DatasetPickerPage: React.FC = () => {
                       。
                     </li>
                     <li>
+                      影像來源（國立屏東科技大學）：Tilapia。
+                    </li>
+                    <li>
                       <span className="font-semibold">資料集僅供 AI 模型建置與學術研究使用</span>，
                       不得作為實際魚病診斷之最終依據或治療決策。
                     </li>

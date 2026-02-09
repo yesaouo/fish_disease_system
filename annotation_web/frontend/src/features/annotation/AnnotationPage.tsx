@@ -976,14 +976,14 @@ const AnnotationPage: React.FC = () => {
                 className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               >
                 <MessageSquareQuote className="h-4 w-4" />
-                查看有註解
+                查看註解
               </button>
               <button
                 onClick={() => confirmAndNavigate("/annotated")}
                 className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               >
                 <CheckCheck className="h-4 w-4" />
-                查看已提交
+                查看提交
               </button>
               <button
                 onClick={() => confirmAndNavigate("/healthy")}
