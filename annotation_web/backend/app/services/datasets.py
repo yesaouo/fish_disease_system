@@ -58,7 +58,7 @@ def list_datasets(settings: Settings | None = None) -> List[str]:
             # When dataset-local symptoms is missing, allow global DATA_ROOT/symptoms.json.
             # Restrict to dataset-like folders to avoid listing utility dirs (e.g. backup/).
             if global_symptoms_exists and (
-                (p / "images").is_dir() or (p / "healthy_images").is_dir() or (p / "annotations").is_dir()
+                (p / "images").is_dir() or (p / "healthy_images").is_dir()
             ):
                 items.append(p.name)
 
