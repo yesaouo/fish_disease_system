@@ -159,7 +159,7 @@ All writes are atomic (temp file + rename). Audit entries append to `<DATA_ROOT>
 ## Frontend Highlights
 
 - Login gate with name validation
-- Dataset picker loads class list from `symptoms.json` (falling back to `classes.txt` if needed); selection persisted locally
+- Dataset picker loads class list from dataset `symptoms.json` (falling back to `DATA_ROOT/symptoms.json` if needed); selection persisted locally
 - Annotation workspace
   - `react-konva` canvas with drag/resize in normalized 0–1000 coordinates
   - Side panel for label + evidence (dropdown); ordered global causes/treatments

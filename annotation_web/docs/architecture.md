@@ -8,7 +8,7 @@ The system comprises a FastAPI backend serving JSON tasks and image streams from
 - `app/config.py`: Environment-driven settings (e.g., `DATA_ROOT`, `ROOT_PATH`, cache TTLs, backup settings).
 - `app/models.py`: Pydantic schemas for requests/responses, internal task metadata, and validation.
 - `app/routes/*`: API routers (`/api/login`, `/api/tasks/*`, `/api/datasets/*`, `/api/*/stats`).
-- `app/services/datasets.py`: Dataset discovery, class loading from `symptoms.json` (or legacy `classes.txt`) with timestamp-aware caching.
+- `app/services/datasets.py`: Dataset discovery, class loading from dataset `symptoms.json` (or `DATA_ROOT/symptoms.json` fallback) with timestamp-aware caching.
 - `app/services/tasks.py`: Task cataloguing, dispatch algorithm, and submit/save/skip flows.
 - `app/services/storage.py`: Atomic JSON writes via temp files, audit-log append, and image path resolution.
 - `app/services/stats.py`: Aggregated statistics with 60s in-memory cache and CSV rendering helpers.

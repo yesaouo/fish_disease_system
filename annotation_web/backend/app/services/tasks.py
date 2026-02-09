@@ -175,8 +175,8 @@ def validate_detections(
 ) -> None:
     """Validate detection labels (and evidence index, if required) against dataset config.
 
-    - Allowed labels come from `symptoms.json` (preferred) or legacy `classes.txt`.
-    - Evidence options are derived from `symptoms.json` and validated by index.
+    - Allowed labels come from dataset `symptoms.json`, or `DATA_ROOT/symptoms.json` fallback.
+    - Evidence options are derived from the same `symptoms.json` source and validated by index.
     """
     settings = _ensure_settings(settings)
     allowed = set(classes)
