@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 import json
 from pathlib import Path
 
@@ -15,63 +15,6 @@ _settings = get_settings()
 _stats_cache = TTLCache[str, StatsResponse](_settings.stats_cache_seconds)
 
 HEALTHY_LABEL = storage_service.HEALTHY_LABEL
-
-
-def _aggregate_submissions_from_audit(dataset: str, log_path: Path) -> Dict[str, int]:
-    counts: Dict[str, int] = defaultdict(int)
-    try:
-        if not log_path.exists():
-            return counts
-        with open(log_path, "r", encoding="utf-8") as fp:
-            for line in fp:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if obj.get("dataset") != dataset:
-                    continue
-                if str(obj.get("action") or "") != "submit":
-                    continue
-                user = str(obj.get("who") or "").strip()
-                if user:
-                    counts[user] += 1
-    except Exception:
-        pass
-    return counts
-
-def _aggregate_submissions_from_audit_split(dataset: str, log_path: Path) -> Tuple[Dict[str, int], Dict[str, int]]:
-    general: Dict[str, int] = defaultdict(int)
-    expert: Dict[str, int] = defaultdict(int)
-    try:
-        if not log_path.exists():
-            return general, expert
-        with open(log_path, "r", encoding="utf-8") as fp:
-            for line in fp:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if obj.get("dataset") != dataset:
-                    continue
-                if str(obj.get("action") or "") != "submit":
-                    continue
-                user = str(obj.get("who") or "").strip()
-                if not user:
-                    continue
-                is_expert = bool(obj.get("is_expert", False))
-                if is_expert:
-                    expert[user] += 1
-                else:
-                    general[user] += 1
-    except Exception:
-        pass
-    return general, expert
 
 
 # Removed skip aggregation: skip metrics are no longer tracked
@@ -125,13 +68,9 @@ def _compute_stats(dataset: str, settings: Settings) -> StatsResponse:
     general_completed = 0
     expert_completed = 0
 
-    # Count submissions from audit log (supports multiple submits per task/user).
-    general_submissions, expert_submissions = _aggregate_submissions_from_audit_split(dataset, settings.audit_log_path)
-    submissions: Dict[str, int] = defaultdict(int)
-    for user, count in general_submissions.items():
-        submissions[user] += count
-    for user, count in expert_submissions.items():
-        submissions[user] += count
+    # Count submissions by role from task-level editor fields, not from audit logs.
+    general_submissions: Dict[str, int] = defaultdict(int)
+    expert_submissions: Dict[str, int] = defaultdict(int)
 
     rows = storage_service.list_task_rows(dataset, settings)
     row_by_task_id = {str(r["task_id"]): r for r in rows if str(r["task_id"]) in task_id_set}
@@ -184,8 +123,17 @@ def _compute_stats(dataset: str, settings: Settings) -> StatsResponse:
                 general_editors = []
             if not isinstance(expert_editors, list):
                 expert_editors = []
-            has_general = bool(general_editors)
-            has_expert_submitted = bool(expert_editors)
+
+            general_users = sorted({str(x).strip() for x in general_editors if str(x).strip()})
+            expert_users = sorted({str(x).strip() for x in expert_editors if str(x).strip()})
+            has_general = bool(general_users)
+            has_expert_submitted = bool(expert_users)
+
+            for user in general_users:
+                general_submissions[user] += 1
+            for user in expert_users:
+                expert_submissions[user] += 1
+
             has_comments = int(row["comments_count"] or 0) > 0
             try:
                 raw = json.loads(row["doc_json"])
@@ -208,6 +156,11 @@ def _compute_stats(dataset: str, settings: Settings) -> StatsResponse:
     # Overall completion is "expert complete".
     completed = expert_completed
     completion_rate = (completed / total) if total else 0.0
+    submissions: Dict[str, int] = defaultdict(int)
+    for user, count in general_submissions.items():
+        submissions[user] += count
+    for user, count in expert_submissions.items():
+        submissions[user] += count
 
     return StatsResponse(
         dataset=dataset,
