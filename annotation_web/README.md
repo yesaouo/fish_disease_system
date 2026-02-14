@@ -144,7 +144,6 @@ With the above, the UI runs at `/fish/`, API at `/fish/api/*`, and image links r
 - `POST /api/tasks/next` – random dispatch among untouched tasks
 - `POST /api/tasks/by_index` – fetch task by 1-based index within dataset
 - `POST /api/tasks/{task_id}/submit` – submit annotations for a task
-- `POST /api/tasks/{task_id}/skip` – records skip history (no version bump)
 - `POST /api/tasks/{task_id}/save` – save without marking completion
 - `GET /api/datasets/{dataset}/stats`, `GET /api/admin/stats`
 - `GET /api/admin/tasks` – summary of tasks across datasets
@@ -163,9 +162,8 @@ All writes are atomic (temp file + rename). Audit entries append to `<DATA_ROOT>
 - Annotation workspace
   - `react-konva` canvas with drag/resize in normalized 0–1000 coordinates
   - Side panel for label + evidence (dropdown); ordered global causes/treatments
-  - Shortcuts: `N` add, `Del` remove, `S` submit, `K` skip, `Ctrl+Z/Y` undo/redo
+  - Shortcuts: `N` add, `Del` remove, `Ctrl+S` save, `Ctrl+Z/Y` undo/redo
   - Validation for boxes, labels, and list constraints before submission
-  - Skip reasons: `暫時跳過` / `無法辨識`
 - Admin dashboard with aggregate metrics and CSV export
 
 Unsaved changes trigger a `beforeunload` warning.

@@ -7,8 +7,6 @@ from ..config import Settings
 from ..models import (
     NextTaskRequest,
     NextTaskResponse,
-    SkipTaskRequest,
-    SkipTaskResponse,
     SubmitTaskRequest,
     SubmitTaskResponse,
     TaskByIndexRequest,
@@ -67,25 +65,6 @@ def get_healthy_task_by_index(
 ) -> NextTaskResponse:
     editor_name = body.editor_name or "anonymous"
     return tasks_service.get_healthy_task_by_index(body.dataset, body.index, editor_name, body.is_expert, settings)
-
-
-@router.post("/tasks/{task_id}/skip", response_model=SkipTaskResponse)
-def skip_task(
-    task_id: str,
-    request: SkipTaskRequest,
-    settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
-) -> SkipTaskResponse:
-    editor_name = request.editor_name
-    tasks_service.skip_task(
-        dataset=request.dataset,
-        task_id=task_id,
-        editor_name=editor_name,
-        is_expert=request.is_expert,
-        settings=settings,
-    )
-    return SkipTaskResponse(ok=True)
-
 
 @router.post("/tasks/{task_id}/save", response_model=SaveTaskResponse)
 def save_task(

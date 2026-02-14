@@ -9,7 +9,7 @@ The system comprises a FastAPI backend serving JSON tasks and image streams from
 - `app/models.py`: Pydantic schemas for requests/responses, internal task metadata, and validation.
 - `app/routes/*`: API routers (`/api/login`, `/api/tasks/*`, `/api/datasets/*`, `/api/*/stats`).
 - `app/services/datasets.py`: Dataset discovery, class loading from dataset `symptoms.json` (or `DATA_ROOT/symptoms.json` fallback) with timestamp-aware caching.
-- `app/services/tasks.py`: Task cataloguing, dispatch algorithm, and submit/save/skip flows.
+- `app/services/tasks.py`: Task cataloguing, dispatch algorithm, and submit/save flows.
 - `app/services/storage.py`: Atomic JSON writes via temp files, audit-log append, and image path resolution.
 - `app/services/stats.py`: Aggregated statistics with 60s in-memory cache and CSV rendering helpers.
 - `app/services/backup.py`: Idle-time backup worker that snapshots annotation JSON files.
@@ -30,7 +30,7 @@ Data model notes:
 - `src/api/client.ts`: Fetch wrapper with token handling and TypeScript interfaces (mirroring backend schemas).
 - `src/features/auth`: Name entry page storing display name in `localStorage`.
 - `src/features/datasets`: Dataset picker, class list management, and React Query hooks for caches.
-- `src/features/annotation`: Main workspace with canvas layer (Konva stage), bounding box editing tools, side panel forms, keyboard shortcuts, validation feedback, submit/skip flows.
+- `src/features/annotation`: Main workspace with canvas layer (Konva stage), bounding box editing tools, side panel forms, keyboard shortcuts, validation feedback, and submit flow.
 - `src/features/admin`: Admin metrics view (tables + CSV export).
 - Shared utilities for coordinate clamping/normalization, validation helpers, and ordered list editing (▲/▼ buttons) for global causes/treatments.
 
@@ -43,7 +43,6 @@ Data model notes:
 ## Editing Model
 - `submit`: sets the role editor (`general_editor` or `expert_editor`), saves the task JSON, writes a version snapshot, and appends an audit entry.
 - `save`: saves the task JSON without changing editor fields (does not mark completion).
-- `skip`: appends an audit entry only (no task JSON is modified).
 - No optimistic concurrency (no `version`/`base_version` checks): last write wins.
 
 ## Caching & Performance
@@ -65,4 +64,4 @@ Data model notes:
   - `IDLE_BACKUP_SECONDS` (default `21600`, i.e. 6 hours)
   - `IDLE_CHECK_INTERVAL_SECONDS` (default `60`)
   - `BACKUP_DIRNAME` (default `backup`)
-  The idle detector uses the mtime of `{DATA_ROOT}/audit_log.jsonl` (writes on submit/skip). One backup is created per unchanged activity period; a marker `.last_activity_mtime` prevents duplicates across restarts. Each snapshot includes a top-level `meta.json` with creation time and the source activity mtime.
+  The idle detector uses the mtime of `{DATA_ROOT}/audit_log.jsonl` (writes on submit/save and other audit-logged operations). One backup is created per unchanged activity period; a marker `.last_activity_mtime` prevents duplicates across restarts. Each snapshot includes a top-level `meta.json` with creation time and the source activity mtime.

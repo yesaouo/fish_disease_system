@@ -3,7 +3,7 @@ import { AxiosError } from "axios";
 import { useCallback, useContext, useEffect, useMemo, useReducer, useState, useRef } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { UNSAFE_NavigationContext as NavigationContext } from "react-router";
-import { fetchNextTask, skipTask, submitTask, fetchClasses, fetchLabelMapZh, fetchEvidenceOptionsZh, fetchTaskByIndex, saveTask, moveImageToHealthyImages } from "../../api/client";
+import { fetchNextTask, submitTask, fetchClasses, fetchLabelMapZh, fetchEvidenceOptionsZh, fetchTaskByIndex, saveTask, moveImageToHealthyImages } from "../../api/client";
 import type {
   NextTaskResponse,
   TaskDocument
@@ -33,7 +33,6 @@ import {
   MessageSquareQuote,
   CheckCheck,
   Images,
-  SkipForward,
   AlertTriangle,
   XCircle
 } from "lucide-react";
@@ -724,53 +723,6 @@ const AnnotationPage: React.FC = () => {
     }
   };
 
-  const handleSkip = async () => {
-    if (!task || !dataset || !name) return;
-
-    // 🟡 非提交：若有變更，先提醒使用者
-    if (dirty) {
-      const ok = window.confirm("目前有未儲存的變更，離開將放棄這些變更。確定要跳過嗎？");
-      if (!ok) return;
-    }
-
-    setSaving(true);
-    dispatch({ type: "RESET_ERRORS" });
-
-    try {
-      await skipTask(task.task_id, {
-        dataset,
-        editor_name: name,
-        is_expert: isExpert
-      });
-
-      // 原本邏輯：跳過後由系統派發下一張
-      // await runWithBypass(() => goNext());
-
-      // 新邏輯：跳過後前往「下一個編號」
-      const currentIdx = routeIndex != null ? routeIndex : task.index;
-      const nextIdx = (currentIdx ?? 0) + 1;
-      await runWithBypass(() => navigate(`/annotate/${nextIdx}`, { replace: true }));
-
-    } catch (err) {
-      const axiosErr = err as AxiosError<{ detail?: string }>;
-      if (axiosErr.response?.status === 409) {
-        setError("此任務已被更新，請再試一次。");
-        // 原本邏輯：發派下一張
-        // await runWithBypass(() => goNext());
-        // 新邏輯：改為下一個編號
-        const currentIdx = routeIndex != null ? routeIndex : task.index;
-        const nextIdx = (currentIdx ?? 0) + 1;
-        await runWithBypass(() => navigate(`/annotate/${nextIdx}`, { replace: true }));
-      } else if (axiosErr.response?.data?.detail) {
-        setError(axiosErr.response.data.detail);
-      } else {
-        setError("跳過失敗，請稍後再試。");
-      }
-    } finally {
-      setSaving(false);
-    }
-  };
-
   const handleMoveToHealthyImages = async () => {
     if (!task || !dataset || !doc) return;
 
@@ -916,7 +868,6 @@ const AnnotationPage: React.FC = () => {
   const undoDisabled = !!(loading || saving || !history?.length);
   const redoDisabled = !!(loading || saving || !future?.length);
   const saveDisabled = !!(loading || saving || !doc || !task);
-  const skipDisabled = !!(loading || saving || !task);
   const submitDisabled = !!(loading || saving || !doc || !task);
   const moveToHealthyDisabled = !!(loading || saving || !doc || !task);
 
@@ -1052,7 +1003,7 @@ const AnnotationPage: React.FC = () => {
               </IconButton>
             </div>
 
-            {/* 右側：跳過／提交 與快捷鍵提示 */}
+            {/* 右側：操作按鈕與快捷鍵提示 */}
             <div className="flex flex-wrap items-center gap-2">
               <div className="hidden items-center gap-2 text-xs text-slate-500 md:flex">
                 <span className="inline-flex items-center gap-1">新增<Kbd>N</Kbd></span>
@@ -1063,16 +1014,6 @@ const AnnotationPage: React.FC = () => {
               </div>
 
               <Separator vertical className="hidden md:block" />
-
-              <button
-                type="button"
-                onClick={handleSkip}
-                className="inline-flex items-center justify-center rounded-md border border-amber-400 bg-amber-50 px-4 py-2 text-sm font-medium text-amber-700 shadow-sm transition-colors hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 disabled:pointer-events-none disabled:opacity-50"
-                disabled={skipDisabled}
-              >
-                <SkipForward className="mr-1 h-4 w-4" />
-                跳過
-              </button>
 
               <button
                 type="button"

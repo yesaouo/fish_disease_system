@@ -50,16 +50,6 @@ export type SubmitTaskResponse = {
   ok: boolean;
 };
 
-export type SkipTaskRequest = {
-  dataset: string;
-  editor_name: string;
-  is_expert: boolean;
-};
-
-export type SkipTaskResponse = {
-  ok: boolean;
-};
-
 export type DatasetStats = {
   dataset: string;
   total_tasks: number;

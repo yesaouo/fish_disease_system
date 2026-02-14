@@ -289,25 +289,6 @@ class SubmitTaskRequest(BaseModel):
 class SubmitTaskResponse(BaseModel):
     ok: bool
 
-class SkipTaskRequest(BaseModel):
-    dataset: str
-    editor_name: str
-    is_expert: bool = True
-
-    @field_validator("dataset")
-    def _validate_dataset(cls, value: str) -> str:
-        return value.strip()
-
-    @field_validator("editor_name")
-    def _validate_editor(cls, value: str) -> str:
-        name = value.strip()
-        if not NAME_PATTERN.match(name):
-            raise ValueError("editor_name 僅限中英文，長度 1-32")
-        return name
-
-class SkipTaskResponse(BaseModel):
-    ok: bool = True
-
 class StatsResponse(BaseModel):
     dataset: str
     total_tasks: int

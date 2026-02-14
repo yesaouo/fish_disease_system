@@ -295,14 +295,13 @@ const DatasetPickerPage: React.FC = () => {
 
           <li>
             <span className="font-semibold">切換影像</span>
-            ：使用上方膠囊輸入列的「上一個／下一個」箭頭，或輸入編號後按「前往」。提交或跳過後會自動載入下一張影像。
+            ：使用上方膠囊輸入列的「上一個／下一個」箭頭，或輸入編號後按「前往」。提交後會自動載入下一張影像。
           </li>
 
           <li>
-            <span className="font-semibold">跳過與提交</span>
+            <span className="font-semibold">提交</span>
             ：
             <ul className="mt-2 list-disc pl-4">
-              <li><span className="font-medium">跳過</span>：點擊「跳過」按鈕，可略過此影像（僅記錄於日誌，不影響派發）。若有未保存變更會先提示確認。</li>
               <li><span className="font-medium">提交</span>：點擊「提交」按鈕（會跳出確認視窗）。提交成功後，此影像將不再重新分派並自動前往下一張。</li>
             </ul>
           </li>
@@ -318,7 +317,7 @@ const DatasetPickerPage: React.FC = () => {
 
           <li>
             <span className="font-semibold">未保存離開提醒</span>
-            ：若存在未保存變更，直接離開或導向其他頁面時會跳出提醒；「提交」與「跳過」流程會暫時放行導頁。
+            ：若存在未保存變更，直接離開或導向其他頁面時會跳出提醒；「提交」流程會暫時放行導頁。
           </li>
         </ol>
 

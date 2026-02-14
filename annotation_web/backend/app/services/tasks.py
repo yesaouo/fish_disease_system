@@ -357,28 +357,6 @@ def get_healthy_task_by_index(
     )
 
 
-def skip_task(
-    dataset: str,
-    task_id: str,
-    editor_name: str,
-    is_expert: bool,
-    settings: Settings | None = None,
-) -> None:
-    settings = _ensure_settings(settings)
-    now = _now_iso()
-    storage_service.append_audit_log(
-        {
-            "who": editor_name,
-            "when": now.isoformat(),
-            "dataset": dataset,
-            "task_id": task_id,
-            "action": "skip",
-            "is_expert": is_expert,
-        },
-        settings,
-    )
-
-
 def save_task(
     dataset: str,
     task_id: str,

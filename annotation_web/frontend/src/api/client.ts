@@ -6,8 +6,6 @@ import type {
   ImageListResponse,
   LoginResponse,
   NextTaskResponse,
-  SkipTaskRequest,
-  SkipTaskResponse,
   SubmitTaskRequest,
   SubmitTaskResponse,
   LabelMapZhResponse,
@@ -114,17 +112,6 @@ export const saveTask = async (
 ): Promise<SaveTaskResponse> => {
   const { data } = await http.post<SaveTaskResponse>(
     `/tasks/${encodeURIComponent(taskId)}/save`,
-    payload
-  );
-  return data;
-};
-
-export const skipTask = async (
-  taskId: string,
-  payload: SkipTaskRequest
-): Promise<SkipTaskResponse> => {
-  const { data } = await http.post<SkipTaskResponse>(
-    `/tasks/${encodeURIComponent(taskId)}/skip`,
     payload
   );
   return data;
