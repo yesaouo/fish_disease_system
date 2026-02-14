@@ -13,6 +13,7 @@ import { UNSAFE_NavigationContext as NavigationContext } from "react-router";
 import {
   AlertTriangle,
   ArrowLeft,
+  Images,
   Redo2,
   Save,
   SquarePlus,
@@ -25,7 +26,6 @@ import {
   fetchHealthyTaskByIndex,
   moveHealthyImageToImages,
   saveTask,
-  submitTask,
 } from "../../api/client";
 import type {
   Comment as TaskComment,
@@ -273,43 +273,6 @@ const useNavBlocker = (
     });
     return unblock;
   }, [when, navigator, bypass]);
-};
-
-const validateHealthyDocument = (doc: TaskDocument): ValidationError[] => {
-  const errors: ValidationError[] = [];
-  const width = doc.image_width || 0;
-  const height = doc.image_height || 0;
-
-  doc.detections.forEach((det, idx) => {
-    const [x1, y1, x2, y2] = det.box_xyxy;
-    if (x1 < 0 || y1 < 0 || x2 > width || y2 > height) {
-      errors.push({
-        field: `detections.${idx}.box_xyxy`,
-        message: "框必須在圖片範圍內",
-      });
-    }
-    if (x2 <= x1 || y2 <= y1) {
-      errors.push({
-        field: `detections.${idx}.box_xyxy`,
-        message: "框座標需滿足 x2>x1 且 y2>y1",
-      });
-    }
-
-    const label = (det.label ?? "").trim();
-    if (!label) {
-      errors.push({
-        field: `detections.${idx}.label`,
-        message: "請選擇表徵類別",
-      });
-    } else if (label !== HEALTHY_LABEL) {
-      errors.push({
-        field: `detections.${idx}.label`,
-        message: `僅允許：${HEALTHY_LABEL_DISPLAY}`,
-      });
-    }
-  });
-
-  return errors;
 };
 
 const withBase = (path: string) => {
@@ -622,38 +585,6 @@ const HealthyAnnotationPage: React.FC = () => {
     }
   }, [dataset, doc, isExpert, name, task]);
 
-  const handleSubmit = useCallback(async () => {
-    if (!doc || !task || !dataset || !name) return;
-    const ok = window.confirm("確定要送出標註嗎？");
-    if (!ok) return;
-
-    const errors = validateHealthyDocument(doc);
-    if (errors.length) {
-      dispatch({ type: "SET_ERRORS", errors });
-      setTimeout(() => jumpToFirstError(), 0);
-      return;
-    }
-
-    setSaving(true);
-    dispatch({ type: "RESET_ERRORS" });
-    try {
-      await submitTask(task.task_id, {
-        full_json: doc,
-        editor_name: name,
-        is_expert: isExpert,
-      });
-      setTask((prev) =>
-        prev ? { ...prev, task: cloneTaskDocument(doc) } : prev
-      );
-      window.alert("已提交。");
-    } catch (err) {
-      const axiosErr = err as AxiosError<{ detail?: string }>;
-      setError(axiosErr.response?.data?.detail || "提交失敗，請稍後再試。");
-    } finally {
-      setSaving(false);
-    }
-  }, [dataset, doc, isExpert, jumpToFirstError, name, task]);
-
   const handleMoveToImages = useCallback(async () => {
     if (!task || !dataset || !doc) return;
 
@@ -662,7 +593,7 @@ const HealthyAnnotationPage: React.FC = () => {
       if (!ok) return;
     }
 
-    const confirm = window.confirm("確定要將這張影像判定為異常嗎？判定後會移回 /images。");
+    const confirm = window.confirm("確定要將這張影像判定為異常嗎？判定後會移回異常影像集。");
     if (!confirm) return;
 
     setSaving(true);
@@ -686,7 +617,6 @@ const HealthyAnnotationPage: React.FC = () => {
   const undoDisabled = loading || saving || !doc || history.length === 0;
   const redoDisabled = loading || saving || !doc || future.length === 0;
   const saveDisabled = loading || saving || !doc || !task || !dirty;
-  const submitDisabled = loading || saving || !doc || !task;
   const moveDisabled = loading || saving || !doc || !task;
 
   useEffect(() => {
@@ -805,13 +735,15 @@ const HealthyAnnotationPage: React.FC = () => {
                 onClick={() => confirmAndNavigate("/healthy")}
                 className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               >
+                <Images className="h-4 w-4" />
                 健康影像
               </button>
               <button
                 onClick={() => confirmAndNavigate("/annotate")}
                 className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               >
-                回到標註
+                <AlertTriangle className="h-4 w-4" />
+                異常影像
               </button>
             </div>
           </div>
@@ -889,15 +821,6 @@ const HealthyAnnotationPage: React.FC = () => {
                 title="判定為異常"
               >
                 判定為異常
-              </button>
-
-              <button
-                type="button"
-                onClick={handleSubmit}
-                className="inline-flex items-center justify-center rounded-md border border-transparent bg-sky-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-sky-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 disabled:pointer-events-none disabled:opacity-50"
-                disabled={submitDisabled}
-              >
-                提交
               </button>
             </div>
           </div>

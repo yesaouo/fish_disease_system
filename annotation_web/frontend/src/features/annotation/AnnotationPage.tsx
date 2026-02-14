@@ -781,7 +781,7 @@ const AnnotationPage: React.FC = () => {
     }
 
     const confirm = window.confirm(
-      "確定要將這張影像判定為健康嗎？判定後會移到 /healthy_images。"
+      "確定要將這張影像判定為健康嗎？判定後會移到健康影像集。"
     );
     if (!confirm) return;
 

@@ -32,7 +32,6 @@ const HealthyImagesPage: React.FC = () => {
   const columns: TaskImageBrowserColumn[] = useMemo(
     () => [
       { key: "index", label: "編號", cellClassName: "font-mono tabular-nums" },
-      { key: "bucket", label: "來源" },
     ],
     []
   );
@@ -47,7 +46,6 @@ const HealthyImagesPage: React.FC = () => {
       onOpen: () => navigate(`/healthy/${index + 1}`),
       fields: {
         index: index + 1,
-        bucket: "healthy_images",
       },
     }));
   }, [data, dataset, navigate]);
