@@ -44,7 +44,7 @@ import {
 } from "../../lib/taskUtils";
 
 const HEALTHY_LABEL = "healthy_region";
-const HEALTHY_LABEL_DISPLAY = "健康特徵(healthy_region)";
+const HEALTHY_LABEL_DISPLAY = "健康特徵";
 
 const baseUrl = import.meta.env.BASE_URL || "/";
 
