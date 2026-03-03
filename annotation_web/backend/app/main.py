@@ -7,7 +7,7 @@ from fastapi import FastAPI
 
 from .routes import auth, datasets, stats, tasks
 from .config import get_settings
-from .services.backup import idle_backup_worker
+from .services.backup import daily_backup_worker
 
 
 def create_app() -> FastAPI:
@@ -29,8 +29,8 @@ def create_app() -> FastAPI:
     async def _start_background() -> None:
         nonlocal worker_task
         settings = get_settings()
-        if settings.idle_backup_enabled:
-            worker_task = asyncio.create_task(idle_backup_worker(settings))
+        if settings.daily_backup_enabled:
+            worker_task = asyncio.create_task(daily_backup_worker(settings))
 
     @app.on_event("shutdown")
     async def _stop_background() -> None:

@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Set
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,10 +24,16 @@ class Settings(BaseSettings):
     dataset_cache_seconds: int = Field(default=60, ge=0)
     classes_cache_seconds: int = Field(default=60, ge=0)
     audit_log_filename: str = Field(default="audit_log.jsonl")
-    # Idle-backup settings
-    idle_backup_enabled: bool = Field(default=True)
-    idle_backup_seconds: int = Field(default=21600, ge=60)  # 6 hours
-    idle_check_interval_seconds: int = Field(default=60, ge=5)
+    # Daily backup settings. Legacy IDLE_* env names remain supported.
+    daily_backup_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("DAILY_BACKUP_ENABLED", "IDLE_BACKUP_ENABLED"),
+    )
+    daily_check_interval_seconds: int = Field(
+        default=60,
+        ge=5,
+        validation_alias=AliasChoices("DAILY_CHECK_INTERVAL_SECONDS", "IDLE_CHECK_INTERVAL_SECONDS"),
+    )
     backup_dirname: str = Field(default="backup")
     # Auth keys file (one key per line) under data_root by default
     auth_keys_filename: str = Field(default="auth_keys.txt")

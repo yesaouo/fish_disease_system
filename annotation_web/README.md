@@ -98,9 +98,8 @@ Environment variables (case-insensitive; JSON for list-like values, e.g. IMAGE_E
 | `CLASSES_CACHE_SECONDS` | `60` | Cache window for class list |
 | `AUDIT_LOG_FILENAME` | `audit_log.jsonl` | File name under `DATA_ROOT` for audit log |
 | `AUTH_KEYS_FILENAME` | `auth_keys.txt` | API key file under `DATA_ROOT` (one key per line; blank lines/# ignored) |
-| `IDLE_BACKUP_ENABLED` | `true` | Enable idle-time dataset backups |
-| `IDLE_BACKUP_SECONDS` | `21600` | Idle duration before a backup (seconds) |
-| `IDLE_CHECK_INTERVAL_SECONDS` | `60` | Polling interval for idle checks |
+| `DAILY_BACKUP_ENABLED` | `true` | Enable daily dataset backups |
+| `DAILY_CHECK_INTERVAL_SECONDS` | `60` | Polling interval for checking whether today's backup is needed |
 | `BACKUP_DIRNAME` | `backup` | Subfolder inside `DATA_ROOT` for backups |
 | `ROOT_PATH` | `` | API root path prefix (e.g. `/fish`) |
 
@@ -110,6 +109,7 @@ Health check: `GET /healthz` returns `{status: "ok"}` when the API is healthy.
 
 - Backend reads environment variables from `backend/.env` by default. See `.env.example`.
 - You can override the env file path via `ENV_FILE=...`.
+- Legacy env names `IDLE_BACKUP_ENABLED` and `IDLE_CHECK_INTERVAL_SECONDS` are still accepted for backward compatibility.
 - Frontend is configured via `frontend/vite.config.ts` (proxy/base). If you need Vite env vars, add `frontend/.env` following Vite conventions.
 
 
