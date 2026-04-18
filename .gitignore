@@ -1,4 +1,3 @@
-data/
 note/
 annotation_web/frontend/dist/
 
@@ -9,3 +8,5 @@ annotation_web/frontend/dist/
 
 **/node_modules/
 **/__pycache__/
+**/data/
+**/outputs/

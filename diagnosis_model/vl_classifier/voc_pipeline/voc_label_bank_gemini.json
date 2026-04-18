@@ -1,0 +1,206 @@
+{
+  "label_map": {
+    "0": { "en": "aeroplane", "zh": "飛機" },
+    "1": { "en": "bicycle", "zh": "腳踏車" },
+    "2": { "en": "bird", "zh": "鳥" },
+    "3": { "en": "boat", "zh": "船" },
+    "4": { "en": "bottle", "zh": "瓶子" },
+    "5": { "en": "bus", "zh": "公車" },
+    "6": { "en": "car", "zh": "汽車" },
+    "7": { "en": "cat", "zh": "貓" },
+    "8": { "en": "chair", "zh": "椅子" },
+    "9": { "en": "cow", "zh": "牛" },
+    "10": { "en": "diningtable", "zh": "餐桌" },
+    "11": { "en": "dog", "zh": "狗" },
+    "12": { "en": "horse", "zh": "馬" },
+    "13": { "en": "motorbike", "zh": "機車" },
+    "14": { "en": "person", "zh": "人" },
+    "15": { "en": "pottedplant", "zh": "盆栽" },
+    "16": { "en": "sheep", "zh": "羊" },
+    "17": { "en": "sofa", "zh": "沙發" },
+    "18": { "en": "train", "zh": "火車" },
+    "19": { "en": "tvmonitor", "zh": "螢幕" }
+  },
+  "data": {
+    "0": {
+      "captions_en": [
+        "a large passenger aeroplane soaring through a clear blue sky with visible condensation trails",
+        "an aeroplane parked on the airport tarmac undergoing routine maintenance and refueling",
+        "a side view of a commercial aeroplane with visible passenger windows, wings, and jet engines",
+        "a small propeller aeroplane taxiing along the runway preparing for an upcoming takeoff",
+        "an aeroplane captured in mid-air with its landing gear fully retracted into the fuselage"
+      ]
+    },
+    "1": {
+      "captions_en": [
+        "a bicycle parked against a brick wall featuring a sturdy metal frame and thick rubber tires",
+        "a mountain bicycle equipped with knobby tires and a complex suspension system for rough terrain",
+        "a side view of a bicycle showing the mechanical chain, pedals, saddle, and handlebars clearly",
+        "a classic city bicycle featuring a front woven basket and a rear storage rack for commuting",
+        "a bicycle resting steadily on its kickstand on a paved sidewalk during a sunny day"
+      ]
+    },
+    "2": {
+      "captions_en": [
+        "a small bird perched securely on a thin tree branch with its colorful feathers neatly arranged",
+        "a bird captured in mid-flight with its wings fully spread against a bright, cloudless sky",
+        "a water bird standing in shallow water using its long beak to forage for food beneath the surface",
+        "a close-up view of a bird showing intricate feather patterns and bright, alert eyes looking forward",
+        "a resting bird with its head tucked slightly, displaying a smooth and plump silhouette"
+      ]
+    },
+    "3": {
+      "captions_en": [
+        "a small wooden boat floating gently on the calm, reflective surface of a clear lake",
+        "a sailing boat with its large white canvas sails fully deployed and catching the ocean breeze",
+        "a motor boat speeding across the open water, leaving a prominent white wake behind its stern",
+        "a large fishing boat moored at the wooden dock with heavy nets and equipment visible on deck",
+        "a side view of a boat resting securely on a sandy beach just above the shoreline water mark"
+      ]
+    },
+    "4": {
+      "captions_en": [
+        "a clear glass bottle filled with a transparent liquid standing upright on a flat wooden table",
+        "a plastic water bottle with a tightly sealed cap and visible moisture condensation on the outside",
+        "an empty wine bottle with a printed paper label adhered tightly to its smooth cylindrical body",
+        "a brightly colored bottle positioned centrally with ambient light reflecting off its curved surface",
+        "a narrow-necked bottle resting alongside other dining items in a well-lit indoor environment"
+      ]
+    },
+    "5": {
+      "captions_en": [
+        "a large public transit bus driving down a busy city street with seated passengers visible inside",
+        "a yellow school bus parked by the curb with its safety stop sign retracted and doors completely closed",
+        "a tall double-decker bus displaying bright, colorful advertisements on its long metallic side panels",
+        "a side view of a modern city bus showing large rectangular tinted windows and pneumatic doors",
+        "a passenger bus stopped at a designated transit station waiting patiently for commuters to board"
+      ]
+    },
+    "6": {
+      "captions_en": [
+        "a sleek modern car parked on a paved residential driveway with a glossy metallic paint finish",
+        "a four-door passenger car traveling swiftly along a highway with its front headlights turned on",
+        "a vintage car showcasing classic curved bodywork, polished chrome bumpers, and round headlights",
+        "a side profile of a sports car featuring aerodynamic lines, low ground clearance, and large alloy wheels",
+        "a compact city car stopped at a red traffic light in the middle of a dense urban environment"
+      ]
+    },
+    "7": {
+      "captions_en": [
+        "a fluffy cat curled up comfortably on a soft cushion with its eyes half-closed in a relaxed state",
+        "an alert cat sitting upright with pointed ears and a long furry tail wrapping neatly around its paws",
+        "a stray cat walking carefully and maintaining balance along the top edge of a narrow brick wall",
+        "a close-up of a cat's face highlighting its prominent long whiskers and bright, highly focused eyes",
+        "a playful cat stretching its body with unsheathed claws and a relaxed, elongated posture"
+      ]
+    },
+    "8": {
+      "captions_en": [
+        "a sturdy wooden chair with a tall slatted backrest and four thick legs placed in a dining room",
+        "an ergonomic office chair featuring a breathable mesh back, padded armrests, and a wheeled base",
+        "a comfortable upholstered chair with thick cushioning resting quietly in the corner of a living room",
+        "a simple folding chair made of thin metal and molded plastic standing empty on a tiled floor",
+        "a high-backed chair casting a distinct, sharp shadow onto the floor under bright overhead lighting"
+      ]
+    },
+    "9": {
+      "captions_en": [
+        "a large dairy cow with distinct black and white patches grazing peacefully in a lush grassy field",
+        "a mature cow standing in a muddy enclosure displaying prominent horns and a heavy, robust body",
+        "a side view of a brown cow resting on the ground and chewing cud under the shade of a large tree",
+        "a cow looking directly toward the camera with a wet, textured nose and large, gentle eyes",
+        "a cow standing closely alongside a weathered wooden fence in a vast rural agricultural setting"
+      ]
+    },
+    "10": {
+      "captions_en": [
+        "a large rectangular dining table made of polished dark wood with matching chairs tucked underneath",
+        "a circular dining table covered with a white patterned tablecloth and set with clean, shiny cutlery",
+        "a bare wooden dining table positioned directly in the center of a brightly lit modern kitchen",
+        "a long dining table neatly arranged with white plates, tall wine glasses, and a floral centerpiece",
+        "a sturdy glass-topped dining table reflecting the ambient light from the room's elegant chandelier"
+      ]
+    },
+    "11": {
+      "captions_en": [
+        "a medium-sized dog standing alert on a grassy lawn with its ears perked up and tail wagging happily",
+        "a tired dog lying flat on the indoor floor with its heavy head resting gently on its front paws",
+        "a dog with a thick, well-groomed coat panting slightly while looking attentively towards the camera",
+        "a playful dog running actively through a public park with a bright tennis ball held firmly in its mouth",
+        "a side view of a dog showing its lean athletic build, straight back, and distinct facial profile"
+      ]
+    },
+    "12": {
+      "captions_en": [
+        "a tall, muscular horse with a shiny, well-brushed brown coat standing quietly in a fenced pasture",
+        "a galloping horse captured in dynamic motion with its long mane and tail flowing freely in the wind",
+        "a saddled horse wearing a leather bridle and waiting patiently for its rider near a wooden stable",
+        "a close-up view of a horse's head showing its distinct white blaze, flared nostrils, and alert ears",
+        "a horse leaning down naturally to eat fresh hay scattered on the ground in a rural farm environment"
+      ]
+    },
+    "13": {
+      "captions_en": [
+        "a heavy cruiser motorbike parked securely on the city street with gleaming chrome exhaust pipes",
+        "a sleek sports motorbike featuring smooth aerodynamic fairings and brightly colored racing decals",
+        "a side view of a motorbike showing its exposed mechanical engine block, suspension, and large tires",
+        "a person riding a motorbike down a paved road while wearing a protective full-face safety helmet",
+        "a standard commuter motorbike resting securely on its center stand on a textured concrete pavement"
+      ]
+    },
+    "14": {
+      "captions_en": [
+        "a person standing upright in casual daily clothing facing the camera with a natural, relaxed posture",
+        "a person walking briskly down a busy city sidewalk carrying a brown leather bag over one shoulder",
+        "a side profile of a person sitting quietly on a wooden park bench reading a printed daily newspaper",
+        "a person captured mid-action while running, showing dynamic limb movement and wearing sportswear",
+        "a person wearing formal business attire standing indoors against a slightly blurred background"
+      ]
+    },
+    "15": {
+      "captions_en": [
+        "a healthy potted plant with broad, vibrant green leaves growing from a decorative ceramic container",
+        "a small fleshy succulent plant resting in a textured terracotta pot on a brightly lit wooden windowsill",
+        "a tall indoor potted plant featuring a thick central woody stem and drooping, glossy dark foliage",
+        "a flowering potted plant displaying vibrant, fully bloomed blossoms alongside dense green leaves",
+        "a hanging potted plant with long trailing vines cascading downward from a suspended woven basket"
+      ]
+    },
+    "16": {
+      "captions_en": [
+        "a sheep covered in a thick, fluffy white fleece standing gracefully on a bright green hillside",
+        "a group of sheep grazing closely together in an open rural pasture under a clear, expansive sky",
+        "a sheep with tightly curved horns resting comfortably on the grass, chewing cud in a relaxed manner",
+        "a close-up of a sheep's face highlighting its distinctive woolly topknot and dark, horizontal pupils",
+        "a recently shorn sheep displaying its slender, exposed body profile against a rustic farm background"
+      ]
+    },
+    "17": {
+      "captions_en": [
+        "a spacious three-seater sofa covered in soft grey fabric, accented with several decorative throw pillows",
+        "a luxurious leather sofa featuring deep traditional button tufting and thick padded rounded armrests",
+        "a modern minimalist sofa featuring clean, straight geometric lines and thin metallic support legs",
+        "a comfortable L-shaped sectional sofa occupying the corner space of a brightly lit modern living room",
+        "a cozy two-seater sofa positioned perfectly centered in front of a low rectangular wooden coffee table"
+      ]
+    },
+    "18": {
+      "captions_en": [
+        "a long freight train hauling numerous heavily loaded metal cargo containers along a straight steel track",
+        "a modern high-speed passenger train moving rapidly through the countryside with an aerodynamic nose",
+        "a classic steam train billowing thick white smoke from its front chimney as it departs the station",
+        "a passenger train waiting idly at a concrete platform with its sliding doors fully open for boarding",
+        "a front view of a train locomotive featuring large, bright illumination headlights and a robust pilot"
+      ]
+    },
+    "19": {
+      "captions_en": [
+        "a large flat-screen TV monitor mounted flush against a living room wall displaying a vivid, bright image",
+        "a desktop computer monitor resting stably on a stand with its screen powered off and appearing entirely black",
+        "a modern television set with an ultra-thin frame bezel positioned carefully on a wooden media console",
+        "a glowing TV monitor in a dimly lit room casting bright, shifting colorful light into the surrounding area",
+        "a side view of a slim electronic monitor showing its extremely thin profile and rear cable connection ports"
+      ]
+    }
+  }
+}

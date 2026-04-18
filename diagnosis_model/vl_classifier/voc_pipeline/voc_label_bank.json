@@ -1,0 +1,226 @@
+{
+  "label_map": {
+    "0": {
+      "en": "aeroplane",
+      "zh": "飛機"
+    },
+    "1": {
+      "en": "bicycle",
+      "zh": "腳踏車"
+    },
+    "2": {
+      "en": "bird",
+      "zh": "鳥"
+    },
+    "3": {
+      "en": "boat",
+      "zh": "船"
+    },
+    "4": {
+      "en": "bottle",
+      "zh": "瓶子"
+    },
+    "5": {
+      "en": "bus",
+      "zh": "公車"
+    },
+    "6": {
+      "en": "car",
+      "zh": "汽車"
+    },
+    "7": {
+      "en": "cat",
+      "zh": "貓"
+    },
+    "8": {
+      "en": "chair",
+      "zh": "椅子"
+    },
+    "9": {
+      "en": "cow",
+      "zh": "牛"
+    },
+    "10": {
+      "en": "diningtable",
+      "zh": "餐桌"
+    },
+    "11": {
+      "en": "dog",
+      "zh": "狗"
+    },
+    "12": {
+      "en": "horse",
+      "zh": "馬"
+    },
+    "13": {
+      "en": "motorbike",
+      "zh": "機車"
+    },
+    "14": {
+      "en": "person",
+      "zh": "人"
+    },
+    "15": {
+      "en": "pottedplant",
+      "zh": "盆栽"
+    },
+    "16": {
+      "en": "sheep",
+      "zh": "羊"
+    },
+    "17": {
+      "en": "sofa",
+      "zh": "沙發"
+    },
+    "18": {
+      "en": "train",
+      "zh": "火車"
+    },
+    "19": {
+      "en": "tvmonitor",
+      "zh": "螢幕"
+    }
+  },
+  "data": {
+    "0": {
+      "captions_en": [
+        "aeroplane",
+        "an aeroplane",
+        "a photo of an aeroplane"
+      ]
+    },
+    "1": {
+      "captions_en": [
+        "bicycle",
+        "a bicycle",
+        "a photo of a bicycle"
+      ]
+    },
+    "2": {
+      "captions_en": [
+        "bird",
+        "a bird",
+        "a photo of a bird"
+      ]
+    },
+    "3": {
+      "captions_en": [
+        "boat",
+        "a boat",
+        "a photo of a boat"
+      ]
+    },
+    "4": {
+      "captions_en": [
+        "bottle",
+        "a bottle",
+        "a photo of a bottle"
+      ]
+    },
+    "5": {
+      "captions_en": [
+        "bus",
+        "a bus",
+        "a photo of a bus"
+      ]
+    },
+    "6": {
+      "captions_en": [
+        "car",
+        "a car",
+        "a photo of a car"
+      ]
+    },
+    "7": {
+      "captions_en": [
+        "cat",
+        "a cat",
+        "a photo of a cat"
+      ]
+    },
+    "8": {
+      "captions_en": [
+        "chair",
+        "a chair",
+        "a photo of a chair"
+      ]
+    },
+    "9": {
+      "captions_en": [
+        "cow",
+        "a cow",
+        "a photo of a cow"
+      ]
+    },
+    "10": {
+      "captions_en": [
+        "diningtable",
+        "a diningtable",
+        "a photo of a diningtable"
+      ]
+    },
+    "11": {
+      "captions_en": [
+        "dog",
+        "a dog",
+        "a photo of a dog"
+      ]
+    },
+    "12": {
+      "captions_en": [
+        "horse",
+        "a horse",
+        "a photo of a horse"
+      ]
+    },
+    "13": {
+      "captions_en": [
+        "motorbike",
+        "a motorbike",
+        "a photo of a motorbike"
+      ]
+    },
+    "14": {
+      "captions_en": [
+        "person",
+        "a person",
+        "a photo of a person"
+      ]
+    },
+    "15": {
+      "captions_en": [
+        "pottedplant",
+        "a pottedplant",
+        "a photo of a pottedplant"
+      ]
+    },
+    "16": {
+      "captions_en": [
+        "sheep",
+        "a sheep",
+        "a photo of a sheep"
+      ]
+    },
+    "17": {
+      "captions_en": [
+        "sofa",
+        "a sofa",
+        "a photo of a sofa"
+      ]
+    },
+    "18": {
+      "captions_en": [
+        "train",
+        "a train",
+        "a photo of a train"
+      ]
+    },
+    "19": {
+      "captions_en": [
+        "tvmonitor",
+        "a tvmonitor",
+        "a photo of a tvmonitor"
+      ]
+    }
+  }
+}
