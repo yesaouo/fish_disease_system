@@ -3,7 +3,7 @@ const path = require("path");
 // conda info --base
 const CONDA_BASE = "/home/lab603/anaconda3";  // 改成你的 conda base
 const CONDA_ENV  = "annotation_web";  // 固定 conda env 名稱
-const LOG_ROOT   = "/home/lab603/桌面/YJ/fish_disease_system/data/annotation/logs"; // 固定 log 目錄
+const LOG_ROOT   = "/mnt/ssd/YJ/fish_disease_system/data/annotation/logs"; // 固定 log 目錄
 const PYTHON = path.join(CONDA_BASE, "envs", CONDA_ENV, "bin", "python");
 
 module.exports = {

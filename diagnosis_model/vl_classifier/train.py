@@ -26,8 +26,8 @@ DEFAULT_CONFIG = {
     # model/data
     # "model_name": "openai/clip-vit-base-patch16",
     "model_name": "google/siglip2-base-patch16-224",
-    "data_root": "/home/lab603/桌面/YJ/fish_disease_system/data/coco/_merged",
-    "symptoms_file": "/home/lab603/桌面/YJ/fish_disease_system/data/annotation/backup/20260207/fish_disease/symptoms.json",
+    "data_root": "/mnt/ssd/YJ/fish_disease_system/data/coco/_merged",
+    "symptoms_file": "/mnt/ssd/YJ/fish_disease_system/data/annotation/backup/20260207/fish_disease/symptoms.json",
     "output_dir": None,
     "crop_mode": "bbox",  # "bbox" or "square"
 
