@@ -27,6 +27,21 @@ _LABEL2RGB255 = {}
 _LABEL2BGR255 = {}
 
 
+# =========================
+# Prompt templates (與 train.py 對齊)
+# =========================
+PROMPT_EN = "This is {cap}."
+PROMPT_ZH = "{cap}。"
+
+
+def format_caption(cap: str, lang: str) -> str:
+    if lang == "en":
+        return PROMPT_EN.format(cap=str(cap).lower())
+    if lang == "zh":
+        return PROMPT_ZH.format(cap=str(cap))
+    return str(cap)
+
+
 def _label_to_rgb255(label: str, s: float = 0.65, v: float = 0.95):
     h = (zlib.crc32(str(label).encode("utf-8")) & 0xFFFFFFFF) / 2**32
     r, g, b = colorsys.hsv_to_rgb(h, s, v)
@@ -105,7 +120,15 @@ def save_classification_report(y_true, y_pred, labels, output_path):
 # Data helpers
 # =========================
 
-def load_symptoms_data(symptoms_json_path: str):
+def load_symptoms_data(symptoms_json_path: str, langs: Tuple[str, ...] = ("en", "zh")):
+    """
+    Returns:
+        flat_texts:    已套 prompt 的 caption bank
+        flat_label_ids: 每個 bank 位置對應的 category_id（str）
+        flat_langs:    每個 bank 位置的語言
+        id_to_zh_map:  category_id -> 中文名稱（來自 label_map）
+        all_label_ids: 出現在 bank 裡的所有 category_id（排序後）
+    """
     with open(symptoms_json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -118,15 +141,25 @@ def load_symptoms_data(symptoms_json_path: str):
 
     flat_texts: List[str] = []
     flat_label_ids: List[str] = []
+    flat_langs: List[str] = []
+
     for k, content in data_content.items():
+        if not isinstance(content, dict):
+            continue
         label_id = str(k)
-        captions = content.get("captions_en", []) if isinstance(content, dict) else []
-        for cap in captions or []:
-            flat_texts.append(f"This is {str(cap).lower()}.")
-            flat_label_ids.append(label_id)
+        for lang in langs:
+            caps = content.get(f"captions_{lang}", []) or []
+            if not isinstance(caps, list):
+                continue
+            for cap in caps:
+                if not isinstance(cap, str) or not cap.strip():
+                    continue
+                flat_texts.append(format_caption(cap.strip(), lang))
+                flat_label_ids.append(label_id)
+                flat_langs.append(lang)
 
     all_label_ids = _sorted_labels(set(flat_label_ids))
-    return flat_texts, flat_label_ids, id_to_zh_map, all_label_ids
+    return flat_texts, flat_label_ids, flat_langs, id_to_zh_map, all_label_ids
 
 
 
@@ -359,6 +392,22 @@ def encode_image_features(model, processor, images_local, images_global, device,
 # Main evaluation
 # =========================
 
+def _argmax_over_subset(scores: torch.Tensor, mask: torch.Tensor) -> List[int]:
+    """
+    scores: (N, M)
+    mask:   (M,) bool，True 表示允許的欄位
+    回傳 argmax 的 index list。若整列都被 mask 掉會退化成整個 scores 的 argmax。
+    """
+    if mask is None or mask.all():
+        return scores.argmax(dim=-1).tolist()
+    if not mask.any():
+        return scores.argmax(dim=-1).tolist()
+    s = scores.clone()
+    s[:, ~mask] = float("-inf")
+    return s.argmax(dim=-1).tolist()
+
+
+
 def process_gt_dataset(
     data_dir: str,
     symptoms_json_path: str,
@@ -373,19 +422,35 @@ def process_gt_dataset(
     max_length: int = 64,
     use_amp: bool = True,
     force_fusion: bool = False,
+    eval_lang: str = "both",
 ):
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if eval_lang == "both":
+        langs = ("en", "zh")
+        split_views = ["all", "en", "zh"]
+    else:
+        langs = (eval_lang,)
+        split_views = ["all"]
+
     coco_json_path = data_dir / "_annotations.coco.json"
     if not coco_json_path.exists():
         raise FileNotFoundError(f"找不到：{coco_json_path}")
 
-    print("Loading symptoms.json ...")
-    flat_texts, flat_label_ids, id_to_zh_map, all_label_ids = load_symptoms_data(symptoms_json_path)
+    print(f"Loading symptoms.json (langs={langs}) ...")
+    flat_texts, flat_label_ids, flat_langs, id_to_zh_map, all_label_ids = load_symptoms_data(
+        symptoms_json_path, langs=langs
+    )
     if len(flat_texts) == 0:
-        raise RuntimeError("symptoms.json 的 captions_en 為空，無法做 text candidates。")
+        raise RuntimeError("symptoms.json 的 captions 為空，無法做 text candidates。")
+
+    # 語言過濾遮罩（對應到 bank 欄位）
+    en_mask = torch.tensor([l == "en" for l in flat_langs], dtype=torch.bool)
+    zh_mask = torch.tensor([l == "zh" for l in flat_langs], dtype=torch.bool)
+
+    print(f"Bank size = {len(flat_texts)} (en={int(en_mask.sum())}, zh={int(zh_mask.sum())})")
 
     models = {}
     text_features = {}
@@ -419,8 +484,11 @@ def process_gt_dataset(
         img_id = ann["image_id"]
         img_id_to_anns.setdefault(img_id, []).append(ann)
 
-    y_true = []
-    y_pred = {tag: [] for tag, _ in model_specs}
+    y_true: List[str] = []
+    # y_pred[tag][view] -> list[str]
+    y_pred: Dict[str, Dict[str, List[str]]] = {
+        tag: {view: [] for view in split_views} for tag, _ in model_specs
+    }
 
     vis_dir = output_dir / "vis"
     if save_vis:
@@ -466,7 +534,7 @@ def process_gt_dataset(
             continue
 
         y_true.extend(gt_ids)
-        preds_this_img = {}
+        preds_this_img: Dict[str, Dict[str, List[str]]] = {}
 
         for tag, (m, p) in models.items():
             img_feats = encode_image_features(
@@ -478,12 +546,24 @@ def process_gt_dataset(
                 img_batch_size=img_batch_size,
                 use_amp=use_amp,
             )
-            scores = img_feats @ text_features[tag].T
-            best_idx = scores.argmax(dim=-1).tolist()
-            pred_ids = [flat_label_ids[i] for i in best_idx]
+            scores = img_feats @ text_features[tag].T  # (n_crops, bank_size)
 
-            y_pred[tag].extend(pred_ids)
-            preds_this_img[tag] = pred_ids
+            view_preds: Dict[str, List[str]] = {}
+            # all
+            idx_all = _argmax_over_subset(scores, torch.ones(scores.size(1), dtype=torch.bool))
+            view_preds["all"] = [flat_label_ids[i] for i in idx_all]
+
+            if "en" in split_views:
+                idx_en = _argmax_over_subset(scores, en_mask)
+                view_preds["en"] = [flat_label_ids[i] for i in idx_en]
+            if "zh" in split_views:
+                idx_zh = _argmax_over_subset(scores, zh_mask)
+                view_preds["zh"] = [flat_label_ids[i] for i in idx_zh]
+
+            for view in split_views:
+                y_pred[tag][view].extend(view_preds[view])
+
+            preds_this_img[tag] = view_preds
 
         if save_vis:
             cv2_img = cv2.imread(str(img_path))
@@ -501,7 +581,8 @@ def process_gt_dataset(
                 lines.append(("GT", gt_zh, (255, 255, 255)))
 
                 for tag, _ in model_specs:
-                    pred_id = preds_this_img[tag][i]
+                    # 可視化只顯示 "all" view（完整 bank）的結果
+                    pred_id = preds_this_img[tag]["all"][i]
                     pred_zh = id_to_zh_map.get(pred_id, "未知")
                     correct = pred_id == gt_id
                     color = (0, 255, 0) if correct else (255, 0, 0)
@@ -529,36 +610,46 @@ def process_gt_dataset(
             cv2.imwrite(str(vis_dir / f"pred_{file_name}"), vis_img)
 
     print("\n===== Results =====")
+    summary_rows: List[str] = []
     for tag, _ in model_specs:
-        pred = y_pred[tag]
-        if len(pred) != len(y_true):
-            raise RuntimeError(f"{tag} 的 y_pred 長度({len(pred)}) != y_true 長度({len(y_true)})，資料對齊有問題。")
+        for view in split_views:
+            pred = y_pred[tag][view]
+            if len(pred) != len(y_true):
+                raise RuntimeError(
+                    f"{tag}/{view} 的 y_pred 長度({len(pred)}) != y_true 長度({len(y_true)})，資料對齊有問題。"
+                )
 
-        acc = (np.array(pred) == np.array(y_true)).mean() if len(y_true) else 0.0
-        print(f"[{tag}] accuracy = {acc:.4f}  (n={len(y_true)})")
+            acc = (np.array(pred) == np.array(y_true)).mean() if len(y_true) else 0.0
+            line = f"[{tag}][view={view}] accuracy = {acc:.4f}  (n={len(y_true)})"
+            print(line)
+            summary_rows.append(line)
 
-        save_confusion_matrix(
-            y_true,
-            pred,
-            all_label_ids,
-            output_dir / f"confusion_matrix_{tag}.png",
-            title=f"Confusion Matrix ({tag})",
-            normalize=None,
-        )
-        save_confusion_matrix(
-            y_true,
-            pred,
-            all_label_ids,
-            output_dir / f"confusion_matrix_{tag}_norm.png",
-            title=f"Confusion Matrix ({tag}) - Normalized (Recall)",
-            normalize="true",
-        )
-        save_classification_report(
-            y_true,
-            pred,
-            all_label_ids,
-            output_dir / f"report_{tag}.txt",
-        )
+            save_confusion_matrix(
+                y_true,
+                pred,
+                all_label_ids,
+                output_dir / f"confusion_matrix_{tag}_{view}.png",
+                title=f"Confusion Matrix ({tag}, view={view})",
+                normalize=None,
+            )
+            save_confusion_matrix(
+                y_true,
+                pred,
+                all_label_ids,
+                output_dir / f"confusion_matrix_{tag}_{view}_norm.png",
+                title=f"Confusion Matrix ({tag}, view={view}) - Normalized (Recall)",
+                normalize="true",
+            )
+            save_classification_report(
+                y_true,
+                pred,
+                all_label_ids,
+                output_dir / f"report_{tag}_{view}.txt",
+            )
+
+    # summary 總表
+    with open(output_dir / "summary.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_rows) + "\n")
 
     print(f"\nDone! Saved outputs to: {output_dir}")
     if save_vis:
@@ -593,6 +684,13 @@ def build_argparser():
         action="store_true",
         help="強制用 fusion pipeline 載入所有 model；若 model 目錄中沒有 wrapper_state.pt 會報錯。"
     )
+    ap.add_argument(
+        "--eval_lang",
+        type=str,
+        choices=["en", "zh", "both"],
+        default="both",
+        help="評估時要啟用的語言 bank；both 會同時輸出 all/en/zh 三組指標"
+    )
     return ap
 
 
@@ -615,6 +713,7 @@ def main():
         max_length=args.max_length,
         use_amp=(not args.no_amp),
         force_fusion=bool(args.fusion),
+        eval_lang=args.eval_lang,
     )
 
 

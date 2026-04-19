@@ -31,6 +31,10 @@ DEFAULT_CONFIG = {
     "output_dir": None,
     "crop_mode": "bbox",  # "bbox" or "square"
 
+    # languages
+    "langs": ["en", "zh"],     # 訓練時用到的語言；多語會 flatten 進同一個 caption bank
+    "warmup_ratio": 0.15,       # 單語建議 0.1；雙語建議 0.15
+
     # train hypers
     "batch_size": 128,
     "num_epochs": 10,
@@ -64,6 +68,21 @@ DEFAULT_CONFIG = {
 
     "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
+
+
+# =========================
+# Prompt templates
+# =========================
+PROMPT_EN = "This is {cap}."
+PROMPT_ZH = "{cap}。"
+
+
+def format_caption(cap: str, lang: str) -> str:
+    if lang == "en":
+        return PROMPT_EN.format(cap=str(cap).lower())
+    if lang == "zh":
+        return PROMPT_ZH.format(cap=str(cap))
+    return str(cap)
 
 
 # =========================
@@ -109,10 +128,17 @@ def resolve_image_path(image_base_dir: str, file_name: str, data_root: str, spli
 
 
 # =========================
-# Symptoms Captions
+# Symptoms Captions (multilingual)
 # =========================
 
-def load_captions_en(symptoms_path: str) -> Dict[str, List[str]]:
+def load_captions_multilingual(
+    symptoms_path: str,
+    langs: Tuple[str, ...] = ("en", "zh"),
+) -> Dict[str, List[Tuple[str, str]]]:
+    """
+    回傳：cat_key -> [(raw_caption, lang), ...]
+    順序為 langs 的指定順序（關係到 evidence_index 的跨語對應：同一 ei 會對到每個語言清單的第 ei 個）
+    """
     if not symptoms_path or not os.path.exists(symptoms_path):
         raise FileNotFoundError(f"symptoms.json not found: {symptoms_path}")
 
@@ -120,47 +146,86 @@ def load_captions_en(symptoms_path: str) -> Dict[str, List[str]]:
     if "data" not in s or not isinstance(s["data"], dict):
         raise ValueError("symptoms.json format error: missing dict field 'data'")
 
-    captions_by_cat: Dict[str, List[str]] = {}
+    out: Dict[str, List[Tuple[str, str]]] = {}
     for k, v in s["data"].items():
         if not isinstance(v, dict):
             continue
-        caps = v.get("captions_en", None)
-        if caps is None:
-            raise ValueError(f"symptoms.json missing captions_en for category_id={k}")
-        if not isinstance(caps, list) or len(caps) == 0:
-            raise ValueError(f"symptoms.json captions_en empty/invalid for category_id={k}")
-        captions_by_cat[str(k)] = [str(x) for x in caps]
+        pairs: List[Tuple[str, str]] = []
+        for lang in langs:
+            key = f"captions_{lang}"
+            caps = v.get(key, None)
+            if caps is None:
+                # 該類別沒有此語言的 caption 就跳過該語言，不整類 raise
+                continue
+            if not isinstance(caps, list):
+                raise ValueError(f"{key} for category_id={k} is not a list")
+            for cap in caps:
+                if isinstance(cap, str) and cap.strip():
+                    pairs.append((cap.strip(), lang))
 
-    if len(captions_by_cat) == 0:
-        raise ValueError("symptoms.json has no usable captions_en")
+        if not pairs:
+            raise ValueError(f"symptoms.json category_id={k} has no usable captions for langs={langs}")
 
-    return captions_by_cat
+        out[str(k)] = pairs
+
+    if not out:
+        raise ValueError("symptoms.json has no usable captions")
+    return out
 
 
 
 def build_caption_bank(
-    captions_by_cat: Dict[str, List[str]]
-) -> Tuple[List[str], List[int], Dict[int, List[int]]]:
+    captions_by_cat: Dict[str, List[Tuple[str, str]]],
+) -> Tuple[List[str], List[int], List[str], Dict[int, List[int]], Dict[int, Dict[int, List[int]]]]:
+    """
+    Returns:
+        bank_texts:       已套 prompt 的完整 bank
+        bank_labels:      每個 bank 位置對應的 cat_id
+        bank_langs:       每個 bank 位置的語言（'en'/'zh'/...）
+        cat2bank_indices: cat_id -> 本類別所有 bank 索引（跨語言）
+        cat2evidence:    cat_id -> ei -> List[bank_idx]（同一 ei 對應到各語言的同位 caption）
+    """
     keys_sorted = sorted(captions_by_cat.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x))
 
     bank_texts: List[str] = []
     bank_labels: List[int] = []
+    bank_langs: List[str] = []
     cat2bank_indices: Dict[int, List[int]] = {}
+    # cat_id -> lang -> 該語言 caption 的 bank 索引
+    lang_positions: Dict[int, Dict[str, List[int]]] = {}
 
     for k in keys_sorted:
         cat_id = int(k)
-        caps = captions_by_cat[k]
         idxs: List[int] = []
-        for cap in caps:
-            idxs.append(len(bank_texts))
-            bank_texts.append(cap)
+        per_lang: Dict[str, List[int]] = {}
+        for cap, lang in captions_by_cat[k]:
+            bi = len(bank_texts)
+            bank_texts.append(format_caption(cap, lang))
             bank_labels.append(cat_id)
+            bank_langs.append(lang)
+            idxs.append(bi)
+            per_lang.setdefault(lang, []).append(bi)
         cat2bank_indices[cat_id] = idxs
+        lang_positions[cat_id] = per_lang
+
+    cat2evidence: Dict[int, Dict[int, List[int]]] = {}
+    for cat_id, per_lang in lang_positions.items():
+        max_ei = max((len(lst) for lst in per_lang.values()), default=0)
+        ev_map: Dict[int, List[int]] = {}
+        for ei in range(max_ei):
+            positions: List[int] = []
+            # 以固定順序掃語言，確保每個 sample 的 evidence 位置穩定
+            for lang in sorted(per_lang.keys()):
+                lst = per_lang[lang]
+                if ei < len(lst):
+                    positions.append(lst[ei])
+            ev_map[ei] = positions
+        cat2evidence[cat_id] = ev_map
 
     if len(bank_texts) == 0:
         raise ValueError("Caption bank is empty. Check symptoms.json")
 
-    return bank_texts, bank_labels, cat2bank_indices
+    return bank_texts, bank_labels, bank_langs, cat2bank_indices, cat2evidence
 
 
 # =========================
@@ -240,7 +305,7 @@ class CocoCropDataset(Dataset):
         data_root: str,
         split: str,
         crop_mode: str,
-        captions_by_cat: Dict[str, List[str]],
+        captions_by_cat: Dict[str, List[Tuple[str, str]]],
         use_multipos: bool = False,
         use_fusion: bool = False,
     ):
@@ -327,22 +392,25 @@ class CocoCropDataset(Dataset):
                     )
                 )
             else:
+                # baseline paired mode：每筆從多語 caption pool 選一條（支持 evidence_index 指定 或 round-robin）
                 ann_text = ann.get("text", None)
                 if isinstance(ann_text, str) and ann_text.strip():
+                    # 若 annotation 直接給 text，就不做 prompt 包裝（視為使用者自訂）
                     text = ann_text.strip()
                 else:
-                    caps = self.captions_by_cat[cat_key]
+                    caps = self.captions_by_cat[cat_key]  # List[(cap, lang)]
                     if ann.get("evidence_index") is not None:
                         try:
                             ei = int(ann["evidence_index"])
                         except Exception:
                             ei = 0
                         ei = max(0, min(ei, len(caps) - 1))
-                        text = caps[ei]
+                        cap, lang = caps[ei]
                     else:
                         ptr = rr_ptr.get(cat_key, 0)
-                        text = caps[ptr % len(caps)]
+                        cap, lang = caps[ptr % len(caps)]
                         rr_ptr[cat_key] = ptr + 1
+                    text = format_caption(cap, lang)
 
                 samples.append(
                     CocoSample(
@@ -512,7 +580,7 @@ def compute_symmetric_multipos_sigmoid_loss(
     logits: torch.Tensor,
     img_labels: torch.Tensor,
     bank_labels: torch.Tensor,
-    evidence_bank_idx: torch.Tensor,
+    evidence_bank_idx: torch.Tensor,     # (B, L)，-1 代表該 slot 無 evidence
     evidence_alpha: float,
     t2i_lambda: float,
     t2i_skip_no_positive: bool,
@@ -530,13 +598,20 @@ def compute_symmetric_multipos_sigmoid_loss(
 
     weight = torch.ones((B, M), device=device, dtype=dtype)
     if evidence_alpha is not None and float(evidence_alpha) > 1.0:
-        valid = evidence_bank_idx >= 0
-        if valid.any():
-            rows = torch.arange(B, device=device)[valid]
-            cols = torch.clamp(evidence_bank_idx[valid], 0, M - 1)
-            ok = pos_mask[rows, cols]
-            if ok.any():
-                weight[rows[ok], cols[ok]] = float(evidence_alpha)
+        if evidence_bank_idx.dim() != 2:
+            raise ValueError(
+                f"evidence_bank_idx must be 2D (B, L), got shape={tuple(evidence_bank_idx.shape)}"
+            )
+        L_ev = evidence_bank_idx.size(1)
+        for l in range(L_ev):
+            col = evidence_bank_idx[:, l]
+            valid = col >= 0
+            if valid.any():
+                rows = torch.arange(B, device=device)[valid]
+                cols = torch.clamp(col[valid], 0, M - 1)
+                ok = pos_mask[rows, cols]
+                if ok.any():
+                    weight[rows[ok], cols[ok]] = float(evidence_alpha)
 
     element = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
 
@@ -629,6 +704,12 @@ def infer_output_dir(config: Dict[str, Any]) -> str:
         suffix = "fusion"
     else:
         suffix = "finetuned"
+
+    langs = config.get("langs", ["en"])
+    if isinstance(langs, (list, tuple)) and len(langs) > 0:
+        lang_tag = "_".join(sorted(langs))
+        suffix = f"{suffix}_{lang_tag}"
+
     return f"./{model_stub}_{suffix}"
 
 
@@ -643,6 +724,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symptoms_file", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--crop_mode", type=str, choices=["bbox", "square"], default=None)
+
+    parser.add_argument("--lang", type=str, choices=["en", "zh", "both"], default=None)
+    parser.add_argument("--warmup_ratio", type=float, default=None)
 
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=None)
@@ -701,10 +785,17 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         "train_split",
         "valid_split",
         "test_split",
+        "warmup_ratio",
     ]:
-        value = getattr(args, key)
+        value = getattr(args, key, None)
         if value is not None:
             config[key] = value
+
+    if args.lang is not None:
+        if args.lang == "both":
+            config["langs"] = ["en", "zh"]
+        else:
+            config["langs"] = [args.lang]
 
     if args.no_amp:
         config["use_amp"] = False
@@ -752,21 +843,31 @@ def build_collate_fn(
     use_multipos: bool,
     use_fusion: bool,
     cat2bank_indices: Optional[Dict[int, List[int]]] = None,
+    cat2evidence: Optional[Dict[int, Dict[int, List[int]]]] = None,
+    evidence_slots: int = 2,
 ):
     def collate_fn(items):
         if use_multipos:
+            if cat2evidence is None:
+                raise ValueError("multipos collate 需要 cat2evidence（由 build_caption_bank 產生）")
+
             labels = torch.tensor([int(x["label_id"]) for x in items], dtype=torch.long)
             evidence_idx = [int(x["evidence_index"]) for x in items]
-            evidence_bank_idx = torch.full((len(items),), -1, dtype=torch.long)
+
+            L = int(max(1, evidence_slots))
+            evidence_bank_idx = torch.full((len(items), L), -1, dtype=torch.long)
 
             for i, (y, ei) in enumerate(zip(labels.tolist(), evidence_idx)):
                 if ei is None or int(ei) < 0:
                     continue
-                idxs = cat2bank_indices.get(int(y), None) if cat2bank_indices is not None else None
-                if not idxs:
+                ev_map = cat2evidence.get(int(y))
+                if not ev_map:
                     continue
-                ei2 = max(0, min(int(ei), len(idxs) - 1))
-                evidence_bank_idx[i] = int(idxs[ei2])
+                positions = ev_map.get(int(ei))
+                if not positions:
+                    continue
+                for j, pos in enumerate(positions[:L]):
+                    evidence_bank_idx[i, j] = int(pos)
 
             if use_fusion:
                 images_local = [x["image_local"] for x in items]
@@ -913,7 +1014,7 @@ def inspect_fusion_state(model, valid_loader, device: str):
 
 
 # =========================
-# Baseline train / eval (original train.py path)
+# Baseline train / eval
 # =========================
 
 def run_eval_baseline(model, dataloader, device: str, use_amp: bool) -> float:
@@ -943,7 +1044,9 @@ def train_baseline(config: Dict[str, Any]):
     device = config["device"]
     os.makedirs(config["output_dir"], exist_ok=True)
 
-    captions_by_cat = load_captions_en(config["symptoms_file"])
+    langs = tuple(config.get("langs", ["en"]))
+    captions_by_cat = load_captions_multilingual(config["symptoms_file"], langs=langs)
+
     train_ds = CocoCropDataset(
         data_root=config["data_root"],
         split=config["train_split"],
@@ -985,7 +1088,7 @@ def train_baseline(config: Dict[str, Any]):
     total_steps = len(train_loader) * int(config["num_epochs"])
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(total_steps * 0.1),
+        num_warmup_steps=int(total_steps * float(config["warmup_ratio"])),
         num_training_steps=total_steps,
     )
     scaler = torch.cuda.amp.GradScaler(enabled=(bool(config["use_amp"]) and device == "cuda"))
@@ -1064,15 +1167,17 @@ def train_baseline(config: Dict[str, Any]):
 # =========================
 
 def prepare_custom_supervision(config: Dict[str, Any], processor):
-    captions_by_cat = load_captions_en(config["symptoms_file"])
+    langs = tuple(config.get("langs", ["en"]))
+    captions_by_cat = load_captions_multilingual(config["symptoms_file"], langs=langs)
 
-    bank_texts = None
+    bank_tokens_device = None
     bank_labels_t = None
     cat2bank_indices = None
-    bank_tokens_device = None
+    cat2evidence = None
+    evidence_slots = 1
 
     if config["multipos"]:
-        bank_texts, bank_labels, cat2bank_indices = build_caption_bank(captions_by_cat)
+        bank_texts, bank_labels, bank_langs, cat2bank_indices, cat2evidence = build_caption_bank(captions_by_cat)
         bank_labels_t = torch.tensor(bank_labels, dtype=torch.long, device=config["device"])
         bank_tokens = processor(
             text=bank_texts,
@@ -1087,7 +1192,18 @@ def prepare_custom_supervision(config: Dict[str, Any], processor):
             if isinstance(v, torch.Tensor)
         }
 
-    return captions_by_cat, bank_tokens_device, bank_labels_t, cat2bank_indices
+        evidence_slots = max(
+            (max((len(pos) for pos in ev_map.values()), default=1)
+             for ev_map in cat2evidence.values()),
+            default=1,
+        )
+
+        print(
+            f"[CaptionBank] size={len(bank_texts)}, langs={langs}, "
+            f"evidence_slots={evidence_slots}"
+        )
+
+    return captions_by_cat, bank_tokens_device, bank_labels_t, cat2bank_indices, cat2evidence, evidence_slots
 
 
 
@@ -1210,7 +1326,14 @@ def train_custom(config: Dict[str, Any]):
     os.makedirs(config["output_dir"], exist_ok=True)
 
     processor, model = create_processor_and_model(config)
-    captions_by_cat, bank_tokens_device, bank_labels_t, cat2bank_indices = prepare_custom_supervision(config, processor)
+    (
+        captions_by_cat,
+        bank_tokens_device,
+        bank_labels_t,
+        cat2bank_indices,
+        cat2evidence,
+        evidence_slots,
+    ) = prepare_custom_supervision(config, processor)
 
     train_ds = CocoCropDataset(
         data_root=config["data_root"],
@@ -1235,6 +1358,8 @@ def train_custom(config: Dict[str, Any]):
         use_multipos=bool(config["multipos"]),
         use_fusion=bool(config["fusion"]),
         cat2bank_indices=cat2bank_indices,
+        cat2evidence=cat2evidence,
+        evidence_slots=int(evidence_slots),
     )
 
     train_loader = DataLoader(
@@ -1258,7 +1383,7 @@ def train_custom(config: Dict[str, Any]):
     total_steps = len(train_loader) * int(config["num_epochs"])
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(total_steps * 0.1),
+        num_warmup_steps=int(total_steps * float(config["warmup_ratio"])),
         num_training_steps=total_steps,
     )
     scaler = torch.cuda.amp.GradScaler(enabled=(bool(config["use_amp"]) and device == "cuda"))
@@ -1371,6 +1496,7 @@ def main():
 
     print(
         f"Mode: multipos={config['multipos']}, fusion={config['fusion']} | "
+        f"langs={config['langs']} | warmup_ratio={config['warmup_ratio']} | "
         f"output_dir={config['output_dir']}"
     )
 
