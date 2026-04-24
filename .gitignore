@@ -1,5 +1,6 @@
 note/
 annotation_web/frontend/dist/
+temp/
 
 *.env
 *.log

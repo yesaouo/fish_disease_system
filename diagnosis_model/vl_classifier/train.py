@@ -33,11 +33,11 @@ DEFAULT_CONFIG = {
 
     # languages
     "langs": ["en", "zh"],     # 訓練時用到的語言；多語會 flatten 進同一個 caption bank
-    "warmup_ratio": 0.15,       # 單語建議 0.1；雙語建議 0.15
+    "warmup_ratio": 0.25,       # 單語建議 0.2；雙語建議 0.25
 
     # train hypers
     "batch_size": 128,
-    "num_epochs": 10,
+    "num_epochs": 8,
     "learning_rate": 1e-4,
     "weight_decay": None,  # mode-aware default
     "max_length": 64,
@@ -83,6 +83,12 @@ def format_caption(cap: str, lang: str) -> str:
     if lang == "zh":
         return PROMPT_ZH.format(cap=str(cap))
     return str(cap)
+# def format_caption(cap: str, lang: str) -> str:
+#     if lang == "en":
+#         return str(cap)
+#     if lang == "zh":
+#         return str(cap)
+#     return str(cap)
 
 
 # =========================
@@ -710,7 +716,7 @@ def infer_output_dir(config: Dict[str, Any]) -> str:
         lang_tag = "_".join(sorted(langs))
         suffix = f"{suffix}_{lang_tag}"
 
-    return f"./{model_stub}_{suffix}"
+    return f"./outputs/{model_stub}_{suffix}"
 
 
 
