@@ -20,24 +20,24 @@ import torch
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[3]))
-    from diagnosis_model.cause_inference.data.cause_cluster_json import (  # type: ignore
+    from diagnosis_model.cause_inference.preprocessing.cause_cluster_json import (  # type: ignore
         assign_cause_ids,
         compute_stats,
         load_clusters_json,
         quality_report,
         save_clusters_json,
     )
-    from diagnosis_model.cause_inference.data.dim_reduction import (  # type: ignore
+    from diagnosis_model.cause_inference.preprocessing.dim_reduction import (  # type: ignore
         load_reduced_embeddings,
         reduce_embeddings,
         reduction_metadata,
         save_reduced_embeddings,
     )
-    from diagnosis_model.cause_inference.data.hdbscan_clustering import cluster_hdbscan  # type: ignore
-    from diagnosis_model.cause_inference.data.singleton_reassign import (  # type: ignore
+    from diagnosis_model.cause_inference.preprocessing.hdbscan_clustering import cluster_hdbscan  # type: ignore
+    from diagnosis_model.cause_inference.preprocessing.singleton_reassign import (  # type: ignore
         reassign_singletons_to_real_clusters,
     )
-    from diagnosis_model.cause_inference.data.text_embedding_cache import (  # type: ignore
+    from diagnosis_model.cause_inference.preprocessing.text_embedding_cache import (  # type: ignore
         build_text_embedding_cache,
         load_text_embedding_cache,
     )

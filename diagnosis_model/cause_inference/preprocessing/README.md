@@ -13,8 +13,8 @@ cd /mnt/ssd/YJ/fish_disease_system
 可以用兩種方式執行，擇一即可：
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py --help
-python -m diagnosis_model.cause_inference.data.recluster_causes --help
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py --help
+python -m diagnosis_model.cause_inference.preprocessing.recluster_causes --help
 ```
 
 目前 CLI 子命令有：
@@ -30,10 +30,10 @@ python -m diagnosis_model.cause_inference.data.recluster_causes --help
 ### 用 VLM encoder
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py cache \
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cache \
   --coco_files data/detection/coco/_merged/train/_annotations.coco.json \
                data/detection/coco/_merged/valid/_annotations.coco.json \
-  --cache_dir diagnosis_model/cause_inference/data/cause_cache \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
   --encoder_backend vlm \
   --vlm_path diagnosis_model/vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh \
   --text_batch_size 1024 \
@@ -43,10 +43,10 @@ python diagnosis_model/cause_inference/data/recluster_causes.py cache \
 ### 用 Hugging Face model
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py cache \
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cache \
   --coco_files data/detection/coco/_merged/train/_annotations.coco.json \
                data/detection/coco/_merged/valid/_annotations.coco.json \
-  --cache_dir diagnosis_model/cause_inference/data/cause_cache_hf \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache_hf \
   --encoder_backend hf \
   --hf_model sentence-transformers/paraphrase-multilingual-mpnet-base-v2 \
   --hf_pooling mean \
@@ -56,10 +56,10 @@ python diagnosis_model/cause_inference/data/recluster_causes.py cache \
 ### 用 sentence-transformers backend
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py cache \
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cache \
   --coco_files data/detection/coco/_merged/train/_annotations.coco.json \
                data/detection/coco/_merged/valid/_annotations.coco.json \
-  --cache_dir diagnosis_model/cause_inference/data/cause_cache_st \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache_st \
   --encoder_backend sentence-transformers \
   --hf_model sentence-transformers/paraphrase-multilingual-mpnet-base-v2 \
   --text_template "{cap}"
@@ -76,9 +76,9 @@ python diagnosis_model/cause_inference/data/recluster_causes.py cache \
 如果你想把 reduce 結果存下來，避免每次 clustering 都重跑：
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py reduce \
-  --cache_dir diagnosis_model/cause_inference/data/cause_cache \
-  --output temp/cause_reduced.npy \
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py reduce \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --output diagnosis_model/cause_inference/outputs/cause_reduced.npy \
   --pca_components 50 \
   --umap_n_neighbors 15 \
   --umap_min_dist 0.0 \
@@ -89,17 +89,17 @@ python diagnosis_model/cause_inference/data/recluster_causes.py reduce \
 
 這會產生：
 
-- `temp/cause_reduced.npy`
-- `temp/cause_reduced.npy.meta.json`
+- `diagnosis_model/cause_inference/outputs/cause_reduced.npy`
+- `diagnosis_model/cause_inference/outputs/cause_reduced.npy.meta.json`
 
 ## 3. 直接做 clustering 輸出 JSON
 
 ### 方式 A: 讓 `cluster` 自己跑 reduce
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py cluster \
-  --cache_dir diagnosis_model/cause_inference/data/cause_cache \
-  --output temp/cause_clusters.json \
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cluster \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters.json \
   --pca_components 50 \
   --umap_n_neighbors 15 \
   --umap_min_dist 0.0 \
@@ -114,10 +114,10 @@ python diagnosis_model/cause_inference/data/recluster_causes.py cluster \
 ### 方式 B: 使用已經存好的 reduced embedding
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py cluster \
-  --cache_dir diagnosis_model/cause_inference/data/cause_cache \
-  --reduced_path temp/cause_reduced.npy \
-  --output temp/cause_clusters.json \
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cluster \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --reduced_path diagnosis_model/cause_inference/outputs/cause_reduced.npy \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters.json \
   --cluster_selection_method eom \
   --min_cluster_size 6 \
   --report_top_n 20
@@ -132,9 +132,9 @@ python diagnosis_model/cause_inference/data/recluster_causes.py cluster \
 ## 4. 做 sweep 找參數
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py sweep \
-  --cache_dir diagnosis_model/cause_inference/data/cause_cache \
-  --output temp/cause_clusters.json \
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py sweep \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters.json \
   --pca_components 50 \
   --umap_min_dist 0.0 \
   --umap_n_components 5 \
@@ -153,7 +153,7 @@ python diagnosis_model/cause_inference/data/recluster_causes.py sweep \
 summary 會寫成：
 
 ```text
-temp/cause_clusters.json.sweep.json
+diagnosis_model/cause_inference/outputs/cause_clusters.json.sweep.json
 ```
 
 ## 5. 把 singleton 回掛到 real cluster
@@ -161,10 +161,10 @@ temp/cause_clusters.json.sweep.json
 這一步是用 embedding cosine similarity，把 size=1 的 cluster 掛回既有 real cluster。
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py reassign-singletons \
-  --cache_dir diagnosis_model/cause_inference/data/cause_cache \
-  --input temp/cause_clusters.json \
-  --output temp/cause_clusters_reassigned.json \
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py reassign-singletons \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --input diagnosis_model/cause_inference/outputs/cause_clusters.json \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters_reassigned.json \
   --cosine_threshold 0.92 \
   --margin 0.03 \
   --min_real_cluster_size 2 \
@@ -182,10 +182,10 @@ python diagnosis_model/cause_inference/data/recluster_causes.py reassign-singlet
 ### 最常見：一次建 cache，之後反覆 cluster
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py cache ...
-python diagnosis_model/cause_inference/data/recluster_causes.py cluster ...
-python diagnosis_model/cause_inference/data/recluster_causes.py sweep ...
-python diagnosis_model/cause_inference/data/recluster_causes.py reassign-singletons ...
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cache ...
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cluster ...
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py sweep ...
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py reassign-singletons ...
 ```
 
 ### 如果你要一直試 HDBSCAN 參數
@@ -193,8 +193,8 @@ python diagnosis_model/cause_inference/data/recluster_causes.py reassign-singlet
 先把 reduce 存起來：
 
 ```bash
-python diagnosis_model/cause_inference/data/recluster_causes.py reduce ...
-python diagnosis_model/cause_inference/data/recluster_causes.py cluster --reduced_path ...
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py reduce ...
+python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cluster --reduced_path ...
 ```
 
 ## 7. 相關檔案
@@ -205,8 +205,7 @@ python diagnosis_model/cause_inference/data/recluster_causes.py cluster --reduce
 - `hdbscan_clustering.py`: HDBSCAN
 - `cause_cluster_json.py`: labels 轉 cause JSON、quality report
 - `singleton_reassign.py`: singleton 回掛邏輯
-- `recluster_causes_old.py`: 舊版參考
-- `recluster_causes_oldv2.py`: 舊版參考
+- `export_unique_causes.py`: 把去重後的 cause 字串 dump 成 txt 檢查用
 
 ## 8. 小提醒
 
