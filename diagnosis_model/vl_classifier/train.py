@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
 
     # languages
     "langs": ["en", "zh"],     # 訓練時用到的語言；多語會 flatten 進同一個 caption bank
-    "warmup_ratio": 0.25,       # 單語建議 0.2；雙語建議 0.25
+    "warmup_ratio": 0.15,       # 單語建議 0.2；雙語建議 0.25；凍結建議預設 -1
 
     # train hypers
     "batch_size": 128,
@@ -46,10 +46,11 @@ DEFAULT_CONFIG = {
     "grad_clip_norm": 1.0,
     "use_amp": True,
     "seed": 42,
+    "freeze_text_encoder": True,
 
     # fusion-specific
     "dropout_prob": 0.1,
-    "fusion_base_lr": 3e-5,
+    "fusion_base_lr": 5e-5,
     "fusion_head_lr": 1e-4,
 
     # multi-positive / custom loss
@@ -724,6 +725,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified training entry for baseline / multi-positive / fusion modes")
     parser.add_argument("--multipos", action="store_true", help="use multi-positive caption-bank training")
     parser.add_argument("--fusion", action="store_true", help="use local-global image fusion")
+    parser.add_argument("--freeze_text_encoder", action="store_true", help="freeze the text encoder/text projection during training")
 
     parser.add_argument("--model_name", type=str, default=None)
     parser.add_argument("--data_root", type=str, default=None)
@@ -809,6 +811,8 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         config["pin_memory"] = False
     if args.eval_test_after_train:
         config["eval_test_after_train"] = True
+    if args.freeze_text_encoder:
+        config["freeze_text_encoder"] = True
 
     if config["weight_decay"] is None:
         config["weight_decay"] = 0.01 if (config["multipos"] or config["fusion"]) else 0.0
@@ -840,6 +844,105 @@ def create_processor_and_model(config: Dict[str, Any]):
         dropout_prob=float(config["dropout_prob"]),
     ).to(device)
     return processor, model
+
+
+def _unwrap_trainable_base_model(model):
+    """Return the underlying dual-encoder model.
+
+    LocalGlobalFusionWrapper owns a Hugging Face dual-encoder under `base_model`.
+    For plain Hugging Face CLIP/SigLIP/SigLIP2 models, keep the model itself.
+    """
+    if isinstance(model, LocalGlobalFusionWrapper):
+        return model.base_model
+    return model
+
+
+def _set_requires_grad_unique(params, requires_grad: bool) -> int:
+    seen = set()
+    n_params = 0
+    for p in params:
+        if p is None or id(p) in seen:
+            continue
+        seen.add(id(p))
+        p.requires_grad = requires_grad
+        n_params += int(p.numel())
+    return n_params
+
+
+def _collect_attr_parameters(obj, attr_name: str) -> List[torch.nn.Parameter]:
+    if not hasattr(obj, attr_name):
+        return []
+
+    attr = getattr(obj, attr_name)
+    if attr is None:
+        return []
+    if isinstance(attr, nn.Module):
+        return list(attr.parameters())
+    if isinstance(attr, nn.Parameter):
+        return [attr]
+    if isinstance(attr, torch.Tensor) and getattr(attr, "requires_grad", False):
+        return [attr]
+    return []
+
+
+def freeze_text_encoder(model) -> int:
+    """Freeze the text side of a CLIP/SigLIP-style dual encoder.
+
+    This freezes common text-module names and text projection parameters.
+    `logit_scale` / `logit_bias` are intentionally left trainable because they are
+    global calibration parameters rather than text-encoder weights.
+    """
+    base = _unwrap_trainable_base_model(model)
+
+    text_param_candidates: List[torch.nn.Parameter] = []
+    for attr_name in [
+        "text_model",
+        "text_encoder",
+        "language_model",
+        "text_projection",
+        "text_proj",
+        "text_embedder",
+    ]:
+        text_param_candidates.extend(_collect_attr_parameters(base, attr_name))
+
+    # Fallback: catch named parameters that clearly belong to the text branch.
+    # This helps if a future model uses a slightly different module layout.
+    for name, p in base.named_parameters():
+        name_l = name.lower()
+        if (
+            name_l.startswith("text_")
+            or ".text_" in name_l
+            or name_l.startswith("text.")
+            or ".text." in name_l
+            or "text_model" in name_l
+            or "text_encoder" in name_l
+        ):
+            text_param_candidates.append(p)
+
+    return _set_requires_grad_unique(text_param_candidates, False)
+
+
+def count_trainable_parameters(model) -> Tuple[int, int]:
+    total = sum(int(p.numel()) for p in model.parameters())
+    trainable = sum(int(p.numel()) for p in model.parameters() if p.requires_grad)
+    return trainable, total
+
+
+def apply_freeze_config(model, config: Dict[str, Any]):
+    if bool(config.get("freeze_text_encoder", False)):
+        frozen = freeze_text_encoder(model)
+        if frozen == 0:
+            print("[Freeze] freeze_text_encoder=True, but no text-encoder parameters were matched.")
+        else:
+            print(f"[Freeze] text encoder/text projection frozen: {frozen:,} parameters")
+
+    trainable, total = count_trainable_parameters(model)
+    pct = 100.0 * trainable / max(1, total)
+    print(f"[Params] trainable={trainable:,} / total={total:,} ({pct:.2f}%)")
+
+
+def trainable_parameters(module) -> List[torch.nn.Parameter]:
+    return [p for p in module.parameters() if p.requires_grad]
 
 
 
@@ -936,17 +1039,33 @@ def build_collate_fn(
 
 def build_optimizer(model, config: Dict[str, Any]):
     if config["fusion"]:
+        param_groups = []
+
+        base_params = trainable_parameters(model.base_model)
+        if base_params:
+            param_groups.append({"params": base_params, "lr": float(config["fusion_base_lr"])})
+
+        fusion_head_params = trainable_parameters(model.fusion_linear)
+        if fusion_head_params:
+            param_groups.append({"params": fusion_head_params, "lr": float(config["fusion_head_lr"])})
+
+        if model.gate.requires_grad:
+            param_groups.append({"params": [model.gate], "lr": float(config["fusion_head_lr"])})
+
+        if not param_groups:
+            raise RuntimeError("No trainable parameters found. Check freeze settings.")
+
         return torch.optim.AdamW(
-            [
-                {"params": model.base_model.parameters(), "lr": float(config["fusion_base_lr"])},
-                {"params": model.fusion_linear.parameters(), "lr": float(config["fusion_head_lr"])},
-                {"params": [model.gate], "lr": float(config["fusion_head_lr"])},
-            ],
+            param_groups,
             weight_decay=float(config["weight_decay"]),
         )
 
+    params = trainable_parameters(model)
+    if not params:
+        raise RuntimeError("No trainable parameters found. Check freeze settings.")
+
     return torch.optim.AdamW(
-        model.parameters(),
+        params,
         lr=float(config["learning_rate"]),
         weight_decay=float(config["weight_decay"]),
     )
@@ -1071,6 +1190,7 @@ def train_baseline(config: Dict[str, Any]):
     )
 
     processor, model = create_processor_and_model(config)
+    apply_freeze_config(model, config)
     collate_fn = build_collate_fn(processor, config, use_multipos=False, use_fusion=False)
 
     train_loader = DataLoader(
@@ -1332,6 +1452,7 @@ def train_custom(config: Dict[str, Any]):
     os.makedirs(config["output_dir"], exist_ok=True)
 
     processor, model = create_processor_and_model(config)
+    apply_freeze_config(model, config)
     (
         captions_by_cat,
         bank_tokens_device,
@@ -1501,7 +1622,8 @@ def main():
     config = resolve_config(args)
 
     print(
-        f"Mode: multipos={config['multipos']}, fusion={config['fusion']} | "
+        f"Mode: multipos={config['multipos']}, fusion={config['fusion']}, "
+        f"freeze_text_encoder={config['freeze_text_encoder']} | "
         f"langs={config['langs']} | warmup_ratio={config['warmup_ratio']} | "
         f"output_dir={config['output_dir']}"
     )
