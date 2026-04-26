@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import argparse
 import zlib
 import colorsys
@@ -9,8 +8,6 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
 import matplotlib.pyplot as plt
@@ -19,27 +16,21 @@ from sklearn.metrics import confusion_matrix, classification_report
 
 import cv2
 
+from common import (
+    format_caption,
+    get_image_features,
+    get_text_features,
+    load_flat_caption_bank,
+    LocalGlobalFusionWrapper,
+    sort_label_ids,
+)
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 DEFAULT_FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
 _LABEL2RGB255 = {}
 _LABEL2BGR255 = {}
-
-
-# =========================
-# Prompt templates (與 train.py 對齊)
-# =========================
-PROMPT_EN = "This is {cap}."
-PROMPT_ZH = "{cap}。"
-
-
-def format_caption(cap: str, lang: str) -> str:
-    if lang == "en":
-        return PROMPT_EN.format(cap=str(cap).lower())
-    if lang == "zh":
-        return PROMPT_ZH.format(cap=str(cap))
-    return str(cap)
 
 
 def _label_to_rgb255(label: str, s: float = 0.65, v: float = 0.95):
@@ -85,16 +76,8 @@ def put_chinese_text(img_bgr: np.ndarray, text: str, pos, color_rgb, font_path: 
 # Metrics
 # =========================
 
-def _sorted_labels(labels):
-    return sorted(
-        list(labels),
-        key=lambda x: int(x) if str(x).isdigit() else str(x),
-    )
-
-
-
 def save_confusion_matrix(y_true, y_pred, labels, output_path, title="Confusion Matrix", normalize=None):
-    labels = _sorted_labels(set(labels) | set(y_true) | set(y_pred))
+    labels = sort_label_ids(set(labels) | set(y_true) | set(y_pred))
     cm = confusion_matrix(y_true, y_pred, labels=labels, normalize=normalize)
 
     plt.figure(figsize=(12, 10))
@@ -110,7 +93,7 @@ def save_confusion_matrix(y_true, y_pred, labels, output_path, title="Confusion 
 
 
 def save_classification_report(y_true, y_pred, labels, output_path):
-    labels = _sorted_labels(set(labels) | set(y_true) | set(y_pred))
+    labels = sort_label_ids(set(labels) | set(y_true) | set(y_pred))
     report = classification_report(y_true, y_pred, labels=labels, zero_division=0)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report)
@@ -119,49 +102,6 @@ def save_classification_report(y_true, y_pred, labels, output_path):
 # =========================
 # Data helpers
 # =========================
-
-def load_symptoms_data(symptoms_json_path: str, langs: Tuple[str, ...] = ("en", "zh")):
-    """
-    Returns:
-        flat_texts:    已套 prompt 的 caption bank
-        flat_label_ids: 每個 bank 位置對應的 category_id（str）
-        flat_langs:    每個 bank 位置的語言
-        id_to_zh_map:  category_id -> 中文名稱（來自 label_map）
-        all_label_ids: 出現在 bank 裡的所有 category_id（排序後）
-    """
-    with open(symptoms_json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    label_map = data.get("label_map", {})
-    data_content = data.get("data", {})
-
-    id_to_zh_map = {}
-    for k, info in label_map.items():
-        id_to_zh_map[str(k)] = info.get("zh", str(k)) if isinstance(info, dict) else str(k)
-
-    flat_texts: List[str] = []
-    flat_label_ids: List[str] = []
-    flat_langs: List[str] = []
-
-    for k, content in data_content.items():
-        if not isinstance(content, dict):
-            continue
-        label_id = str(k)
-        for lang in langs:
-            caps = content.get(f"captions_{lang}", []) or []
-            if not isinstance(caps, list):
-                continue
-            for cap in caps:
-                if not isinstance(cap, str) or not cap.strip():
-                    continue
-                flat_texts.append(format_caption(cap.strip(), lang))
-                flat_label_ids.append(label_id)
-                flat_langs.append(lang)
-
-    all_label_ids = _sorted_labels(set(flat_label_ids))
-    return flat_texts, flat_label_ids, flat_langs, id_to_zh_map, all_label_ids
-
-
 
 def get_scaled_rect_crop(img_pil: Image.Image, coco_bbox, scale: float):
     x, y, w, h = coco_bbox
@@ -190,89 +130,6 @@ def get_scaled_rect_crop(img_pil: Image.Image, coco_bbox, scale: float):
 # =========================
 # Model helpers
 # =========================
-
-def _pool_from_last_hidden(last_hidden: torch.Tensor) -> torch.Tensor:
-    return last_hidden[:, 0]
-
-
-
-def get_image_features(model, pixel_values: torch.Tensor) -> torch.Tensor:
-    if hasattr(model, "get_image_features"):
-        return model.get_image_features(pixel_values=pixel_values)
-
-    out = model(pixel_values=pixel_values, return_dict=True)
-    if hasattr(out, "image_embeds") and out.image_embeds is not None:
-        return out.image_embeds
-    if hasattr(out, "pooler_output") and out.pooler_output is not None:
-        return out.pooler_output
-    if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
-        return _pool_from_last_hidden(out.last_hidden_state)
-
-    if hasattr(model, "vision_model"):
-        vout = model.vision_model(pixel_values=pixel_values, return_dict=True)
-        if hasattr(vout, "pooler_output") and vout.pooler_output is not None:
-            return vout.pooler_output
-        if hasattr(vout, "last_hidden_state") and vout.last_hidden_state is not None:
-            return _pool_from_last_hidden(vout.last_hidden_state)
-
-    raise RuntimeError("Cannot extract image features from model output.")
-
-
-
-def get_text_features(model, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    if hasattr(model, "get_text_features"):
-        return model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
-
-    out = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-    if hasattr(out, "text_embeds") and out.text_embeds is not None:
-        return out.text_embeds
-    if hasattr(out, "pooler_output") and out.pooler_output is not None:
-        return out.pooler_output
-    if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
-        return _pool_from_last_hidden(out.last_hidden_state)
-
-    if hasattr(model, "text_model"):
-        tout = model.text_model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        if hasattr(tout, "pooler_output") and tout.pooler_output is not None:
-            return tout.pooler_output
-        if hasattr(tout, "last_hidden_state") and tout.last_hidden_state is not None:
-            return _pool_from_last_hidden(tout.last_hidden_state)
-
-    raise RuntimeError("Cannot extract text features from model output.")
-
-
-class LocalGlobalFusionWrapper(nn.Module):
-    def __init__(self, base_model, hidden_size: int, dropout_prob: float = 0.1):
-        super().__init__()
-        self.base_model = base_model
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(dropout_prob)
-        self.fusion_linear = nn.Linear(hidden_size * 2, hidden_size)
-        nn.init.xavier_uniform_(self.fusion_linear.weight)
-        nn.init.zeros_(self.fusion_linear.bias)
-        self.gate = nn.Parameter(torch.tensor(0.1))
-
-    def forward_image(self, pixel_values_local, pixel_values_global, return_parts: bool = False):
-        local_feat = get_image_features(self.base_model, pixel_values_local)
-        global_feat = get_image_features(self.base_model, pixel_values_global)
-
-        local_feat = F.normalize(local_feat, dim=-1)
-        global_feat = F.normalize(global_feat, dim=-1)
-
-        fused = torch.cat([local_feat, global_feat], dim=-1)
-        fused = self.fusion_linear(fused)
-        fused = self.gelu(fused)
-        fused = self.dropout(fused)
-
-        out = local_feat + self.gate * fused
-        if return_parts:
-            return out, local_feat, global_feat, fused
-        return out
-
-    def get_text_features(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return get_text_features(self.base_model, input_ids, attention_mask)
-
-
 
 def parse_model_specs(model_specs: List[str]):
     out = []
@@ -440,11 +297,12 @@ def process_gt_dataset(
         raise FileNotFoundError(f"找不到：{coco_json_path}")
 
     print(f"Loading symptoms.json (langs={langs}) ...")
-    flat_texts, flat_label_ids, flat_langs, id_to_zh_map, all_label_ids = load_symptoms_data(
-        symptoms_json_path, langs=langs
-    )
-    if len(flat_texts) == 0:
-        raise RuntimeError("symptoms.json 的 captions 為空，無法做 text candidates。")
+    bank = load_flat_caption_bank(symptoms_json_path, langs=langs)
+    flat_texts = bank.texts
+    flat_label_ids = bank.label_ids
+    flat_langs = bank.langs
+    id_to_zh_map = bank.id_to_zh
+    all_label_ids = bank.sorted_label_ids
 
     # 語言過濾遮罩（對應到 bank 欄位）
     en_mask = torch.tensor([l == "en" for l in flat_langs], dtype=torch.bool)
@@ -657,14 +515,239 @@ def process_gt_dataset(
 
 
 
+# =========================
+# Overall (per-image retrieval) evaluation
+# =========================
+
+def collect_overall_samples(data_dir: Path) -> Tuple[List[Dict[str, str]], int]:
+    """Walk COCO json's images[] and keep ones with overall.colloquial_zh + medical_zh."""
+    coco_json_path = data_dir / "_annotations.coco.json"
+    if not coco_json_path.exists():
+        raise FileNotFoundError(f"找不到：{coco_json_path}")
+    with open(coco_json_path, "r", encoding="utf-8") as f:
+        coco = json.load(f)
+
+    samples: List[Dict[str, str]] = []
+    no_overall = 0
+    missing = 0
+    for img in coco.get("images", []):
+        if not isinstance(img, dict):
+            continue
+        file_name = img.get("file_name", None)
+        if not file_name:
+            continue
+        overall = img.get("overall", None)
+        if not isinstance(overall, dict):
+            no_overall += 1
+            continue
+        coll = overall.get("colloquial_zh", None)
+        med = overall.get("medical_zh", None)
+        if not (isinstance(coll, str) and coll.strip()):
+            no_overall += 1
+            continue
+        if not (isinstance(med, str) and med.strip()):
+            no_overall += 1
+            continue
+        img_path = data_dir / file_name
+        if not img_path.exists():
+            missing += 1
+            continue
+        samples.append({
+            "file_name": file_name,
+            "img_path": str(img_path),
+            "colloquial": coll.strip(),
+            "medical": med.strip(),
+        })
+
+    print(f"Found {len(samples)} usable images; skipped no_overall={no_overall}, missing={missing}")
+    return samples, no_overall + missing
+
+
+
+def compute_retrieval_metrics(
+    image_feats: torch.Tensor,
+    text_feats: torch.Tensor,
+    gt_text_pairs: List[Tuple[int, int]],
+    ks: Tuple[int, ...] = (1, 5, 10),
+) -> Tuple[Dict[str, float], Dict[str, float], torch.Tensor]:
+    """
+    image_feats: (N, d) L2-normalized
+    text_feats:  (M, d) L2-normalized, M = 2N
+    gt_text_pairs: per image i, the (colloquial_idx, medical_idx) within text_feats
+    Returns (i2t_metrics, t2i_metrics, sims).
+
+    I→T rank = best rank among image i's two GT captions (1-indexed).
+    T→I rank = rank of caption j's source image (1-indexed).
+    """
+    sims = image_feats @ text_feats.T  # (N, M)
+    N, M = sims.shape
+    if len(gt_text_pairs) != N:
+        raise ValueError(f"gt_text_pairs len {len(gt_text_pairs)} != N {N}")
+
+    # I -> T
+    gt_img_mask = torch.zeros(N, M, dtype=torch.bool)
+    for i, (a, b) in enumerate(gt_text_pairs):
+        gt_img_mask[i, a] = True
+        gt_img_mask[i, b] = True
+
+    pos_sims_i = sims.masked_fill(~gt_img_mask, float("-inf"))
+    best_pos_i = pos_sims_i.max(dim=1).values  # (N,)
+    ranks_i = 1 + (sims > best_pos_i.unsqueeze(1)).sum(dim=1)  # (N,) long
+    ranks_i = ranks_i.float()
+
+    i2t = {f"R@{k}": float((ranks_i <= k).float().mean().item()) for k in ks}
+    i2t["MRR"] = float((1.0 / ranks_i).mean().item())
+    i2t["median_rank"] = float(ranks_i.median().item())
+    i2t["mean_rank"] = float(ranks_i.mean().item())
+
+    # T -> I: for each caption j, the source image
+    text2img = torch.full((M,), -1, dtype=torch.long)
+    for i, (a, b) in enumerate(gt_text_pairs):
+        text2img[a] = i
+        text2img[b] = i
+    valid = text2img >= 0
+    sims_t = sims.T  # (M, N)
+    pos_sims_t = sims_t.gather(1, text2img.clamp(min=0).view(-1, 1)).squeeze(1)  # (M,)
+    ranks_t = 1 + (sims_t > pos_sims_t.unsqueeze(1)).sum(dim=1)
+    ranks_t = ranks_t[valid].float()
+
+    t2i = {f"R@{k}": float((ranks_t <= k).float().mean().item()) for k in ks}
+    t2i["MRR"] = float((1.0 / ranks_t).mean().item())
+    t2i["median_rank"] = float(ranks_t.median().item())
+    t2i["mean_rank"] = float(ranks_t.mean().item())
+
+    return i2t, t2i, sims
+
+
+
+def process_overall_dataset(
+    data_dir: str,
+    output_dir: str,
+    model_specs,
+    device: str = "cuda",
+    text_batch_size: int = 256,
+    img_batch_size: int = 64,
+    max_length: int = 64,
+    use_amp: bool = True,
+    topk_dump: int = 5,
+):
+    data_dir = Path(data_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    samples, _ = collect_overall_samples(data_dir)
+    if len(samples) == 0:
+        raise RuntimeError("No usable images for overall eval (no overall.colloquial_zh/medical_zh found).")
+
+    N = len(samples)
+    images = [Image.open(s["img_path"]).convert("RGB") for s in samples]
+
+    # Interleaved bank: bank[2i] = colloquial_i, bank[2i+1] = medical_i
+    bank_texts: List[str] = []
+    bank_kinds: List[str] = []  # "colloquial" or "medical"
+    bank_owner: List[int] = []  # image index this caption belongs to
+    gt_text_pairs: List[Tuple[int, int]] = []
+    for i, s in enumerate(samples):
+        bank_texts.append(s["colloquial"]); bank_kinds.append("colloquial"); bank_owner.append(i)
+        bank_texts.append(s["medical"]);    bank_kinds.append("medical");    bank_owner.append(i)
+        gt_text_pairs.append((2 * i, 2 * i + 1))
+
+    print(f"Overall pool: N={N} images, M={len(bank_texts)} captions (2 per image)")
+
+    summary_rows: List[str] = []
+    for tag, name_or_path in model_specs:
+        print(f"\n=== model: {tag} ({name_or_path}) ===")
+        m, p = load_model_and_processor(name_or_path, device=device, force_fusion=False)
+        if getattr(m, "is_wrapper", False):
+            raise RuntimeError(
+                f"{tag}: 此 checkpoint 為 fusion wrapper，但 overall 模式不支援 fusion。"
+            )
+
+        text_feats = encode_text_features(
+            m, p, bank_texts, device=device,
+            text_batch_size=text_batch_size, max_length=max_length, use_amp=use_amp,
+        )
+        # whole-image encoding; non-fusion path ignores images_global
+        image_feats = encode_image_features(
+            m, p, images, images, device=device,
+            img_batch_size=img_batch_size, use_amp=use_amp,
+        )
+        print(f"  image_feats={tuple(image_feats.shape)}, text_feats={tuple(text_feats.shape)}")
+
+        i2t, t2i, sims = compute_retrieval_metrics(image_feats, text_feats, gt_text_pairs)
+
+        def _fmt(d: Dict[str, float]) -> str:
+            return ", ".join(f"{k}={v:.4f}" for k, v in d.items())
+
+        line_i2t = f"[{tag}] I->T: {_fmt(i2t)}"
+        line_t2i = f"[{tag}] T->I: {_fmt(t2i)}"
+        print(line_i2t)
+        print(line_t2i)
+        summary_rows += [line_i2t, line_t2i]
+
+        with open(output_dir / f"retrieval_metrics_{tag}.txt", "w", encoding="utf-8") as f:
+            f.write(f"N (images) = {N}\nM (captions) = {len(bank_texts)}\n\n")
+            f.write("I -> T:\n")
+            for k, v in i2t.items():
+                f.write(f"  {k} = {v:.6f}\n")
+            f.write("\nT -> I:\n")
+            for k, v in t2i.items():
+                f.write(f"  {k} = {v:.6f}\n")
+
+        # Top-K dump per image (one JSON line per image)
+        if topk_dump and topk_dump > 0:
+            K = int(min(topk_dump, sims.size(1)))
+            topv, topi = sims.topk(K, dim=1)
+            jsonl_path = output_dir / f"topk_{tag}.jsonl"
+            with open(jsonl_path, "w", encoding="utf-8") as f:
+                for i in range(N):
+                    row = {
+                        "image": samples[i]["file_name"],
+                        "gt": {
+                            "colloquial": samples[i]["colloquial"],
+                            "medical": samples[i]["medical"],
+                        },
+                        "top": [
+                            {
+                                "rank": int(r + 1),
+                                "score": float(topv[i, r].item()),
+                                "kind": bank_kinds[int(topi[i, r].item())],
+                                "owner_idx": int(bank_owner[int(topi[i, r].item())]),
+                                "is_gt": bool(bank_owner[int(topi[i, r].item())] == i),
+                                "text": bank_texts[int(topi[i, r].item())],
+                            }
+                            for r in range(K)
+                        ],
+                    }
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            print(f"  topk dump -> {jsonl_path}")
+
+    with open(output_dir / "summary.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_rows) + "\n")
+
+    print(f"\nDone! Saved outputs to: {output_dir}")
+
+
+# =========================
+# CLI
+# =========================
+
 def build_argparser():
     ap = argparse.ArgumentParser(
         description="Unified evaluator for baseline / multipos / fusion SigLIP2 checkpoints on COCO GT bboxes."
     )
+    ap.add_argument(
+        "--target",
+        type=str,
+        choices=["lesion", "overall"],
+        default="lesion",
+        help="lesion: 對 bbox crop 在 symptoms.json bank 上做分類（現行）。overall: 對整張圖做 image↔caption retrieval（image['overall'].colloquial_zh/medical_zh）",
+    )
     ap.add_argument("--data_dir", type=str, required=True, help="資料夾內需包含：圖片檔 + _annotations.coco.json")
-    ap.add_argument("--symptoms_json", type=str, required=True, help="symptoms.json 路徑")
+    ap.add_argument("--symptoms_json", type=str, default=None, help="symptoms.json 路徑（target=lesion 必填）")
     ap.add_argument("--output_dir", type=str, required=True, help="輸出資料夾")
-    ap.add_argument("--scale", type=float, default=1.0, help="bbox 放大倍率（矩形，w/h 同時乘）")
+    ap.add_argument("--scale", type=float, default=1.0, help="bbox 放大倍率（矩形，w/h 同時乘；只用於 target=lesion）")
+    ap.add_argument("--topk_dump", type=int, default=5, help="overall: 每張圖在輸出寫前 K 條 retrieval 結果到 topk_{tag}.jsonl，0 表示不寫")
     ap.add_argument(
         "--model",
         type=str,
@@ -696,8 +779,30 @@ def build_argparser():
 
 
 def main():
-    args = build_argparser().parse_args()
+    parser = build_argparser()
+    args = parser.parse_args()
     model_specs = parse_model_specs(args.model)
+
+    if args.target == "overall":
+        if args.fusion:
+            parser.error("--target overall is incompatible with --fusion")
+        if args.save_vis:
+            print("[WARN] --save_vis is not implemented for target=overall yet; ignoring.")
+        process_overall_dataset(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            model_specs=model_specs,
+            device=args.device,
+            text_batch_size=args.text_batch_size,
+            img_batch_size=args.img_batch_size,
+            max_length=args.max_length,
+            use_amp=(not args.no_amp),
+            topk_dump=int(args.topk_dump),
+        )
+        return
+
+    if not args.symptoms_json:
+        parser.error("--symptoms_json is required for --target lesion")
 
     process_gt_dataset(
         data_dir=args.data_dir,

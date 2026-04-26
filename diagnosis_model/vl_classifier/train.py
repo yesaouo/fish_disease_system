@@ -16,6 +16,14 @@ import matplotlib.pyplot as plt
 
 from transformers import AutoProcessor, AutoModel, get_cosine_schedule_with_warmup
 
+from common import (
+    format_caption,
+    get_image_features,
+    get_text_features,
+    load_flat_caption_bank,
+    LocalGlobalFusionWrapper,
+)
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -72,27 +80,6 @@ DEFAULT_CONFIG = {
 
 
 # =========================
-# Prompt templates
-# =========================
-PROMPT_EN = "This is {cap}."
-PROMPT_ZH = "{cap}。"
-
-
-def format_caption(cap: str, lang: str) -> str:
-    if lang == "en":
-        return PROMPT_EN.format(cap=str(cap).lower())
-    if lang == "zh":
-        return PROMPT_ZH.format(cap=str(cap))
-    return str(cap)
-# def format_caption(cap: str, lang: str) -> str:
-#     if lang == "en":
-#         return str(cap)
-#     if lang == "zh":
-#         return str(cap)
-#     return str(cap)
-
-
-# =========================
 # Utils
 # =========================
 
@@ -137,49 +124,6 @@ def resolve_image_path(image_base_dir: str, file_name: str, data_root: str, spli
 # =========================
 # Symptoms Captions (multilingual)
 # =========================
-
-def load_captions_multilingual(
-    symptoms_path: str,
-    langs: Tuple[str, ...] = ("en", "zh"),
-) -> Dict[str, List[Tuple[str, str]]]:
-    """
-    回傳：cat_key -> [(raw_caption, lang), ...]
-    順序為 langs 的指定順序（關係到 evidence_index 的跨語對應：同一 ei 會對到每個語言清單的第 ei 個）
-    """
-    if not symptoms_path or not os.path.exists(symptoms_path):
-        raise FileNotFoundError(f"symptoms.json not found: {symptoms_path}")
-
-    s = load_json(symptoms_path)
-    if "data" not in s or not isinstance(s["data"], dict):
-        raise ValueError("symptoms.json format error: missing dict field 'data'")
-
-    out: Dict[str, List[Tuple[str, str]]] = {}
-    for k, v in s["data"].items():
-        if not isinstance(v, dict):
-            continue
-        pairs: List[Tuple[str, str]] = []
-        for lang in langs:
-            key = f"captions_{lang}"
-            caps = v.get(key, None)
-            if caps is None:
-                # 該類別沒有此語言的 caption 就跳過該語言，不整類 raise
-                continue
-            if not isinstance(caps, list):
-                raise ValueError(f"{key} for category_id={k} is not a list")
-            for cap in caps:
-                if isinstance(cap, str) and cap.strip():
-                    pairs.append((cap.strip(), lang))
-
-        if not pairs:
-            raise ValueError(f"symptoms.json category_id={k} has no usable captions for langs={langs}")
-
-        out[str(k)] = pairs
-
-    if not out:
-        raise ValueError("symptoms.json has no usable captions")
-    return out
-
-
 
 def build_caption_bank(
     captions_by_cat: Dict[str, List[Tuple[str, str]]],
@@ -465,60 +409,94 @@ class CocoCropDataset(Dataset):
         return out
 
 
+class CocoOverallDataset(Dataset):
+    """Per-image dataset that pairs the whole image with overall.colloquial_zh / overall.medical_zh."""
+
+    def __init__(
+        self,
+        data_root: str,
+        split: str,
+        use_multipos: bool,
+    ):
+        self.data_root = data_root
+        self.split = split
+        self.use_multipos = use_multipos
+
+        split_dir = os.path.join(data_root, split)
+        coco_json_path = os.path.join(split_dir, "_annotations.coco.json")
+        if not os.path.exists(coco_json_path):
+            raise FileNotFoundError(f"COCO json not found: {coco_json_path}")
+
+        coco = load_json(coco_json_path)
+        images = coco.get("images", [])
+        image_base_dir = resolve_image_base_dir(split_dir)
+
+        samples: List[Dict[str, str]] = []
+        skipped = 0
+        no_overall = 0
+        missing_images = 0
+
+        for img in images:
+            if not isinstance(img, dict):
+                skipped += 1
+                continue
+            file_name = img.get("file_name", None)
+            if not file_name:
+                skipped += 1
+                continue
+
+            overall = img.get("overall", None)
+            if not isinstance(overall, dict):
+                no_overall += 1
+                continue
+            colloquial = overall.get("colloquial_zh", None)
+            medical = overall.get("medical_zh", None)
+            if not (isinstance(colloquial, str) and colloquial.strip()):
+                no_overall += 1
+                continue
+            if not (isinstance(medical, str) and medical.strip()):
+                no_overall += 1
+                continue
+
+            img_path = resolve_image_path(image_base_dir, file_name, data_root, split)
+            if not os.path.exists(img_path):
+                missing_images += 1
+                continue
+
+            samples.append({
+                "img_path": img_path,
+                "colloquial": colloquial.strip(),
+                "medical": medical.strip(),
+            })
+
+        self.samples = samples
+        print(
+            f"[{split}] overall samples={len(self.samples)}, skipped={skipped}, "
+            f"no_overall={no_overall}, missing_images={missing_images}, coco={coco_json_path}"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        image = Image.open(s["img_path"]).convert("RGB")
+
+        if self.use_multipos:
+            return {
+                "image": image,
+                "caption_colloquial": s["colloquial"],
+                "caption_medical": s["medical"],
+            }
+
+        # baseline: deterministic alternation by sample index keeps valid loss reproducible
+        text = s["colloquial"] if (idx % 2 == 0) else s["medical"]
+        return {"image": image, "text": text}
+
+
 # =========================
 # Model helpers
 # =========================
-
-def _pool_from_last_hidden(last_hidden: torch.Tensor) -> torch.Tensor:
-    return last_hidden[:, 0]
-
-
-
-def get_image_features(model, pixel_values: torch.Tensor) -> torch.Tensor:
-    if hasattr(model, "get_image_features"):
-        return model.get_image_features(pixel_values=pixel_values)
-
-    out = model(pixel_values=pixel_values, return_dict=True)
-    if hasattr(out, "image_embeds") and out.image_embeds is not None:
-        return out.image_embeds
-    if hasattr(out, "pooler_output") and out.pooler_output is not None:
-        return out.pooler_output
-    if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
-        return _pool_from_last_hidden(out.last_hidden_state)
-
-    if hasattr(model, "vision_model"):
-        vout = model.vision_model(pixel_values=pixel_values, return_dict=True)
-        if hasattr(vout, "pooler_output") and vout.pooler_output is not None:
-            return vout.pooler_output
-        if hasattr(vout, "last_hidden_state") and vout.last_hidden_state is not None:
-            return _pool_from_last_hidden(vout.last_hidden_state)
-
-    raise RuntimeError("Cannot extract image features from model output. Please use a dual-encoder model (CLIP/SigLIP).")
-
-
-
-def get_text_features(model, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    if hasattr(model, "get_text_features"):
-        return model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
-
-    out = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-    if hasattr(out, "text_embeds") and out.text_embeds is not None:
-        return out.text_embeds
-    if hasattr(out, "pooler_output") and out.pooler_output is not None:
-        return out.pooler_output
-    if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
-        return _pool_from_last_hidden(out.last_hidden_state)
-
-    if hasattr(model, "text_model"):
-        tout = model.text_model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        if hasattr(tout, "pooler_output") and tout.pooler_output is not None:
-            return tout.pooler_output
-        if hasattr(tout, "last_hidden_state") and tout.last_hidden_state is not None:
-            return _pool_from_last_hidden(tout.last_hidden_state)
-
-    raise RuntimeError("Cannot extract text features from model output. Please use a dual-encoder model (CLIP/SigLIP).")
-
-
 
 def get_logit_scale_and_bias(model, device: str, temperature: float = 0.07) -> Tuple[torch.Tensor, torch.Tensor]:
     target_model = model.base_model if hasattr(model, "base_model") else model
@@ -541,42 +519,6 @@ def get_logit_scale_and_bias(model, device: str, temperature: float = 0.07) -> T
 
     scale = torch.clamp(scale, max=100.0)
     return scale, bias
-
-
-# =========================
-# Fusion Wrapper
-# =========================
-class LocalGlobalFusionWrapper(nn.Module):
-    def __init__(self, base_model, hidden_size: int, dropout_prob: float = 0.1):
-        super().__init__()
-        self.base_model = base_model
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(dropout_prob)
-        self.fusion_linear = nn.Linear(hidden_size * 2, hidden_size)
-        nn.init.xavier_uniform_(self.fusion_linear.weight)
-        nn.init.zeros_(self.fusion_linear.bias)
-        self.gate = nn.Parameter(torch.tensor(0.1))
-
-    def forward_image(self, pixel_values_local, pixel_values_global, return_parts: bool = False):
-        local_feat = get_image_features(self.base_model, pixel_values_local)
-        global_feat = get_image_features(self.base_model, pixel_values_global)
-
-        local_feat = F.normalize(local_feat, dim=-1)
-        global_feat = F.normalize(global_feat, dim=-1)
-
-        fused = torch.cat([local_feat, global_feat], dim=-1)
-        fused = self.fusion_linear(fused)
-        fused = self.gelu(fused)
-        fused = self.dropout(fused)
-
-        out = local_feat + self.gate * fused
-
-        if return_parts:
-            return out, local_feat, global_feat, fused
-        return out
-
-    def get_text_features(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return get_text_features(self.base_model, input_ids, attention_mask)
 
 
 # =========================
@@ -712,6 +654,10 @@ def infer_output_dir(config: Dict[str, Any]) -> str:
     else:
         suffix = "finetuned"
 
+    target = config.get("target", "lesion")
+    if target != "lesion":
+        suffix = f"{target}_{suffix}"
+
     langs = config.get("langs", ["en"])
     if isinstance(langs, (list, tuple)) and len(langs) > 0:
         lang_tag = "_".join(sorted(langs))
@@ -723,6 +669,13 @@ def infer_output_dir(config: Dict[str, Any]) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified training entry for baseline / multi-positive / fusion modes")
+    parser.add_argument(
+        "--target",
+        type=str,
+        choices=["lesion", "overall"],
+        default="lesion",
+        help="lesion: bbox crop + symptoms.json captions (existing). overall: whole image + image['overall'].colloquial_zh/medical_zh",
+    )
     parser.add_argument("--multipos", action="store_true", help="use multi-positive caption-bank training")
     parser.add_argument("--fusion", action="store_true", help="use local-global image fusion")
     parser.add_argument("--freeze_text_encoder", action="store_true", help="freeze the text encoder/text projection during training")
@@ -766,8 +719,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     config = dict(DEFAULT_CONFIG)
+    config["target"] = str(getattr(args, "target", "lesion") or "lesion")
     config["multipos"] = bool(args.multipos)
     config["fusion"] = bool(args.fusion)
+
+    if config["target"] == "overall" and config["fusion"]:
+        raise ValueError("--target overall is incompatible with --fusion (no local/global crops in overall mode)")
 
     for key in [
         "model_name",
@@ -804,6 +761,10 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
             config["langs"] = ["en", "zh"]
         else:
             config["langs"] = [args.lang]
+
+    if config["target"] == "overall":
+        # overall captions are zh-only; lock langs for output-dir naming and downstream prints
+        config["langs"] = ["zh"]
 
     if args.no_amp:
         config["use_amp"] = False
@@ -954,8 +915,56 @@ def build_collate_fn(
     cat2bank_indices: Optional[Dict[int, List[int]]] = None,
     cat2evidence: Optional[Dict[int, Dict[int, List[int]]]] = None,
     evidence_slots: int = 2,
+    target: str = "lesion",
 ):
     def collate_fn(items):
+        if target == "overall":
+            images = [x["image"] for x in items]
+            img_batch = processor(images=images, return_tensors="pt")
+            if "pixel_values" not in img_batch:
+                raise RuntimeError("Processor did not return 'pixel_values' for images")
+
+            if use_multipos:
+                B = len(items)
+                # interleaved bank: [colloquial_0, medical_0, colloquial_1, medical_1, ...]
+                texts: List[str] = []
+                bank_labels: List[int] = []
+                for i, x in enumerate(items):
+                    texts.append(str(x["caption_colloquial"]))
+                    bank_labels.append(i)
+                    texts.append(str(x["caption_medical"]))
+                    bank_labels.append(i)
+
+                txt_batch = processor(
+                    text=texts,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=config["max_length"],
+                )
+                out: Dict[str, torch.Tensor] = {
+                    "pixel_values": img_batch["pixel_values"],
+                    "input_ids": txt_batch["input_ids"],
+                    "labels": torch.arange(B, dtype=torch.long),
+                    "bank_labels": torch.tensor(bank_labels, dtype=torch.long),
+                    # evidence_alpha is disabled for overall, but the loss expects a 2D tensor
+                    "evidence_bank_idx": torch.full((B, 1), -1, dtype=torch.long),
+                }
+                if "attention_mask" in txt_batch:
+                    out["attention_mask"] = txt_batch["attention_mask"]
+                return out
+
+            # baseline overall: paired (image, one caption)
+            texts = [str(x["text"]) for x in items]
+            return processor(
+                images=images,
+                text=texts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=config["max_length"],
+            )
+
         if use_multipos:
             if cat2evidence is None:
                 raise ValueError("multipos collate 需要 cat2evidence（由 build_caption_bank 產生）")
@@ -1169,29 +1178,43 @@ def train_baseline(config: Dict[str, Any]):
     device = config["device"]
     os.makedirs(config["output_dir"], exist_ok=True)
 
-    langs = tuple(config.get("langs", ["en"]))
-    captions_by_cat = load_captions_multilingual(config["symptoms_file"], langs=langs)
+    target = config.get("target", "lesion")
 
-    train_ds = CocoCropDataset(
-        data_root=config["data_root"],
-        split=config["train_split"],
-        crop_mode=config["crop_mode"],
-        captions_by_cat=captions_by_cat,
-        use_multipos=False,
-        use_fusion=False,
-    )
-    valid_ds = CocoCropDataset(
-        data_root=config["data_root"],
-        split=config["valid_split"],
-        crop_mode=config["crop_mode"],
-        captions_by_cat=captions_by_cat,
-        use_multipos=False,
-        use_fusion=False,
-    )
+    if target == "overall":
+        captions_by_cat = None
+        train_ds = CocoOverallDataset(
+            data_root=config["data_root"],
+            split=config["train_split"],
+            use_multipos=False,
+        )
+        valid_ds = CocoOverallDataset(
+            data_root=config["data_root"],
+            split=config["valid_split"],
+            use_multipos=False,
+        )
+    else:
+        langs = tuple(config.get("langs", ["en"]))
+        captions_by_cat = load_flat_caption_bank(config["symptoms_file"], langs=langs).raw_by_cat
+        train_ds = CocoCropDataset(
+            data_root=config["data_root"],
+            split=config["train_split"],
+            crop_mode=config["crop_mode"],
+            captions_by_cat=captions_by_cat,
+            use_multipos=False,
+            use_fusion=False,
+        )
+        valid_ds = CocoCropDataset(
+            data_root=config["data_root"],
+            split=config["valid_split"],
+            crop_mode=config["crop_mode"],
+            captions_by_cat=captions_by_cat,
+            use_multipos=False,
+            use_fusion=False,
+        )
 
     processor, model = create_processor_and_model(config)
     apply_freeze_config(model, config)
-    collate_fn = build_collate_fn(processor, config, use_multipos=False, use_fusion=False)
+    collate_fn = build_collate_fn(processor, config, use_multipos=False, use_fusion=False, target=target)
 
     train_loader = DataLoader(
         train_ds,
@@ -1268,14 +1291,21 @@ def train_baseline(config: Dict[str, Any]):
     plot_losses(train_losses, valid_losses, config["output_dir"])
 
     if config.get("eval_test_after_train", False):
-        test_ds = CocoCropDataset(
-            data_root=config["data_root"],
-            split=config["test_split"],
-            crop_mode=config["crop_mode"],
-            captions_by_cat=captions_by_cat,
-            use_multipos=False,
-            use_fusion=False,
-        )
+        if target == "overall":
+            test_ds = CocoOverallDataset(
+                data_root=config["data_root"],
+                split=config["test_split"],
+                use_multipos=False,
+            )
+        else:
+            test_ds = CocoCropDataset(
+                data_root=config["data_root"],
+                split=config["test_split"],
+                crop_mode=config["crop_mode"],
+                captions_by_cat=captions_by_cat,
+                use_multipos=False,
+                use_fusion=False,
+            )
         test_loader = DataLoader(
             test_ds,
             batch_size=int(config["batch_size"]),
@@ -1294,7 +1324,7 @@ def train_baseline(config: Dict[str, Any]):
 
 def prepare_custom_supervision(config: Dict[str, Any], processor):
     langs = tuple(config.get("langs", ["en"]))
-    captions_by_cat = load_captions_multilingual(config["symptoms_file"], langs=langs)
+    captions_by_cat = load_flat_caption_bank(config["symptoms_file"], langs=langs).raw_by_cat
 
     bank_tokens_device = None
     bank_labels_t = None
@@ -1356,17 +1386,33 @@ def compute_custom_batch_loss(
         img_labels = batch["labels"].to(device, non_blocking=True)
         evidence_bank_idx = batch["evidence_bank_idx"].to(device, non_blocking=True)
 
-        if config["fusion"]:
-            txt_feats = model.get_text_features(
-                bank_tokens_device["input_ids"],
-                bank_tokens_device.get("attention_mask", None),
-            )
+        target = config.get("target", "lesion")
+        if target == "overall":
+            # in-batch bank: text features come from this batch's input_ids
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device, non_blocking=True)
+            if config["fusion"]:
+                txt_feats = model.get_text_features(input_ids, attention_mask)
+            else:
+                txt_feats = get_text_features(model, input_ids, attention_mask)
+            bank_lbls = batch["bank_labels"].to(device, non_blocking=True)
+            evidence_alpha_eff = 1.0  # disabled for overall
         else:
-            txt_feats = get_text_features(
-                model,
-                bank_tokens_device["input_ids"],
-                bank_tokens_device.get("attention_mask", None),
-            )
+            if config["fusion"]:
+                txt_feats = model.get_text_features(
+                    bank_tokens_device["input_ids"],
+                    bank_tokens_device.get("attention_mask", None),
+                )
+            else:
+                txt_feats = get_text_features(
+                    model,
+                    bank_tokens_device["input_ids"],
+                    bank_tokens_device.get("attention_mask", None),
+                )
+            bank_lbls = bank_labels_t
+            evidence_alpha_eff = float(config["evidence_alpha"])
 
         img_feats = F.normalize(img_feats, dim=-1)
         txt_feats = F.normalize(txt_feats, dim=-1)
@@ -1376,9 +1422,9 @@ def compute_custom_batch_loss(
         loss, li2t, lt2i = compute_symmetric_multipos_sigmoid_loss(
             logits=logits,
             img_labels=img_labels,
-            bank_labels=bank_labels_t,
+            bank_labels=bank_lbls,
             evidence_bank_idx=evidence_bank_idx,
-            evidence_alpha=float(config["evidence_alpha"]),
+            evidence_alpha=evidence_alpha_eff,
             t2i_lambda=float(config["t2i_lambda"]),
             t2i_skip_no_positive=bool(config["t2i_skip_no_positive"]),
             t2i_label_level_mean=bool(config["t2i_label_level_mean"]),
@@ -1453,31 +1499,53 @@ def train_custom(config: Dict[str, Any]):
 
     processor, model = create_processor_and_model(config)
     apply_freeze_config(model, config)
-    (
-        captions_by_cat,
-        bank_tokens_device,
-        bank_labels_t,
-        cat2bank_indices,
-        cat2evidence,
-        evidence_slots,
-    ) = prepare_custom_supervision(config, processor)
 
-    train_ds = CocoCropDataset(
-        data_root=config["data_root"],
-        split=config["train_split"],
-        crop_mode=config["crop_mode"],
-        captions_by_cat=captions_by_cat,
-        use_multipos=bool(config["multipos"]),
-        use_fusion=bool(config["fusion"]),
-    )
-    valid_ds = CocoCropDataset(
-        data_root=config["data_root"],
-        split=config["valid_split"],
-        crop_mode=config["crop_mode"],
-        captions_by_cat=captions_by_cat,
-        use_multipos=bool(config["multipos"]),
-        use_fusion=bool(config["fusion"]),
-    )
+    target = config.get("target", "lesion")
+
+    if target == "overall":
+        captions_by_cat = None
+        bank_tokens_device = None
+        bank_labels_t = None
+        cat2bank_indices = None
+        cat2evidence = None
+        evidence_slots = 1
+
+        train_ds = CocoOverallDataset(
+            data_root=config["data_root"],
+            split=config["train_split"],
+            use_multipos=bool(config["multipos"]),
+        )
+        valid_ds = CocoOverallDataset(
+            data_root=config["data_root"],
+            split=config["valid_split"],
+            use_multipos=bool(config["multipos"]),
+        )
+    else:
+        (
+            captions_by_cat,
+            bank_tokens_device,
+            bank_labels_t,
+            cat2bank_indices,
+            cat2evidence,
+            evidence_slots,
+        ) = prepare_custom_supervision(config, processor)
+
+        train_ds = CocoCropDataset(
+            data_root=config["data_root"],
+            split=config["train_split"],
+            crop_mode=config["crop_mode"],
+            captions_by_cat=captions_by_cat,
+            use_multipos=bool(config["multipos"]),
+            use_fusion=bool(config["fusion"]),
+        )
+        valid_ds = CocoCropDataset(
+            data_root=config["data_root"],
+            split=config["valid_split"],
+            crop_mode=config["crop_mode"],
+            captions_by_cat=captions_by_cat,
+            use_multipos=bool(config["multipos"]),
+            use_fusion=bool(config["fusion"]),
+        )
 
     collate_fn = build_collate_fn(
         processor=processor,
@@ -1487,6 +1555,7 @@ def train_custom(config: Dict[str, Any]):
         cat2bank_indices=cat2bank_indices,
         cat2evidence=cat2evidence,
         evidence_slots=int(evidence_slots),
+        target=target,
     )
 
     train_loader = DataLoader(
@@ -1586,14 +1655,21 @@ def train_custom(config: Dict[str, Any]):
     plot_losses(train_losses, valid_losses, config["output_dir"])
 
     if config.get("eval_test_after_train", False):
-        test_ds = CocoCropDataset(
-            data_root=config["data_root"],
-            split=config["test_split"],
-            crop_mode=config["crop_mode"],
-            captions_by_cat=captions_by_cat,
-            use_multipos=bool(config["multipos"]),
-            use_fusion=bool(config["fusion"]),
-        )
+        if target == "overall":
+            test_ds = CocoOverallDataset(
+                data_root=config["data_root"],
+                split=config["test_split"],
+                use_multipos=bool(config["multipos"]),
+            )
+        else:
+            test_ds = CocoCropDataset(
+                data_root=config["data_root"],
+                split=config["test_split"],
+                crop_mode=config["crop_mode"],
+                captions_by_cat=captions_by_cat,
+                use_multipos=bool(config["multipos"]),
+                use_fusion=bool(config["fusion"]),
+            )
         test_loader = DataLoader(
             test_ds,
             batch_size=int(config["batch_size"]),
@@ -1622,7 +1698,7 @@ def main():
     config = resolve_config(args)
 
     print(
-        f"Mode: multipos={config['multipos']}, fusion={config['fusion']}, "
+        f"Mode: target={config['target']}, multipos={config['multipos']}, fusion={config['fusion']}, "
         f"freeze_text_encoder={config['freeze_text_encoder']} | "
         f"langs={config['langs']} | warmup_ratio={config['warmup_ratio']} | "
         f"output_dir={config['output_dir']}"
