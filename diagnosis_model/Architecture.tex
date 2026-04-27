@@ -1,0 +1,225 @@
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage{ctex}
+\usepackage{xcolor}
+\usetikzlibrary{arrows.meta, positioning, fit, calc, backgrounds, shapes.geometric}
+\usepackage{xeCJK}
+\setCJKmainfont{Noto Serif CJK TC}
+
+\begin{document}
+
+\begin{tikzpicture}[
+    font=\small,
+    node distance=9mm and 12mm,
+    >=Latex,
+    block/.style={
+        rectangle,
+        rounded corners=2mm,
+        draw=black!70,
+        thick,
+        align=center,
+        minimum width=34mm,
+        minimum height=10mm,
+        fill=blue!5
+    },
+    smallblock/.style={
+        rectangle,
+        rounded corners=2mm,
+        draw=black!65,
+        thick,
+        align=center,
+        minimum width=28mm,
+        minimum height=8mm,
+        fill=blue!4
+    },
+    db/.style={
+        cylinder,
+        shape border rotate=90,
+        draw=black!70,
+        thick,
+        aspect=0.28,
+        align=center,
+        minimum height=16mm,
+        minimum width=27mm,
+        fill=orange!12
+    },
+    output/.style={
+        rectangle,
+        rounded corners=2mm,
+        draw=black!80,
+        thick,
+        align=center,
+        minimum width=38mm,
+        minimum height=10mm,
+        fill=green!10
+    },
+    module/.style={
+        rectangle,
+        rounded corners=3mm,
+        draw=black!35,
+        dashed,
+        thick,
+        inner sep=5mm
+    },
+    arrow/.style={->, thick},
+    dasharrow/.style={->, thick, dashed, black!65}
+]
+
+% ======================
+% Main online pipeline
+% ======================
+
+\node[block] (input) {輸入魚隻影像};
+
+\node[block, below=of input] (detector) {
+    RF-DETR\\
+    病灶偵測
+};
+
+\node[smallblock, left=22mm of detector] (healthy) {
+    無 lesion\\
+    判定健康
+};
+
+\node[block, below=of detector] (evidence) {
+    Evidence Extraction\\
+    產生多粒度證據
+};
+
+\node[smallblock, below left=8mm and 15mm of evidence] (global) {
+    Global Token\\
+    VLM-Global
+};
+
+\node[smallblock, below=8mm of evidence] (lesion) {
+    Lesion Tokens\\
+    VLM-Lesion
+};
+
+\node[smallblock, below right=8mm and 15mm of evidence] (text) {
+    Optional Text Token\\
+    Text Encoder
+};
+
+\node[block, below=16mm of lesion] (queryset) {
+    Query Evidence Set\\
+    $Q=\{g_Q,\;t_Q,\;l_{Q1},...,l_{QN}\}$
+};
+
+\node[block, below=of queryset] (c2r) {
+    C$^2$R Case Retrieval\\
+    Hungarian Lesion-set Matching
+};
+
+\node[block, below=of c2r] (candidates) {
+    Top-$K$ 相似案例\\
+    $\rightarrow$ Candidate Causes
+};
+
+\node[block, below=of candidates] (ceah) {
+    CEAH\\
+    Cause-Evidence Attribution Head
+};
+
+\node[block, below=of ceah] (scoring) {
+    Attribution-gated Scoring\\
+    $z_c=\sum_i \alpha_{c,i}v_i$\\
+    $s_c=\mathrm{score}(z_c,c)$
+};
+
+\node[output, below=of scoring] (final) {
+    最終輸出\\
+    病因排序 + 支持病灶 + 支持案例
+};
+
+\node[output, right=21mm of scoring] (faith) {
+    Faithfulness Check\\
+    Lesion Drop Test\\
+    Top-$\alpha$ drop vs. Random drop
+};
+
+% ======================
+% Offline database
+% ======================
+
+\node[db, right=28mm of c2r] (db) {
+    Case Database\\
+    train cases
+};
+
+\node[smallblock, above=8mm of db] (casecontent) {
+    每筆 case：\\
+    global emb\\
+    lesion embs\\
+    causes
+};
+
+\node[smallblock, below=8mm of db] (proj) {
+    Projection Head\\
+    cause-overlap\\
+    supervised space
+};
+
+% ======================
+% Attribution details
+% ======================
+
+\node[smallblock, left=25mm of ceah] (alpha) {
+    Attribution\\
+    $\alpha_c \in [0,1]^{M}$\\
+    over evidence tokens
+};
+
+\node[smallblock, left=25mm of scoring] (sparse) {
+    Sparse Selection\\
+    global / text / lesions\\
+    少數 evidence 支持病因
+};
+
+% ======================
+% Arrows
+% ======================
+
+\draw[arrow] (input) -- (detector);
+\draw[arrow] (detector) -- node[right, font=\scriptsize] {有 lesion} (evidence);
+\draw[arrow] (detector.west) -- (healthy.east);
+
+\draw[arrow] (evidence) -- (global);
+\draw[arrow] (evidence) -- (lesion);
+\draw[arrow] (evidence) -- (text);
+
+\draw[arrow] (global) |- (queryset);
+\draw[arrow] (lesion) -- (queryset);
+\draw[arrow] (text) |- (queryset);
+
+\draw[arrow] (queryset) -- (c2r);
+\draw[arrow] (c2r) -- (candidates);
+\draw[arrow] (candidates) -- (ceah);
+\draw[arrow] (ceah) -- (scoring);
+\draw[arrow] (scoring) -- (final);
+
+\draw[arrow] (db.west) -- node[above, font=\scriptsize] {相似案例檢索} (c2r.east);
+\draw[dasharrow] (casecontent) -- (db);
+\draw[dasharrow] (proj) -- (db);
+
+\draw[arrow] (ceah) -- (alpha);
+\draw[arrow] (alpha) -- (sparse);
+\draw[arrow] (sparse) -- (scoring);
+
+\draw[arrow] (scoring.east) -- (faith.west);
+\draw[dasharrow] (faith.south) |- (final.east);
+
+% ======================
+% Group boxes
+% ======================
+
+\begin{pgfonlayer}{background}
+\node[module, fit=(input)(detector)(healthy), label={[font=\bfseries]above:Stage 1：病灶偵測}] {};
+\node[module, fit=(evidence)(global)(lesion)(text)(queryset), label={[font=\bfseries]left:Stage 2：證據抽取}] {};
+\node[module, fit=(c2r)(candidates)(db)(casecontent)(proj), label={[font=\bfseries]right:Stage 3：案例檢索召回}] {};
+\node[module, fit=(ceah)(alpha)(sparse)(scoring), label={[font=\bfseries]left:Stage 4：忠實病灶歸因精排}] {};
+\node[module, fit=(final)(faith), label={[font=\bfseries]right:輸出與驗證}] {};
+\end{pgfonlayer}
+
+\end{tikzpicture}
+
+\end{document}
