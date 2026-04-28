@@ -1,8 +1,10 @@
 # Cause Clustering Usage
 
-這份說明是給目前這版
+這份說明主要是給目前這版
 [`recluster_causes.py`](./recluster_causes.py)
-用的。
+用的；最後也附上
+[`llm_consolidate_causes.py`](./llm_consolidate_causes.py)
+的 LLM 整理流程。
 
 建議從 repo root 執行：
 
@@ -177,7 +179,80 @@ python diagnosis_model/cause_inference/preprocessing/recluster_causes.py reassig
 - `--margin`: best 和 second-best 的差距門檻
 - `--min_real_cluster_size`: 至少多大的 cluster 才能當 anchor
 
-## 6. 常見流程
+## 6. 用 Ollama LLM 整理 / 合併 cause strings
+
+如果你想改用 LLM 逐批整理，而不是 embedding + HDBSCAN，可以用
+[`llm_consolidate_causes.py`](./llm_consolidate_causes.py)。
+
+它會輸出和 clustering 版相同的 JSON schema：
+
+- `cause_id_to_canonical`
+- `original_to_cause_id`
+- `cluster_meta`
+
+這支腳本透過 Ollama 呼叫本機模型。執行前先確認 Ollama server 已啟動，且模型已經存在：
+
+```bash
+ollama serve
+ollama pull gemma4:26b
+```
+
+預設設定是：
+
+```text
+--ollama_host http://127.0.0.1:11434
+--model gemma4:26b
+--output diagnosis_model/cause_inference/outputs/cause_clusters_llm.json
+```
+
+基本執行：
+
+```bash
+python diagnosis_model/cause_inference/preprocessing/llm_consolidate_causes.py \
+  --coco_files data/detection/coco/_merged/train/_annotations.coco.json \
+               data/detection/coco/_merged/valid/_annotations.coco.json \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+  --batch_size 5 \
+  --max_attempts 5
+```
+
+如果已經有 `cache` 產出的 `texts.json`，也可以直接讀：
+
+```bash
+python diagnosis_model/cause_inference/preprocessing/llm_consolidate_causes.py \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+  --batch_size 5
+```
+
+腳本每完成一批就會保存：
+
+- `diagnosis_model/cause_inference/outputs/cause_clusters_llm.json`
+- `diagnosis_model/cause_inference/outputs/cause_clusters_llm.json.checkpoint.json`
+
+重新執行同一個 command 會自動從 checkpoint 接續。若要從頭重跑，才加
+`--overwrite`。
+
+想要暫停時直接按 `Ctrl+C` 即可。腳本會保留最後一個已完成批次的
+checkpoint；如果按下時 LLM 正在處理某一批，該批不算完成，重新執行時會從
+該批開頭重跑。
+
+預設會把完整 JSON Schema 傳給 Ollama 的 `format`。如果你的 Ollama 版本或模型
+不支援 schema format，可以改用一般 JSON mode：
+
+```bash
+python diagnosis_model/cause_inference/preprocessing/llm_consolidate_causes.py \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+  --model gemma4:26b \
+  --json_mode
+```
+
+如果模型的 chat 介面表現不穩，可以加 `--use_generate` 改走 Ollama
+`/api/generate`。如果驗證一直失敗，也可以用 `--save_failed_responses` 保存原始
+回覆，方便檢查模型到底輸出了什麼。
+
+## 7. 常見流程
 
 ### 最常見：一次建 cache，之後反覆 cluster
 
@@ -197,7 +272,7 @@ python diagnosis_model/cause_inference/preprocessing/recluster_causes.py reduce 
 python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cluster --reduced_path ...
 ```
 
-## 7. 相關檔案
+## 8. 相關檔案
 
 - `cause_texts.py`: 從 COCO 收集 cause strings
 - `text_embedding_cache.py`: 建立 / 載入文字 embedding cache
@@ -206,10 +281,12 @@ python diagnosis_model/cause_inference/preprocessing/recluster_causes.py cluster
 - `cause_cluster_json.py`: labels 轉 cause JSON、quality report
 - `singleton_reassign.py`: singleton 回掛邏輯
 - `export_unique_causes.py`: 把去重後的 cause 字串 dump 成 txt 檢查用
+- `llm_consolidate_causes.py`: 用 Ollama LLM 逐批整理 / 合併 cause strings
 
-## 8. 小提醒
+## 9. 小提醒
 
 - `cluster` 如果沒有給 `--reduced_path`，會自己重跑 PCA + UMAP。
 - `cache` 是最花時間的步驟，通常只需要跑一次。
 - `sweep` 主要拿來找 `umap_n_neighbors` / `umap_n_components` / `min_cluster_size`。
 - singleton 回掛是後處理，不會直接改 HDBSCAN 本身的結果生成方式。
+- LLM 版本遇到輸出格式錯誤會重試 `--max_attempts` 次；仍失敗就退出，保留上一批的 checkpoint。
