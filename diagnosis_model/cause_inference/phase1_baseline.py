@@ -70,10 +70,29 @@ def hungarian_set_score(sim_block: np.ndarray) -> float:
     if n == 0 or m == 0:
         return 0.0
     if n == 1 or m == 1:
-        # Hungarian degenerates to single max
         return float(sim_block.max() / max(n, m))
     row, col = linear_sum_assignment(-sim_block)
     return float(sim_block[row, col].sum() / max(n, m))
+
+
+def max_mean_set_score(sim_block: np.ndarray) -> float:
+    """Symmetric max-mean: 0.5 * (mean_i max_j sim_ij + mean_j max_i sim_ij).
+
+    Differentiable analog of Hungarian (used at training time). Not penalized by
+    size mismatch — slight asymmetry vs Hungarian.
+    """
+    n, m = sim_block.shape
+    if n == 0 or m == 0:
+        return 0.0
+    forward = float(sim_block.max(axis=1).mean())
+    backward = float(sim_block.max(axis=0).mean())
+    return 0.5 * (forward + backward)
+
+
+_LESION_MATCH_FNS = {
+    "hungarian": hungarian_set_score,
+    "max_mean":  max_mean_set_score,
+}
 
 
 def compute_case_similarities(
@@ -83,17 +102,19 @@ def compute_case_similarities(
     train_lesion_stack: torch.Tensor, # [total_lesions, D]
     train_offsets: List[int],
     alpha: float, beta: float,
+    lesion_match: str = "hungarian",
 ) -> np.ndarray:
     """Return [n_train] combined similarity scores."""
-    g_sim = (q_global.unsqueeze(0) @ train_global_stack.T).squeeze(0)  # [n_train]
-    les_sim = (q_lesions @ train_lesion_stack.T).cpu().numpy()         # [N_q, total]
+    match_fn = _LESION_MATCH_FNS[lesion_match]
+    g_sim = (q_global.unsqueeze(0) @ train_global_stack.T).squeeze(0)
+    les_sim = (q_lesions @ train_lesion_stack.T).cpu().numpy()
 
     n_train = len(train_offsets) - 1
     l_score = np.zeros(n_train, dtype=np.float32)
     for i in range(n_train):
         s, e = train_offsets[i], train_offsets[i + 1]
         if e > s:
-            l_score[i] = hungarian_set_score(les_sim[:, s:e])
+            l_score[i] = match_fn(les_sim[:, s:e])
     return alpha * g_sim.cpu().numpy() + beta * l_score
 
 
@@ -184,6 +205,9 @@ def main():
     ap.add_argument("--top_n_causes", type=int, default=20)
     ap.add_argument("--alpha_global", type=float, default=0.25)
     ap.add_argument("--beta_lesion", type=float, default=0.75)
+    ap.add_argument("--lesion_match", type=str, default="hungarian",
+                    choices=["hungarian", "max_mean"],
+                    help="lesion-set matching mode for case similarity")
     ap.add_argument("--device", type=str,
                     default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--max_queries", type=int, default=-1)
@@ -251,6 +275,7 @@ def main():
             q_global, q_lesions,
             train_global_stack, train_lesion_stack, train_offsets,
             args.alpha_global, args.beta_lesion,
+            lesion_match=args.lesion_match,
         )
         top_k_idx = np.argsort(-sims)[: args.top_k_cases]
         top_k_w = sims[top_k_idx]
