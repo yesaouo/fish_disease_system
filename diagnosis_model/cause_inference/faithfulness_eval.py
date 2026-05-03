@@ -131,7 +131,14 @@ def main():
     # Per-condition score deltas (full minus masked)
     drops_by_cond_total: Dict[str, List[float]] = defaultdict(list)
     drops_by_cond_bucket: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    drops_by_cond_n: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
     bucket_count = defaultdict(int)
+    n_bucket_count = defaultdict(int)
+
+    def n_bucket(n: int) -> str:
+        if n == 1: return "N=1"
+        if n == 2: return "N=2"
+        return "N>=3"
 
     t0 = time.time()
     for qi, q in enumerate(queries):
@@ -215,6 +222,8 @@ def main():
         else:
             s_random = baseline
 
+        nb = n_bucket(n_les)
+        n_bucket_count[nb] += 1
         for cond, val in [
             ("no_global",   baseline - s_no_global),
             ("no_text",     baseline - s_no_text),
@@ -224,6 +233,7 @@ def main():
         ]:
             drops_by_cond_total[cond].append(val)
             drops_by_cond_bucket[bucket][cond].append(val)
+            drops_by_cond_n[nb][cond].append(val)
 
         if (qi + 1) % 200 == 0 or qi + 1 == len(queries):
             elapsed = time.time() - t0
@@ -236,6 +246,7 @@ def main():
     summary = {
         "n_queries_used": sum(len(drops_by_cond_total[c]) for c in ["no_global"]) // 1,
         "bucket_counts": dict(bucket_count),
+        "n_bucket_counts": dict(n_bucket_count),
         "score_drop_by_condition": {
             cond: {
                 "mean": float(np.mean(vals)),
@@ -255,6 +266,17 @@ def main():
             }
             for bucket, conds in drops_by_cond_bucket.items()
         },
+        "score_drop_by_n_bucket": {
+            nb: {
+                cond: {
+                    "mean": float(np.mean(vals)) if vals else 0.0,
+                    "median": float(np.median(vals)) if vals else 0.0,
+                    "n": len(vals),
+                }
+                for cond, vals in conds.items()
+            }
+            for nb, conds in drops_by_cond_n.items()
+        },
         "config": vars(args),
     }
     with (out_dir / "faithfulness.json").open("w", encoding="utf-8") as f:
@@ -269,6 +291,16 @@ def main():
         mx_v = summary["score_drop_by_bucket"].get("mixed", {}).get(cond, {}).get("mean", 0.0)
         print(f"{cond:<14}{all_v:>10.4f}{gt_v:>14.4f}{lt_v:>14.4f}{mx_v:>10.4f}")
     print(f"\nbucket counts: {dict(bucket_count)}")
+
+    print("\n=== Score drop by lesion-count bucket ===")
+    print(f"{'condition':<14}{'all':>10}{'N=1':>10}{'N=2':>10}{'N>=3':>10}")
+    for cond in ["no_global", "no_text", "no_lesion", "no_top_α", "no_random"]:
+        all_v = summary["score_drop_by_condition"][cond]["mean"]
+        v1 = summary["score_drop_by_n_bucket"].get("N=1", {}).get(cond, {}).get("mean", 0.0)
+        v2 = summary["score_drop_by_n_bucket"].get("N=2", {}).get(cond, {}).get("mean", 0.0)
+        v3 = summary["score_drop_by_n_bucket"].get("N>=3", {}).get(cond, {}).get("mean", 0.0)
+        print(f"{cond:<14}{all_v:>10.4f}{v1:>10.4f}{v2:>10.4f}{v3:>10.4f}")
+    print(f"\nN-bucket counts: {dict(n_bucket_count)}")
     print(f"[save] -> {out_dir}/faithfulness.json")
 
 

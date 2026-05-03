@@ -68,14 +68,18 @@ def ceah_forward_for_pool(
     lesion_embs = q["lesion_embs"].unsqueeze(0).expand(P, -1, -1).to(device)
     lesion_mask = torch.ones(P, n_les, dtype=torch.bool, device=device)
 
-    text_key = f"text_{use_text_kind}_emb"
-    t = q.get(text_key)
-    if t is not None:
-        text_emb = t.unsqueeze(0).expand(P, -1).to(device)
-        text_present = torch.ones(P, dtype=torch.bool, device=device)
-    else:
+    if use_text_kind == "none":
         text_emb = torch.zeros(P, in_dim, device=device)
         text_present = torch.zeros(P, dtype=torch.bool, device=device)
+    else:
+        text_key = f"text_{use_text_kind}_emb"
+        t = q.get(text_key)
+        if t is not None:
+            text_emb = t.unsqueeze(0).expand(P, -1).to(device)
+            text_present = torch.ones(P, dtype=torch.bool, device=device)
+        else:
+            text_emb = torch.zeros(P, in_dim, device=device)
+            text_present = torch.zeros(P, dtype=torch.bool, device=device)
 
     cand_embs = cause_table_embs.index_select(
         0, torch.tensor(candidate_indices, device=device, dtype=torch.long),
@@ -224,7 +228,8 @@ def main():
     ap.add_argument("--semantic_threshold", type=float, default=0.95)
     ap.add_argument("--diversify_threshold", type=float, default=0.95)
     ap.add_argument("--text_kind", type=str, default="medical",
-                    choices=["medical", "colloquial"])
+                    choices=["medical", "colloquial", "none"],
+                    help="`none` forces text_present=False for all queries (vision-only)")
 
     # CEAH model dims
     ap.add_argument("--common_dim", type=int, default=256)

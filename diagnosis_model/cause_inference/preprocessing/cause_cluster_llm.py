@@ -13,12 +13,21 @@ The output JSON matches cause_cluster_json.py:
 The long-running state is checkpointed after every completed batch, so rerunning
 the same command resumes from the last saved batch.
 
+Sharded mode is available for large inputs. It runs local consolidation inside
+bounded shards, then merges the shard-level canonical causes and rebuilds a
+single global output. This prevents the prompt's Existing canonical causes list
+from growing with the entire dataset during the first pass.
+
 Prerequisite:
   ollama serve
   ollama pull <model>
 
-Example:
+Examples:
+  # Original one-stage mode
   python cause_cluster_llm.py --model gemma4:26b --batch_size 50
+
+  # Sharded mode: local clusters per 500 causes, then merge local canonicals
+  python cause_cluster_llm.py --model gemma4:26b --batch_size 5 --shard_size 500 --merge_batch_size 50
 """
 from __future__ import annotations
 
@@ -219,6 +228,22 @@ def load_input_texts(args: argparse.Namespace) -> List[str]:
     return texts
 
 
+def _int_key(value: Any) -> int:
+    return int(value)
+
+
+def _sorted_items_by_int_key(mapping: Dict[Any, Any]) -> List[Tuple[int, Any]]:
+    return [(int(k), v) for k, v in sorted(mapping.items(), key=lambda kv: int(kv[0]))]
+
+def _get_by_int_key(mapping: Dict[Any, Any], key: int) -> Any:
+    if key in mapping:
+        return mapping[key]
+    str_key = str(key)
+    if str_key in mapping:
+        return mapping[str_key]
+    raise KeyError(key)
+
+
 def clusters_to_output(state: Dict[str, Any]) -> Dict[str, Any]:
     clusters = state["clusters"]
     return {
@@ -269,11 +294,11 @@ def _state_from_output(path: Path, texts: Sequence[str], fingerprint: str) -> Di
         )
 
     restored_clusters: List[Dict[str, Any]] = []
-    for cause_id, meta in sorted(clusters["cluster_meta"].items()):
+    for cause_id, meta in _sorted_items_by_int_key(clusters["cluster_meta"]):
         restored_clusters.append(
             {
                 "id": int(cause_id),
-                "canonical": str(clusters["cause_id_to_canonical"][cause_id]),
+                "canonical": str(_get_by_int_key(clusters["cause_id_to_canonical"], cause_id)),
                 "members": list(meta.get("members", [])),
             }
         )
@@ -658,11 +683,19 @@ def _iter_batches(texts: Sequence[str], start: int, batch_size: int):
         yield idx, list(texts[idx : idx + batch_size])
 
 
-def _progress_bar(total: int, initial: int):
+def _iter_shards(texts: Sequence[str], shard_size: int):
+    if shard_size <= 0:
+        raise ValueError("shard_size must be positive")
+    for shard_idx, start in enumerate(range(0, len(texts), shard_size)):
+        shard = list(texts[start : start + shard_size])
+        yield shard_idx, start, shard
+
+
+def _progress_bar(total: int, initial: int, desc: str = "llm-consolidate"):
     try:
         from tqdm import tqdm
 
-        return tqdm(total=total, initial=initial, desc="llm-consolidate", unit="cause")
+        return tqdm(total=total, initial=initial, desc=desc, unit="cause")
     except Exception:  # pragma: no cover - optional dependency
         return None
 
@@ -680,104 +713,188 @@ def _save_failed_response(
     print(f"[retry] raw response saved to {failed_path}")
 
 
-def cmd_run(args: argparse.Namespace) -> None:
-    texts = load_input_texts(args)
-    output_path = Path(args.output)
-    checkpoint_path = Path(args.checkpoint) if args.checkpoint else output_path.with_name(
-        output_path.name + ".checkpoint.json"
+def _print_ollama_config(args: argparse.Namespace) -> None:
+    print(f"[ollama] host={args.ollama_host}")
+    print(f"[ollama] model={args.model}")
+    print("[ollama] output_format=" + ("json" if args.json_mode else "json_schema"))
+
+
+def _attempt_batch_once(
+    args: argparse.Namespace,
+    state: Dict[str, Any],
+    output_path: Path,
+    checkpoint_path: Path,
+    batch_start: int,
+    batch: Sequence[str],
+    attempt_label: str,
+    failed_response_attempt: int,
+    think_override: Optional[str] = None,
+) -> Optional[Exception]:
+    prompt, visible_existing_ids = build_prompt(
+        state["clusters"],
+        batch,
+        max_existing_in_prompt=args.max_existing_in_prompt,
     )
+
+    raw = generate_response(args=args, prompt=prompt, think_override=think_override)
+    try:
+        payload = parse_json_strict(raw)
+        plan = validate_response(payload, batch, visible_existing_ids)
+        apply_plan(state, plan)
+        state["processed_count"] = batch_start + len(batch)
+        save_state(state, output_path, checkpoint_path)
+        return None
+    except ResponseValidationError as exc:
+        print(
+            f"\n[retry] batch_start={batch_start} "
+            f"batch_items={len(batch)} {attempt_label}: {exc}"
+        )
+        if args.save_failed_responses:
+            _save_failed_response(raw, output_path, batch_start, failed_response_attempt)
+        return exc
+
+
+def _half_batch(batch: Sequence[str], batch_size: int) -> List[str]:
+    half_size = max(1, batch_size // 2)
+    return list(batch[: min(len(batch), half_size)])
+
+
+def _try_one_batch(
+    args: argparse.Namespace,
+    state: Dict[str, Any],
+    output_path: Path,
+    checkpoint_path: Path,
+    batch_start: int,
+    batch: Sequence[str],
+) -> int:
+    """Try one logical batch and return how many inputs were committed.
+
+    Retry policy:
+      1. Try the original batch size for args.max_attempts attempts.
+      2. If still invalid, try the first half-batch for args.half_batch_attempts attempts.
+      3. If still invalid and thinking is disabled, try the half-batch once with think=true.
+
+    When a half-batch succeeds, only that half is committed. The caller will resume
+    from the updated processed_count, so the remaining items are retried next.
+    """
+    last_error: Optional[Exception] = None
+    failed_response_attempt = 0
+
+    for attempt in range(1, args.max_attempts + 1):
+        failed_response_attempt += 1
+        error = _attempt_batch_once(
+            args=args,
+            state=state,
+            output_path=output_path,
+            checkpoint_path=checkpoint_path,
+            batch_start=batch_start,
+            batch=batch,
+            attempt_label=f"full_attempt={attempt}/{args.max_attempts}",
+            failed_response_attempt=failed_response_attempt,
+        )
+        if error is None:
+            return len(batch)
+        last_error = error
+
+    reduced_batch = _half_batch(batch, args.batch_size)
+    print(
+        f"\n[fallback] batch_start={batch_start}: "
+        f"full batch failed; retrying with batch_size/2 ({len(reduced_batch)} item(s))"
+    )
+    for attempt in range(1, args.half_batch_attempts + 1):
+        failed_response_attempt += 1
+        error = _attempt_batch_once(
+            args=args,
+            state=state,
+            output_path=output_path,
+            checkpoint_path=checkpoint_path,
+            batch_start=batch_start,
+            batch=reduced_batch,
+            attempt_label=f"half_attempt={attempt}/{args.half_batch_attempts}",
+            failed_response_attempt=failed_response_attempt,
+        )
+        if error is None:
+            return len(reduced_batch)
+        last_error = error
+
+    if args.think == "false":
+        print(
+            f"\n[fallback] batch_start={batch_start}: "
+            "half batch failed; retrying once with think=true"
+        )
+        failed_response_attempt += 1
+        error = _attempt_batch_once(
+            args=args,
+            state=state,
+            output_path=output_path,
+            checkpoint_path=checkpoint_path,
+            batch_start=batch_start,
+            batch=reduced_batch,
+            attempt_label="half_think_attempt=1/1",
+            failed_response_attempt=failed_response_attempt,
+            think_override="true",
+        )
+        if error is None:
+            return len(reduced_batch)
+        last_error = error
+    else:
+        print(
+            f"\n[fallback] batch_start={batch_start}: "
+            f"think is already enabled ({args.think}); skipping extra think fallback"
+        )
+
+    total_attempts = args.max_attempts + args.half_batch_attempts + (1 if args.think == "false" else 0)
+    raise SystemExit(
+        f"LLM response failed validation after {total_attempts} scheduled attempt(s); "
+        f"last error: {last_error}. Checkpoint remains at {checkpoint_path}"
+    )
+
+
+def run_consolidation_on_texts(
+    args: argparse.Namespace,
+    texts: Sequence[str],
+    output_path: Path,
+    checkpoint_path: Path,
+    overwrite: bool,
+    progress_desc: str = "llm-consolidate",
+    print_done_summary: bool = False,
+) -> Dict[str, Any]:
+    """Run the existing incremental LLM clustering loop on an explicit text list."""
     state = load_or_create_state(
         texts=texts,
         output_path=output_path,
         checkpoint_path=checkpoint_path,
-        overwrite=args.overwrite,
+        overwrite=overwrite,
     )
     save_state(state, output_path, checkpoint_path)
 
     if int(state["processed_count"]) >= len(texts):
         print("[done] all inputs already processed")
-        print(quality_report(clusters_to_output(state), top_n=args.report_top_n))
-        return
+        output = clusters_to_output(state)
+        if print_done_summary:
+            print(quality_report(output, top_n=args.report_top_n))
+        return output
 
-    print(f"[ollama] host={args.ollama_host}")
-    print(f"[ollama] model={args.model}")
-    print(
-        "[ollama] output_format="
-        + ("json" if args.json_mode else "json_schema")
-    )
-
-    pbar = _progress_bar(total=len(texts), initial=int(state["processed_count"]))
+    pbar = _progress_bar(total=len(texts), initial=int(state["processed_count"]), desc=progress_desc)
 
     try:
-        for batch_start, batch in _iter_batches(
-            texts,
-            start=int(state["processed_count"]),
-            batch_size=args.batch_size,
-        ):
-            prompt, visible_existing_ids = build_prompt(
-                state["clusters"],
-                batch,
-                max_existing_in_prompt=args.max_existing_in_prompt,
+        while int(state["processed_count"]) < len(texts):
+            batch_start = int(state["processed_count"])
+            batch = list(texts[batch_start : batch_start + args.batch_size])
+            committed = _try_one_batch(
+                args=args,
+                state=state,
+                output_path=output_path,
+                checkpoint_path=checkpoint_path,
+                batch_start=batch_start,
+                batch=batch,
             )
-
-            last_error: Optional[Exception] = None
-            for attempt in range(1, args.max_attempts + 1):
-                raw = generate_response(args=args, prompt=prompt)
-                try:
-                    payload = parse_json_strict(raw)
-                    plan = validate_response(payload, batch, visible_existing_ids)
-                    apply_plan(state, plan)
-                    state["processed_count"] = batch_start + len(batch)
-                    save_state(state, output_path, checkpoint_path)
-                    if pbar is not None:
-                        pbar.update(len(batch))
-                    else:
-                        print(
-                            f"[progress] {state['processed_count']}/{len(texts)} "
-                            f"({state['processed_count'] / max(1, len(texts)):.1%})"
-                        )
-                    break
-                except ResponseValidationError as exc:
-                    last_error = exc
-                    print(
-                        f"\n[retry] batch_start={batch_start} attempt={attempt}/"
-                        f"{args.max_attempts}: {exc}"
-                    )
-                    if args.save_failed_responses:
-                        _save_failed_response(raw, output_path, batch_start, attempt)
+            if pbar is not None:
+                pbar.update(committed)
             else:
-                if args.think != "true":
-                    print(
-                        f"\n[fallback] batch_start={batch_start}: "
-                        "all normal attempts failed; retrying once with think=true"
-                    )
-                    raw = generate_response(args=args, prompt=prompt, think_override="true")
-                    try:
-                        payload = parse_json_strict(raw)
-                        plan = validate_response(payload, batch, visible_existing_ids)
-                        apply_plan(state, plan)
-                        state["processed_count"] = batch_start + len(batch)
-                        save_state(state, output_path, checkpoint_path)
-                        if pbar is not None:
-                            pbar.update(len(batch))
-                        else:
-                            print(
-                                f"[progress] {state['processed_count']}/{len(texts)} "
-                                f"({state['processed_count'] / max(1, len(texts)):.1%})"
-                            )
-                        continue
-                    except ResponseValidationError as exc:
-                        last_error = exc
-                        print(
-                            f"\n[fallback] batch_start={batch_start}: "
-                            f"think=true also failed: {exc}"
-                        )
-                        if args.save_failed_responses:
-                            _save_failed_response(raw, output_path, batch_start, args.max_attempts + 1)
-
-                raise SystemExit(
-                    f"LLM response failed validation {args.max_attempts} time(s); "
-                    f"last error: {last_error}. Checkpoint remains at {checkpoint_path}"
+                print(
+                    f"[progress] {state['processed_count']}/{len(texts)} "
+                    f"({state['processed_count'] / max(1, len(texts)):.1%})"
                 )
     except KeyboardInterrupt:
         save_state(state, output_path, checkpoint_path)
@@ -787,8 +904,202 @@ def cmd_run(args: argparse.Namespace) -> None:
         if pbar is not None:
             pbar.close()
 
+    return clusters_to_output(state)
+
+
+def _clone_args(args: argparse.Namespace, **overrides: Any) -> argparse.Namespace:
+    payload = vars(args).copy()
+    payload.update(overrides)
+    return argparse.Namespace(**payload)
+
+
+def _default_shard_dir(output_path: Path) -> Path:
+    return output_path.parent / f"{output_path.stem}.shards"
+
+
+def _local_canonical_records(
+    shard_outputs: Sequence[Dict[str, Any]],
+) -> Tuple[List[str], Dict[Tuple[int, int], str]]:
+    """Return unique local canonical texts and a local ref -> canonical text map.
+
+    Multiple shard-local clusters can have exactly the same canonical sentence.
+    The merge stage should see that sentence only once, while every local
+    (shard_idx, local_cause_id) reference still maps to the resulting global id.
+    """
+    canonical_to_seen: Dict[str, None] = {}
+    ref_to_canonical: Dict[Tuple[int, int], str] = {}
+
+    for shard_idx, output in enumerate(shard_outputs):
+        cause_id_to_canonical = output["cause_id_to_canonical"]
+        for local_id, canonical in _sorted_items_by_int_key(cause_id_to_canonical):
+            text = str(canonical).strip()
+            if not text:
+                raise ValueError(f"Shard {shard_idx} local cause id {local_id} has empty canonical")
+            canonical_to_seen.setdefault(text, None)
+            ref_to_canonical[(shard_idx, int(local_id))] = text
+
+    return list(canonical_to_seen.keys()), ref_to_canonical
+
+
+def _rebuild_global_output(
+    shard_outputs: Sequence[Dict[str, Any]],
+    local_ref_to_global_id: Dict[Tuple[int, int], int],
+    global_cause_id_to_canonical: Dict[int, str],
+) -> Dict[str, Any]:
+    original_to_cause_id: Dict[str, int] = {}
+    cluster_members: Dict[int, List[str]] = {
+        int(global_id): [] for global_id in global_cause_id_to_canonical
+    }
+
+    for shard_idx, output in enumerate(shard_outputs):
+        local_original_to_cause_id = output["original_to_cause_id"]
+        for original, local_id in local_original_to_cause_id.items():
+            ref = (shard_idx, int(local_id))
+            if ref not in local_ref_to_global_id:
+                raise ValueError(f"Missing global id for shard/local cause ref {ref}")
+            global_id = local_ref_to_global_id[ref]
+            original_to_cause_id[str(original)] = global_id
+            cluster_members.setdefault(global_id, []).append(str(original))
+
+    return {
+        "cause_id_to_canonical": {
+            int(global_id): global_cause_id_to_canonical[int(global_id)]
+            for global_id in sorted(global_cause_id_to_canonical)
+        },
+        "original_to_cause_id": original_to_cause_id,
+        "cluster_meta": {
+            int(global_id): {
+                "size": len(members),
+                "members": members,
+            }
+            for global_id, members in sorted(cluster_members.items())
+        },
+    }
+
+
+def merge_shard_outputs_with_llm(
+    args: argparse.Namespace,
+    shard_outputs: Sequence[Dict[str, Any]],
+    output_path: Path,
+    shard_dir: Path,
+) -> Dict[str, Any]:
+    merge_texts, ref_to_canonical = _local_canonical_records(shard_outputs)
+    print(f"\n[merge] local canonical causes={len(merge_texts)}")
+
+    if not merge_texts:
+        return {
+            "cause_id_to_canonical": {},
+            "original_to_cause_id": {},
+            "cluster_meta": {},
+        }
+
+    merge_args = _clone_args(args, batch_size=args.merge_batch_size)
+    merge_output_path = shard_dir / f"{output_path.stem}.merge_stage.json"
+    merge_checkpoint_path = shard_dir / f"{output_path.stem}.merge_stage.checkpoint.json"
+
+    merge_output = run_consolidation_on_texts(
+        args=merge_args,
+        texts=merge_texts,
+        output_path=merge_output_path,
+        checkpoint_path=merge_checkpoint_path,
+        overwrite=args.overwrite,
+        progress_desc="llm-merge",
+        print_done_summary=False,
+    )
+
+    merge_original_to_cause_id = {
+        str(text): int(global_id)
+        for text, global_id in merge_output["original_to_cause_id"].items()
+    }
+    global_cause_id_to_canonical = {
+        int(global_id): str(canonical)
+        for global_id, canonical in merge_output["cause_id_to_canonical"].items()
+    }
+
+    local_ref_to_global_id: Dict[Tuple[int, int], int] = {}
+    for ref, canonical in ref_to_canonical.items():
+        if canonical not in merge_original_to_cause_id:
+            raise ValueError(f"Merge stage did not assign local canonical: {canonical!r}")
+        local_ref_to_global_id[ref] = merge_original_to_cause_id[canonical]
+
+    merged = _rebuild_global_output(
+        shard_outputs=shard_outputs,
+        local_ref_to_global_id=local_ref_to_global_id,
+        global_cause_id_to_canonical=global_cause_id_to_canonical,
+    )
+    return merged
+
+
+def cmd_run_sharded(args: argparse.Namespace) -> None:
+    texts = load_input_texts(args)
+    output_path = Path(args.output)
+    shard_dir = Path(args.shard_dir) if args.shard_dir else _default_shard_dir(output_path)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    _print_ollama_config(args)
+    print(f"[shard] shard_size={args.shard_size}")
+    print(f"[shard] merge_batch_size={args.merge_batch_size}")
+    print(f"[shard] work_dir={shard_dir}")
+
+    shard_outputs: List[Dict[str, Any]] = []
+
+    for shard_idx, start, shard_texts in _iter_shards(texts, args.shard_size):
+        shard_output = shard_dir / f"shard_{shard_idx:04d}.json"
+        shard_checkpoint = shard_dir / f"shard_{shard_idx:04d}.checkpoint.json"
+        print(
+            f"\n[shard] {shard_idx:04d} "
+            f"items={len(shard_texts)} "
+            f"range=[{start}, {start + len(shard_texts)})"
+        )
+        local_output = run_consolidation_on_texts(
+            args=args,
+            texts=shard_texts,
+            output_path=shard_output,
+            checkpoint_path=shard_checkpoint,
+            overwrite=args.overwrite,
+            progress_desc=f"llm-shard-{shard_idx:04d}",
+            print_done_summary=False,
+        )
+        shard_outputs.append(local_output)
+
+    merged = merge_shard_outputs_with_llm(
+        args=args,
+        shard_outputs=shard_outputs,
+        output_path=output_path,
+        shard_dir=shard_dir,
+    )
+    save_clusters_json(merged, output_path)
+
     print()
-    print(quality_report(clusters_to_output(state), top_n=args.report_top_n))
+    print(quality_report(merged, top_n=args.report_top_n))
+    print(f"\nSaved merged output: {output_path}")
+    print(f"Shard/checkpoint directory: {shard_dir}")
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    if args.shard_size and args.shard_size > 0:
+        cmd_run_sharded(args)
+        return
+
+    texts = load_input_texts(args)
+    output_path = Path(args.output)
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else output_path.with_name(
+        output_path.name + ".checkpoint.json"
+    )
+
+    _print_ollama_config(args)
+    output = run_consolidation_on_texts(
+        args=args,
+        texts=texts,
+        output_path=output_path,
+        checkpoint_path=checkpoint_path,
+        overwrite=args.overwrite,
+        progress_desc="llm-consolidate",
+        print_done_summary=False,
+    )
+
+    print()
+    print(quality_report(output, top_n=args.report_top_n))
     print(f"\nSaved: {output_path}")
     print(f"Checkpoint: {checkpoint_path}")
 
@@ -808,12 +1119,32 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint",
         default=None,
-        help="Checkpoint path. Defaults to '<output>.checkpoint.json'.",
+        help="Checkpoint path for non-sharded mode. Defaults to '<output>.checkpoint.json'.",
     )
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Ignore existing output/checkpoint and start from scratch.",
+    )
+    parser.add_argument(
+        "--shard_size",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, split inputs into independent local shards, then merge "
+            "the shard-level canonical causes. 0 keeps the original one-stage mode."
+        ),
+    )
+    parser.add_argument(
+        "--shard_dir",
+        default=None,
+        help="Directory for shard outputs/checkpoints. Defaults to '<output_stem>.shards'.",
+    )
+    parser.add_argument(
+        "--merge_batch_size",
+        type=int,
+        default=50,
+        help="Batch size for the final canonical-cause merge stage.",
     )
 
     parser.add_argument(
@@ -857,9 +1188,20 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
 
-    parser.add_argument("--batch_size", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--max_existing_in_prompt", type=int, default=0, help="0 means include all.")
-    parser.add_argument("--max_attempts", type=int, default=10)
+    parser.add_argument(
+        "--max_attempts",
+        type=int,
+        default=3,
+        help="Attempts using the original batch size before falling back to batch_size/2.",
+    )
+    parser.add_argument(
+        "--half_batch_attempts",
+        type=int,
+        default=2,
+        help="Attempts using batch_size/2 after original-batch attempts fail.",
+    )
     parser.add_argument(
         "--max_tokens",
         type=int,
@@ -891,8 +1233,14 @@ def main() -> None:
     args = build_argparser().parse_args()
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive")
+    if args.merge_batch_size <= 0:
+        raise ValueError("--merge_batch_size must be positive")
+    if args.shard_size < 0:
+        raise ValueError("--shard_size must be >= 0")
     if args.max_attempts <= 0:
         raise ValueError("--max_attempts must be positive")
+    if args.half_batch_attempts <= 0:
+        raise ValueError("--half_batch_attempts must be positive")
     if args.max_tokens <= 0:
         raise ValueError("--max_tokens must be positive")
     if args.keep_alive == "":
