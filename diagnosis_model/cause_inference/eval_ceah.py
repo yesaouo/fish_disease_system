@@ -1,12 +1,14 @@
 """Phase 3 evaluation: hybrid Phase-1 + CEAH scoring on valid set.
 
-For each valid query:
-  1. Phase 1 case retrieval → candidate pool
-  2. Phase 1 candidate score  s1(c) = Σ_j w_j · max_g cos(emb(c), emb(e_{j,g}))
-  3. CEAH forward            → s_ceah(c) ∈ (0, 1)  and  α(c) ∈ [0, 1]^E
-  4. Per-query min-max normalize each score to [0, 1]
-  5. Hybrid score: hybrid(c, γ) = γ · s1_norm(c) + (1 − γ) · s_ceah_norm(c)
-  6. For each γ in --gammas: rank → diversify → semantic R@K / MRR
+Mirrors the Phase-1 contract from phase1_baseline.py:
+  - All global / lesion / cause embeddings are L2-normalized before dot products.
+  - Only train cases with combined similarity > 0 are retained for candidate-pool
+    construction and scoring; positive weights are normalized to sum to 1.
+  - All metrics use the raw candidate-pool score ranking; diversification only
+    affects predicted_top_n inspection output.
+  - Misses are +inf internally and null in per_query.jsonl, so R@K never counts
+    uncovered GTs as hits.
+  - Cluster metric is computed per GT cause occurrence.
 
 Outputs:
   - metrics_gammas.json    aggregate metrics per γ
@@ -23,11 +25,20 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from diagnosis_model.cause_inference.models import CEAH
 from diagnosis_model.cause_inference.phase1_baseline import (
-    build_candidate_pool, compute_case_similarities, diversify,
-    score_candidates, stack_train_lesions,
+    MISS_RANK,
+    add_recall_at_ks,
+    build_candidate_pool,
+    compute_case_similarities,
+    diversify,
+    fmt_metric,
+    score_candidates,
+    select_positive_top_cases,
+    stack_train_lesions,
+    summarize_rank_metric,
 )
 
 
@@ -106,32 +117,41 @@ def evaluate_one_query(
     device: str,
     in_dim: int,
 ):
-    q_global = q["global_emb"].to(device)
-    q_lesions = q["lesion_embs"].to(device)
+    # Match phase1_baseline.py: explicitly L2-normalize before dot products.
+    q_global = F.normalize(q["global_emb"].to(device), dim=-1)
+    q_lesions = F.normalize(q["lesion_embs"].to(device), dim=-1)
 
     sims = compute_case_similarities(
         q_global, q_lesions,
         train_global_stack, train_lesion_stack, train_offsets,
         args.alpha_global, args.beta_lesion, lesion_match=args.lesion_match,
     )
-    top_k_idx = np.argsort(-sims)[: args.top_k_cases]
-    top_k_w = sims[top_k_idx]
+    # Drop train cases with similarity <= 0; positive weights normalized to sum to 1.
+    top_k_idx, top_k_w, _ = select_positive_top_cases(sims, args.top_k_cases)
+    n_gt = len(q["cause_emb_indices"])
 
     candidate_indices = build_candidate_pool(top_k_idx, train_cases)
     pool_size = len(candidate_indices)
 
     if pool_size == 0:
+        empty_ranks = [None] * n_gt
         return {
             "pool_size": 0,
-            "ranks_per_gamma": {f"g={g:.2f}": [] for g in args.gammas},
-            "alpha": None,
-            "predicted_top_n": [],
+            "retained_positive_case_count": int(len(top_k_idx)),
+            "ranks_per_gamma": {
+                f"g={g:.2f}": {
+                    "sem_ranks": empty_ranks,
+                    "cluster_ranks": empty_ranks if cluster_id_array is not None else [],
+                }
+                for g in args.gammas
+            },
+            "predicted_top_n_per_gamma": {f"g={g:.2f}": [] for g in args.gammas},
         }
 
     cand_idx_t = torch.tensor(candidate_indices, device=device, dtype=torch.long)
     cand_embs = cause_table_embs.index_select(0, cand_idx_t)  # [P, D]
 
-    # Phase 1 score
+    # Phase 1 score (with normalized positive weights).
     s1 = score_candidates(
         candidate_indices, top_k_idx, top_k_w, train_cases, cause_table_embs,
     )  # [P]
@@ -150,39 +170,38 @@ def evaluate_one_query(
 
     out = {
         "pool_size": pool_size,
+        "retained_positive_case_count": int(len(top_k_idx)),
         "ranks_per_gamma": {},
         "predicted_top_n_per_gamma": {},
     }
 
     for g in args.gammas:
         hybrid = g * s1_n + (1.0 - g) * sc_n  # [P]
-        score_sorted = torch.argsort(hybrid, descending=True).cpu().numpy()
-        sorted_local = diversify(score_sorted, cand_embs, args.diversify_threshold)
-        sorted_global = np.array(candidate_indices)[sorted_local]
+        # Raw ranking is used for all metrics.
+        raw_sorted_local = torch.argsort(hybrid, descending=True).detach().cpu().numpy()
+        # Diversified ranking is used only for predicted_top_n inspection output.
+        div_sorted_local = diversify(raw_sorted_local, cand_embs, args.diversify_threshold)
+        div_sorted_global = np.array(candidate_indices)[div_sorted_local]
 
-        # Semantic ranks
-        sorted_cand_embs = cand_embs[torch.from_numpy(sorted_local).to(device)]
-        cos_sorted = gt_embs @ sorted_cand_embs.T
+        # Semantic ranks within raw ranking
+        raw_sorted_cand_embs = cand_embs[torch.from_numpy(raw_sorted_local).to(device)]
+        cos_sorted = gt_embs @ raw_sorted_cand_embs.T
         sem_match = cos_sorted >= args.semantic_threshold
 
-        sem_ranks: List[int] = []
+        sem_ranks: List[int | None] = []
         for g_i in range(sem_match.size(0)):
             hits = torch.nonzero(sem_match[g_i], as_tuple=False)
-            if hits.numel() > 0:
-                sem_ranks.append(int(hits[0].item()) + 1)
-            else:
-                sem_ranks.append(pool_size + 1)
+            sem_ranks.append(int(hits[0].item()) + 1 if hits.numel() > 0 else None)
 
-        cl_ranks: List[int] = []
+        # Cluster ranks within raw ranking, per GT cause occurrence
+        cl_ranks: List[int | None] = []
         if cluster_id_array is not None:
-            gt_clusters_set = sorted(set(int(cluster_id_array[i]) for i in q["cause_emb_indices"]))
-            sorted_clusters = cluster_id_array[sorted_global]
-            for cid in gt_clusters_set:
-                hits = np.flatnonzero(sorted_clusters == cid)
-                if hits.size > 0:
-                    cl_ranks.append(int(hits[0]) + 1)
-                else:
-                    cl_ranks.append(pool_size + 1)
+            raw_sorted_global = np.array(candidate_indices)[raw_sorted_local]
+            raw_sorted_clusters = cluster_id_array[raw_sorted_global]
+            for gi in q["cause_emb_indices"]:
+                cid = int(cluster_id_array[int(gi)])
+                hits = np.flatnonzero(raw_sorted_clusters == cid)
+                cl_ranks.append(int(hits[0]) + 1 if hits.size > 0 else None)
 
         out["ranks_per_gamma"][f"g={g:.2f}"] = {
             "sem_ranks": sem_ranks,
@@ -190,11 +209,11 @@ def evaluate_one_query(
         }
 
         if abs(g - args.dump_gamma) < 1e-6:
-            top_n_count = min(args.top_n_causes, pool_size)
-            top_n_global = sorted_global[:top_n_count].tolist()
+            top_n_count = min(args.top_n_causes, len(div_sorted_local))
+            top_n_global = div_sorted_global[:top_n_count].tolist()
             top_n_alpha = []
             top_n_score = []
-            for li in sorted_local[:top_n_count].tolist():
+            for li in div_sorted_local[:top_n_count].tolist():
                 top_n_alpha.append(alpha[li].cpu().tolist())
                 top_n_score.append(float(hybrid[li].item()))
             out["predicted_top_n_per_gamma"][f"g={g:.2f}"] = [
@@ -255,7 +274,8 @@ def main():
     train_cases = torch.load(case_db_dir / "train_cases.pt", weights_only=False)
     valid_cases = torch.load(case_db_dir / "valid_cases.pt", weights_only=False)
     cause_pack = torch.load(case_db_dir / "cause_text_embs.pt", weights_only=False)
-    cause_table_embs = cause_pack["embeddings"].to(device)
+    # Match phase1_baseline.py: L2-normalize so dot products are cosine.
+    cause_table_embs = F.normalize(cause_pack["embeddings"].to(device), dim=-1)
     cause_texts = cause_pack["texts"]
     print(f"[load] train={len(train_cases)} valid={len(valid_cases)} "
           f"causes={cause_table_embs.size(0)}")
@@ -270,10 +290,12 @@ def main():
         )
         print(f"[cluster] {len(set(cluster_id_array.tolist()))} clusters loaded")
 
-    # Stack train embeddings
-    train_global_stack = torch.stack([c["global_emb"] for c in train_cases]).to(device)
+    # Stack + L2-normalize train embeddings
+    train_global_stack = F.normalize(
+        torch.stack([c["global_emb"] for c in train_cases]).to(device), dim=-1,
+    )
     train_lesion_stack, train_offsets = stack_train_lesions(train_cases)
-    train_lesion_stack = train_lesion_stack.to(device)
+    train_lesion_stack = F.normalize(train_lesion_stack.to(device), dim=-1)
 
     # Load CEAH
     in_dim = cause_table_embs.size(-1)
@@ -290,12 +312,14 @@ def main():
     print(f"[eval] queries={len(queries)}  K={args.top_k_cases}  "
           f"gammas={args.gammas}  dump_gamma={args.dump_gamma}")
 
-    # Aggregate ranks per gamma
+    # Aggregate ranks per gamma. Misses become +inf in the float arrays.
     sem_ranks_all = {f"g={g:.2f}": [] for g in args.gammas}
     cl_ranks_all = {f"g={g:.2f}": [] for g in args.gammas}
-    cov_all = {f"g={g:.2f}": [] for g in args.gammas}
+    sem_cov_all = {f"g={g:.2f}": [] for g in args.gammas}
+    cl_cov_all = {f"g={g:.2f}": [] for g in args.gammas}
 
     pool_sizes = []
+    retained_case_counts = []
     per_query_results = []
 
     t0 = time.time()
@@ -306,13 +330,23 @@ def main():
             cause_table_embs, cluster_id_array, ceah, args, device, in_dim,
         )
         pool_sizes.append(out["pool_size"])
+        retained_case_counts.append(out["retained_positive_case_count"])
 
         for tag, ranks in out["ranks_per_gamma"].items():
             for r in ranks["sem_ranks"]:
-                sem_ranks_all[tag].append(r)
-                cov_all[tag].append(1 if r <= out["pool_size"] else 0)
+                if r is None:
+                    sem_ranks_all[tag].append(MISS_RANK)
+                    sem_cov_all[tag].append(0)
+                else:
+                    sem_ranks_all[tag].append(float(r))
+                    sem_cov_all[tag].append(1)
             for r in ranks["cluster_ranks"]:
-                cl_ranks_all[tag].append(r)
+                if r is None:
+                    cl_ranks_all[tag].append(MISS_RANK)
+                    cl_cov_all[tag].append(0)
+                else:
+                    cl_ranks_all[tag].append(float(r))
+                    cl_cov_all[tag].append(1)
 
         # Save per-query info for dump_gamma
         dump_tag = f"g={args.dump_gamma:.2f}"
@@ -321,6 +355,7 @@ def main():
             "file_name": q["file_name"],
             "lesion_count": int(q["lesion_embs"].size(0)),
             "pool_size": out["pool_size"],
+            "retained_positive_case_count": out["retained_positive_case_count"],
             "gt_causes": list(q["causes"]),
             "gt_cause_indices": list(q["cause_emb_indices"]),
             "ranks_per_gamma": {
@@ -337,31 +372,68 @@ def main():
             print(f"[eval] {qi+1}/{len(queries)}  "
                   f"rate={rate:.2f} q/s  ETA={eta/60:.1f} min")
 
-    # Aggregate
+    # Aggregate metrics per gamma — same conventions as phase1_baseline.summarize_rank_metric:
+    #   misses -> reciprocal 0 in MRR; mean/median rank computed over covered occurrences.
     metrics: Dict[str, Dict] = {}
     for tag in sem_ranks_all:
-        sa = np.array(sem_ranks_all[tag], dtype=np.float64) if sem_ranks_all[tag] else np.array([1.0])
-        ca = np.array(cl_ranks_all[tag], dtype=np.float64) if cl_ranks_all[tag] else np.array([1.0])
+        sa = np.asarray(sem_ranks_all[tag], dtype=np.float64)
+        ca = np.asarray(cl_ranks_all[tag], dtype=np.float64) if cl_ranks_all[tag] else np.empty(0)
+
+        sem_block = summarize_rank_metric(sa, sem_cov_all[tag])
         m = {
-            "sem_MRR": float((1.0 / sa).mean()),
-            "sem_median_rank": float(np.median(sa)),
-            "sem_coverage": float(np.mean(cov_all[tag])) if cov_all[tag] else 0.0,
+            "sem_MRR": sem_block["MRR"],
+            "sem_median_rank": sem_block["median_rank"],
+            "sem_mean_rank": sem_block["mean_rank"],
+            "sem_coverage": sem_block["coverage"],
+            "sem_n_covered": sem_block["n_covered"],
+            "sem_n_missed": sem_block["n_missed"],
         }
-        for k in args.ks:
-            m[f"sem_R@{k}"] = float((sa <= k).mean())
-        if cl_ranks_all[tag]:
-            m["cl_MRR"] = float((1.0 / ca).mean())
-            for k in args.ks:
-                m[f"cl_R@{k}"] = float((ca <= k).mean())
+        sem_recall: Dict[str, float] = {}
+        add_recall_at_ks(sem_recall, sa, args.ks)
+        for k, v in sem_recall.items():
+            m[f"sem_{k}"] = v
+
+        if ca.size > 0:
+            cl_block = summarize_rank_metric(ca, cl_cov_all[tag])
+            m["cl_MRR"] = cl_block["MRR"]
+            m["cl_median_rank"] = cl_block["median_rank"]
+            m["cl_mean_rank"] = cl_block["mean_rank"]
+            m["cl_coverage"] = cl_block["coverage"]
+            m["cl_n_covered"] = cl_block["n_covered"]
+            m["cl_n_missed"] = cl_block["n_missed"]
+            cl_recall: Dict[str, float] = {}
+            add_recall_at_ks(cl_recall, ca, args.ks)
+            for k, v in cl_recall.items():
+                m[f"cl_{k}"] = v
         metrics[tag] = m
 
     pool_arr = np.array(pool_sizes, dtype=np.float64)
+    retained_arr = np.array(retained_case_counts, dtype=np.float64)
     summary = {
         "n_queries": len(queries),
         "pool_size_mean": float(pool_arr.mean()),
         "pool_size_median": float(np.median(pool_arr)),
+        "retained_cases": {
+            "requested_top_k": int(args.top_k_cases),
+            "positive_similarity_only": True,
+            "mean_retained": float(retained_arr.mean()) if retained_arr.size else 0.0,
+            "median_retained": float(np.median(retained_arr)) if retained_arr.size else 0.0,
+            "min_retained": int(retained_arr.min()) if retained_arr.size else 0,
+            "max_retained": int(retained_arr.max()) if retained_arr.size else 0,
+        },
         "metrics_per_gamma": metrics,
-        "config": vars(args),
+        "config": {
+            **vars(args),
+            "implementation_notes": {
+                "embedding_normalization": "L2-normalize global, lesion, and cause embeddings before dot products.",
+                "retrieved_case_filter": "Only train cases with combined similarity > 0 are retained for candidate-pool construction and scoring.",
+                "case_weighting": "Positive retained similarities are normalized to sum to 1 before candidate scoring.",
+                "metrics_ranking": "All metrics use raw candidate-pool score ranking, before diversification.",
+                "output_ranking": "predicted_top_n uses diversified ranking for inspection only.",
+                "cluster_metric": "Computed per GT cause occurrence; duplicate GT clusters within a query are not deduplicated.",
+                "missing_rank_handling": "Misses are +inf internally, null in per_query.jsonl, and never counted by R@K; mean/median rank are covered-only.",
+            },
+        },
     }
     with (out_dir / "metrics_gammas.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -370,7 +442,7 @@ def main():
         for r in per_query_results:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    print("\n=== Hybrid eval summary ===")
+    print("\n=== Hybrid eval summary (raw ranking) ===")
     print(f"{'gamma':>6}  {'sem_MRR':>8}  {'sem_R@1':>8}  {'sem_R@5':>8}  "
           f"{'sem_R@10':>9}  {'sem_R@20':>9}  {'sem_cov':>8}")
     for g in args.gammas:

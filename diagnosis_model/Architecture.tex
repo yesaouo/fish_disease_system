@@ -31,6 +31,16 @@
         minimum height=8mm,
         fill=blue!4
     },
+    ceahblock/.style={
+        rectangle,
+        rounded corners=2mm,
+        draw=black!75,
+        thick,
+        align=center,
+        minimum width=34mm,
+        minimum height=10mm,
+        fill=red!5
+    },
     db/.style={
         cylinder,
         shape border rotate=90,
@@ -41,6 +51,17 @@
         minimum height=16mm,
         minimum width=27mm,
         fill=orange!12
+    },
+    offline/.style={
+        rectangle,
+        rounded corners=2mm,
+        draw=black!55,
+        thick,
+        align=center,
+        minimum width=30mm,
+        minimum height=8mm,
+        fill=gray!8,
+        font=\scriptsize
     },
     output/.style={
         rectangle,
@@ -65,7 +86,7 @@
 ]
 
 % ======================
-% Main online pipeline
+% Stage 1: 病灶偵測
 % ======================
 
 \node[block] (input) {輸入魚隻影像};
@@ -80,6 +101,10 @@
     判定健康
 };
 
+% ======================
+% Stage 2: 證據抽取
+% ======================
+
 \node[block, below=of detector] (evidence) {
     Evidence Extraction\\
     產生多粒度證據
@@ -87,96 +112,157 @@
 
 \node[smallblock, below left=8mm and 15mm of evidence] (global) {
     Global Token\\
-    VLM-Global
+    VLM-Global Vision
 };
 
 \node[smallblock, below=8mm of evidence] (lesion) {
     Lesion Tokens\\
-    VLM-Lesion
+    VLM-Lesion Fusion
 };
 
 \node[smallblock, below right=8mm and 15mm of evidence] (text) {
     Optional Text Token\\
-    Text Encoder
+    VLM-Global Text Enc.
 };
 
 \node[block, below=16mm of lesion] (queryset) {
     Query Evidence Set\\
-    $Q=\{g_Q,\;t_Q,\;l_{Q1},...,l_{QN}\}$
+    $Q=\{g_Q,\;t_Q,\;l_{Q1},\dots,l_{QN}\}$
 };
+
+% ======================
+% Stage 3: 案例檢索 (C²R)
+% ======================
 
 \node[block, below=of queryset] (c2r) {
     C$^2$R Case Retrieval\\
-    Hungarian Lesion-set Matching
+    $\mathrm{sim}=\alpha\cos(g_Q,g_C)+\beta\,\mathrm{HungarianMatch}(L_Q,L_C)$\\
+    {\scriptsize $\alpha=0.25,\;\beta=0.75$}
 };
 
 \node[block, below=of c2r] (candidates) {
-    Top-$K$ 相似案例\\
-    $\rightarrow$ Candidate Causes
+    Top-$K$ Cases ($K{=}20$)\\
+    $\rightarrow$ Candidate Cause Pool ($\sim\!87$)
 };
 
-\node[block, below=of candidates] (ceah) {
-    CEAH\\
-    Cause-Evidence Attribution Head
+% ======================
+% Stage 4: CEAH v3 — Two-Stream Faithful Attribution
+% ======================
+
+\node[ceahblock, below=of candidates] (project) {
+    Project all to common space\\
+    {\scriptsize $g',\,t',\,l'_i,\,c'$ + type embedding}
 };
 
-\node[block, below=of ceah] (scoring) {
-    Attribution-gated Scoring\\
-    $z_c=\sum_i \alpha_{c,i}v_i$\\
-    $s_c=\mathrm{score}(z_c,c)$
+\node[ceahblock, below=of project] (alpha) {
+    $\alpha=\mathrm{softmax}(\mathrm{MLP}([c',e_i,c'\!\odot\! e_i]))$\\
+    over $\{g,\,t,\,l_1,\dots,l_N\}$,\quad $\sum_i\alpha_i=1$
 };
 
-\node[output, below=of scoring] (final) {
+\node[ceahblock, below left=8mm and 5mm of alpha] (gstream) {
+    Global Stream\\
+    $z_g=\alpha_g\,e_g$\\
+    $s_g=\sigma(\mathrm{MLP}_g([c',z_g]))$
+};
+
+\node[ceahblock, below right=8mm and 5mm of alpha] (lstream) {
+    Local Stream\\
+    $z_\ell=\sum_{i\in\{t,l\}}\alpha_i\,e_i$\\
+    $s_\ell=\sigma(\mathrm{MLP}_\ell([c',z_\ell]))$
+};
+
+\node[ceahblock, below=40mm of alpha] (mult) {
+    Multiplicative Score\\
+    $s_{\mathrm{ceah}}(c)=s_g\cdot s_\ell$\\
+    {\scriptsize 兩個 stream 都對才能高分}
+};
+
+% ======================
+% Stage 5: Hybrid + Diversification + Output
+% ======================
+
+\node[block, below=of mult] (hybrid) {
+    Hybrid Scoring\\
+    $s(c)=\gamma\,s_{\mathrm{phase1}}(c)+(1{-}\gamma)\,s_{\mathrm{ceah}}(c)$\\
+    {\scriptsize $\gamma=0.75$（per-query min-max norm）}
+};
+
+\node[block, below=of hybrid] (diversify) {
+    Greedy Diversification\\
+    {\scriptsize 若 $\max_{c'\in\mathrm{kept}}\cos(c,c')>0.95$ 則跳過}
+};
+
+\node[output, below=of diversify] (final) {
     最終輸出\\
     病因排序 + 支持病灶 + 支持案例
 };
 
-\node[output, right=21mm of scoring] (faith) {
-    Faithfulness Check\\
-    Lesion Drop Test\\
-    Top-$\alpha$ drop vs. Random drop
-};
-
 % ======================
-% Offline database
+% Right side: Case database + cause table
 % ======================
 
-\node[db, right=28mm of c2r] (db) {
+\node[db, right=30mm of c2r] (db) {
     Case Database\\
     train cases
 };
 
-\node[smallblock, above=8mm of db] (casecontent) {
+\node[smallblock, above=6mm of db, align=left, font=\footnotesize] (casecontent) {
     每筆 case：\\
-    global emb\\
-    lesion embs\\
-    causes
+    \quad global\_emb,\\
+    \quad lesion\_embs[N],\\
+    \quad text\_\{med,coll\}\_emb,\\
+    \quad causes,\,cause\_emb\_idx
 };
 
-\node[smallblock, below=8mm of db] (proj) {
+\node[db, right=90mm of project, fill=orange!8] (causedb) {
+    cause\_text\_embs\\
+    \scriptsize 56k cause emb table
+};
+
+% ======================
+% Phase 1 candidate score (input to hybrid)
+% ======================
+
+\node[smallblock, left=22mm of hybrid, align=left, font=\footnotesize] (phase1score) {
+    Phase 1 score\\
+    $s_{\mathrm{phase1}}(c){=}\!\sum_j w_j\!\max_g\!\cos(\!c,e_{j,g})$
+};
+
+% ======================
+% Offline preprocessing block (right column, bottom)
+% ======================
+
+\node[offline, below=16mm of causedb] (hardneg) {
+    Hard-negative Pool\\
+    leave-one-out, $K{=}20$\\
+    (CEAH 訓練 only)
+};
+
+\node[offline, below=4mm of hardneg] (hdbscan) {
+    HDBSCAN Cluster Taxonomy\\
+    fine 2807 / coarse 100\\
+    (Eval-only metric)
+};
+
+\node[offline, below=4mm of hdbscan] (proj) {
     Projection Head\\
-    cause-overlap\\
-    supervised space
+    cause-overlap supervised\\
+    \textbf{(Phase 2 ablation, no lift)}
 };
 
 % ======================
-% Attribution details
+% Eval-only: Faithfulness
 % ======================
 
-\node[smallblock, left=25mm of ceah] (alpha) {
-    Attribution\\
-    $\alpha_c \in [0,1]^{M}$\\
-    over evidence tokens
-};
-
-\node[smallblock, left=25mm of scoring] (sparse) {
-    Sparse Selection\\
-    global / text / lesions\\
-    少數 evidence 支持病因
+\node[output, right=22mm of mult, fill=yellow!10] (faith) {
+    \textbf{Faithfulness Check}\\
+    {\scriptsize (Eval-only)}\\
+    Lesion drop test\\
+    drop / random ratio: 18$\times$ at $N{\ge}3$
 };
 
 % ======================
-% Arrows
+% Arrows: main pipeline
 % ======================
 
 \draw[arrow] (input) -- (detector);
@@ -193,20 +279,31 @@
 
 \draw[arrow] (queryset) -- (c2r);
 \draw[arrow] (c2r) -- (candidates);
-\draw[arrow] (candidates) -- (ceah);
-\draw[arrow] (ceah) -- (scoring);
-\draw[arrow] (scoring) -- (final);
+\draw[arrow] (candidates) -- (project);
 
-\draw[arrow] (db.west) -- node[above, font=\scriptsize] {相似案例檢索} (c2r.east);
+\draw[arrow] (project) -- (alpha);
+\draw[arrow] (alpha.south) -- ++(0,-3mm) -| (gstream.north);
+\draw[arrow] (alpha.south) -- ++(0,-3mm) -| (lstream.north);
+\draw[arrow] (gstream.south) to[out=-90,in=150] ($(mult.north)+(-8mm,0)$);
+\draw[arrow] (lstream.south) to[out=-90,in=30] ($(mult.north)+(8mm,0)$);
+
+\draw[arrow] (mult) -- (hybrid);
+\draw[arrow] (hybrid) -- (diversify);
+\draw[arrow] (diversify) -- (final);
+
+% Phase 1 score input to hybrid
+\draw[arrow] (phase1score.east) -- (hybrid.west);
+\draw[dasharrow] (candidates.west) -| (phase1score.north);
+
+% Database side arrows
+\draw[arrow] (db.west) -- node[above, font=\scriptsize] {Top-$K$ 案例} (c2r.east);
 \draw[dasharrow] (casecontent) -- (db);
-\draw[dasharrow] (proj) -- (db);
 
-\draw[arrow] (ceah) -- (alpha);
-\draw[arrow] (alpha) -- (sparse);
-\draw[arrow] (sparse) -- (scoring);
+% Cause table feeds candidate emb to CEAH
+\draw[arrow] (causedb.west) -- node[above, font=\scriptsize] {candidate $c'$ embedding} (project.east);
 
-\draw[arrow] (scoring.east) -- (faith.west);
-\draw[dasharrow] (faith.south) |- (final.east);
+% Faithfulness as eval-only side branch
+\draw[dasharrow] (mult.east) -- (faith.west);
 
 % ======================
 % Group boxes
@@ -215,9 +312,10 @@
 \begin{pgfonlayer}{background}
 \node[module, fit=(input)(detector)(healthy), label={[font=\bfseries]above:Stage 1：病灶偵測}] {};
 \node[module, fit=(evidence)(global)(lesion)(text)(queryset), label={[font=\bfseries]left:Stage 2：證據抽取}] {};
-\node[module, fit=(c2r)(candidates)(db)(casecontent)(proj), label={[font=\bfseries]right:Stage 3：案例檢索召回}] {};
-\node[module, fit=(ceah)(alpha)(sparse)(scoring), label={[font=\bfseries]left:Stage 4：忠實病灶歸因精排}] {};
-\node[module, fit=(final)(faith), label={[font=\bfseries]right:輸出與驗證}] {};
+\node[module, fit=(c2r)(candidates)(db)(casecontent), label={[font=\bfseries]right:Stage 3：案例檢索 C$^2$R}] {};
+\node[module, fit=(project)(alpha)(gstream)(lstream)(mult)(causedb), label={[font=\bfseries]left:Stage 4：CEAH v3 — Two-Stream Faithful Attribution}] {};
+\node[module, fit=(hybrid)(diversify)(phase1score)(final), label={[font=\bfseries]left:Stage 5：Hybrid 混合排序 + 輸出}] {};
+\node[module, fit=(hardneg)(hdbscan)(proj), label={[font=\bfseries]right:Offline / Ablation}, draw=black!30, fill=gray!4] {};
 \end{pgfonlayer}
 
 \end{tikzpicture}

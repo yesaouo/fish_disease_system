@@ -37,6 +37,9 @@ if __package__ in {None, ""}:
     from diagnosis_model.cause_inference.preprocessing.singleton_reassign import (  # type: ignore
         reassign_singletons_to_real_clusters,
     )
+    from diagnosis_model.cause_inference.preprocessing.cluster_hierarchical_merge import (  # type: ignore
+        merge_similar_clusters_hierarchical,
+    )
     from diagnosis_model.cause_inference.preprocessing.text_embedding_cache import (  # type: ignore
         build_text_embedding_cache,
         load_text_embedding_cache,
@@ -57,6 +60,7 @@ else:
     )
     from .hdbscan_clustering import cluster_hdbscan
     from .singleton_reassign import reassign_singletons_to_real_clusters
+    from .cluster_hierarchical_merge import merge_similar_clusters_hierarchical
     from .text_embedding_cache import build_text_embedding_cache, load_text_embedding_cache
 
 
@@ -341,6 +345,35 @@ def cmd_reassign_singletons(args: argparse.Namespace) -> None:
     print(f"\nSaved: {args.output}")
 
 
+
+
+def cmd_merge_similar_clusters(args: argparse.Namespace) -> None:
+    texts, embeddings, _ = load_text_embedding_cache(args.cache_dir)
+    clusters = load_clusters_json(args.input)
+    merged, stats = merge_similar_clusters_hierarchical(
+        clusters,
+        texts,
+        embeddings,
+        cosine_threshold=args.cosine_threshold,
+        margin=args.margin,
+        min_merge_cluster_size=args.min_merge_cluster_size,
+        batch_size=args.batch_size,
+        max_merge_rounds=args.max_merge_rounds,
+    )
+    save_clusters_json(merged, args.output)
+    print(
+        f"[merge-similar-clusters] initial_clusters={stats['n_initial_clusters']}, "
+        f"final_clusters={stats['n_final_clusters']}, "
+        f"initial_singletons={stats['n_initial_singletons']}, "
+        f"final_singletons={stats['n_final_singletons']}, "
+        f"merges={stats['n_merges']}, "
+        f"last_similarity={stats['last_merged_similarity']}"
+    )
+    print()
+    print(quality_report(merged, top_n=args.report_top_n))
+    print(f"\nSaved: {args.output}")
+
+
 def add_encoder_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--encoder_backend",
@@ -457,6 +490,36 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--report_top_n", type=int, default=15)
     p.set_defaults(func=cmd_reassign_singletons)
+
+    p = sub.add_parser(
+        "merge-similar-clusters",
+        help="Iteratively merge any JSON clusters whose centroid cosine similarity passes the threshold.",
+    )
+    p.add_argument("--cache_dir", required=True)
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--cosine_threshold", type=float, required=True)
+    p.add_argument(
+        "--margin",
+        type=float,
+        default=0.0,
+        help="Require the best merge target to exceed the second-best target by this margin.",
+    )
+    p.add_argument(
+        "--min_merge_cluster_size",
+        type=int,
+        default=1,
+        help="Only clusters with at least this many members can participate in merging.",
+    )
+    p.add_argument(
+        "--max_merge_rounds",
+        type=int,
+        default=None,
+        help="Optional cap on iterative merge rounds. Default: until convergence.",
+    )
+    p.add_argument("--batch_size", type=int, default=4096)
+    p.add_argument("--report_top_n", type=int, default=15)
+    p.set_defaults(func=cmd_merge_similar_clusters)
 
     return parser
 

@@ -1,0 +1,110 @@
+================================================================================
+FaCE-R 訓練指令
+================================================================================
+所有指令從 repo root 執行：cd /mnt/ssd/YJ/fish_disease_system
+
+Python env:
+  SDM:    /home/lab603/anaconda3/envs/SDM/bin/python
+
+================================================================================
+[0] Phase 0 — 建立 case database（一次性）
+================================================================================
+輸入: train + valid COCO 標註 + 兩個 frozen VLM
+輸出: case_db/{train_cases.pt, valid_cases.pt, cause_text_embs.pt, meta.json}
+時間: ~7 分鐘
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.build_case_database \
+  --coco_train data/detection/coco/_merged/train/_annotations.coco.json \
+  --image_root_train data/detection/coco/_merged/train \
+  --coco_valid data/detection/coco/_merged/valid/_annotations.coco.json \
+  --image_root_valid data/detection/coco/_merged/valid \
+  --vlm_global diagnosis_model/vl_classifier/outputs/siglip2_base_patch16_224_overall_multipos_zh \
+  --vlm_lesion diagnosis_model/vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh \
+  --output_dir diagnosis_model/cause_inference/outputs/case_db \
+  --chunk_size 64 --img_batch_size 64 --text_batch_size 256
+
+================================================================================
+[1] Cause clustering（一次性，論文用 LLM 版）
+================================================================================
+此步驟已完成，輸出 cause_clusters_llm.json（466 clusters）。
+若不需重新產生 taxonomy，可直接沿用該檔案進行後續訓練與評估。
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.cause_cluster_llm \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+  --batch_size 10 \
+  --shard_size 100 \
+  --merge_batch_size 20
+
+備用：HDBSCAN 粗粒度 100 clusters（論文 ablation 用）：
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.recluster_causes cluster \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --reduced_path diagnosis_model/cause_inference/outputs/cause_reduced.npy \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters_v100.json \
+  --cluster_selection_method eom \
+  --min_cluster_size 100 \
+  --report_top_n 5
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.recluster_causes reassign-singletons \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --input diagnosis_model/cause_inference/outputs/cause_clusters_v100.json \
+  --output diagnosis_model/cause_inference/outputs/cause_clusters_v100_reassigned.json \
+  --cosine_threshold 0.70 --margin 0.0 --min_real_cluster_size 100
+
+================================================================================
+[2] 建立 train candidate pool（CEAH 訓練前置，一次性）
+================================================================================
+為每個 train case 用 leave-one-out retrieval 預先建立 candidate pool 與 hard
+negatives。輸出 train_candidate_pool.pt（一次性，~3 分鐘）。
+
+最佳參數: K=20, α=0.25, β=0.75, hungarian, semantic_threshold=0.95
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.build_train_candidate_pool \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --output_path diagnosis_model/cause_inference/outputs/case_db/train_candidate_pool.pt \
+  --top_k_cases 20 \
+  --alpha_global 0.25 --beta_lesion 0.75 \
+  --lesion_match hungarian \
+  --semantic_threshold 0.95
+
+================================================================================
+[3] Phase 2 — Projection head 訓練（論文當 ablation；可省略）
+================================================================================
+Negative result：學到的 projection 跟 frozen 一樣，無 lift。
+論文寫法：「we attempted projection learning but observed no improvement —
+included as ablation showing VLM features are already saturated」
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.train_projection \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --output_dir diagnosis_model/cause_inference/outputs/projection_v1 \
+  --epochs 30 --batch_size 64 --lr 1e-4 \
+  --eval_every 2 --warmup_steps 200
+
+================================================================================
+[4] Phase 3 — CEAH 訓練（論文主要結果）
+================================================================================
+v3 best 配方：softmax attribution + multiplicative scoring + 無 sparsity penalty
+            + text dropout 50% + 20 epochs
+時間: ~4 分鐘
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.train_ceah \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --train_pool_path diagnosis_model/cause_inference/outputs/case_db/train_candidate_pool.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/ceah_v3 \
+  --attribution_mode softmax \
+  --scoring_mode multiplicative \
+  --epochs 20 \
+  --batch_size 32 \
+  --lr 1e-4 \
+  --lambda_sparsity 0.0 \
+  --text_dropout 0.5 \
+  --warmup_steps 200 \
+  --eval_every 2 \
+  --eval_max_queries 300
+
+訓練輸出：
+  best_ceah.pt    — best by valid sem_MRR（推論用這個）
+  last_ceah.pt    — 最終一個 epoch
+  train_log.jsonl — per-epoch loss 與 eval 指標
+  config.json     — hyperparams

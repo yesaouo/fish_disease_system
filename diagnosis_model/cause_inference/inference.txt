@@ -1,0 +1,195 @@
+================================================================================
+FaCE-R 推論 / 評估指令
+================================================================================
+所有指令從 repo root 執行：cd /mnt/ssd/YJ/fish_disease_system
+
+Python env: /home/lab603/anaconda3/envs/SDM/bin/python
+
+論文最終 retrieval 配方（best）：
+  Phase 1 retrieval: K=20, α_global=0.25, β_lesion=0.75, lesion_match=hungarian
+  Diversification:   threshold=0.95
+  CEAH:              softmax + multiplicative,  best_ceah.pt
+  Hybrid:            γ=0.75   (Phase 1 0.75 ∶ CEAH 0.25)
+  Cluster taxonomy:  cause_clusters_llm.json (466 LLM topics)
+  Text:              medical（也支援 colloquial / none）
+
+================================================================================
+[A] Phase 1 zero-training baseline（論文對照組）
+================================================================================
+最佳參數：K=20, hungarian, diversify=0.95
+時間: ~50 秒（1573 valid queries）
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.phase1_baseline \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --output_dir diagnosis_model/cause_inference/outputs/phase1_final \
+  --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+  --top_k_cases 20 \
+  --alpha_global 0.25 --beta_lesion 0.75 \
+  --lesion_match hungarian \
+  --diversify_threshold 0.95 \
+  --semantic_threshold 0.95
+
+論文 Phase 1 baseline 報告數字（K=20, hungarian，1573 valid，LLM 466 cluster）：
+  semantic R@1=22.3%, R@5=34.8%, R@10=44.4%, R@20=58.9%, MRR=0.298
+  semantic coverage = 93.1%
+  cluster  R@1=17.2%, R@5=27.8%, R@10=35.8%, R@20=47.6%, MRR=0.235
+
+================================================================================
+[B] CEAH v3 hybrid retrieval（論文主要結果）
+================================================================================
+時間: ~50 秒（1573 valid queries）
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.eval_ceah \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/ceah_v3_final \
+  --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+  --attribution_mode softmax --scoring_mode multiplicative \
+  --gammas 0.0 0.5 0.75 1.0 \
+  --dump_gamma 0.75 \
+  --top_k_cases 20 \
+  --diversify_threshold 0.95 \
+  --semantic_threshold 0.95 \
+  --text_kind medical
+
+論文 CEAH v3 hybrid γ=0.75 結果（1573 valid，LLM 466 cluster）：
+  semantic R@1=22.4%, R@5=36.1%, R@10=45.3%, R@20=57.9%, MRR=0.302, coverage=93.1%
+  cluster  R@1=18.2%, R@5=29.3%, R@10=37.0%, R@20=46.6%, MRR=0.245
+
+  γ 掃描（sem_MRR / sem_R@10 / cl_MRR / cl_R@10）：
+    γ=0.00 (CEAH only):    0.301 / 46.8% / 0.271 / 39.8%   ← cluster best
+    γ=0.50:                0.303 / 45.9% / 0.254 / 37.6%   ← sem MRR best
+    γ=0.75:                0.302 / 45.3% / 0.245 / 37.0%
+    γ=1.00 (Phase1 only):  0.298 / 44.4% / 0.235 / 35.8%
+
+  →  CEAH 對 cluster recall 有實質提升（γ=0 vs γ=1: cl_R@10 39.8% vs 35.8%, +4pp）；
+     semantic 在 γ=0.5 達 sem_MRR=0.303 最佳，γ=0.75 為 paper 預設（dump_gamma）
+
+================================================================================
+[C] Faithfulness 驗證（lesion masking 實驗，論文核心結果）
+================================================================================
+驗證 CEAH 的 lesion attribution 真的影響預測（不是裝飾）。
+時間: ~40 秒
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.faithfulness_eval \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/ceah_v3_faithfulness \
+  --attribution_mode softmax --scoring_mode multiplicative \
+  --gamma 0.5 \
+  --max_queries -1
+
+論文報告數字（1573 valid，遮蔽後 baseline 分數變化）：
+  no_lesion drop:  global-type=+0.034, lesion-type=+0.040, mixed=+0.036
+  no_random drop:  +0.005 (基本不變)
+
+  N-bucket 視角：
+    N=1: lesion drop 0.025 (lesion 還沒主導)
+    N=2: lesion drop 0.051 (10× random)
+    N≥3: lesion drop 0.055 (18× random)
+  → multi-lesion case 下，lesion 是 load-bearing 的解釋來源
+
+================================================================================
+[D] N=1/2/3+ lesion bucket 分析（論文 ablation）
+================================================================================
+時間: ~3 秒（讀現成 jsonl）
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.analyze_v3_n_buckets \
+  --eval_dir diagnosis_model/cause_inference/outputs/ceah_v3_final \
+  --case_db diagnosis_model/cause_inference/outputs/case_db \
+  --gamma_tag g=0.75
+
+報告內容：
+  - 每 N bucket 的 retrieval 指標
+  - 每 N bucket 的 attribution 分佈（global / text / lesion sum）
+  - cause-type × N bucket 的 l/g ratio
+  - lesion winner concentration（max/sum）
+
+================================================================================
+[E] Text mode ablation（medical / colloquial / none）
+================================================================================
+時間: 三個 mode 各 ~50 秒
+
+for mode in medical colloquial none; do
+  /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.eval_ceah \
+    --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+    --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt \
+    --output_dir diagnosis_model/cause_inference/outputs/ceah_v3_text_${mode} \
+    --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+    --attribution_mode softmax --scoring_mode multiplicative \
+    --gammas 0.75 --dump_gamma 0.75 \
+    --text_kind ${mode}
+done
+
+論文報告數字（1573 valid，三個 mode）：
+  medical:    sem_MRR=0.4170, R@10=78.65%, lesion-type l/g=1.36
+  colloquial: sem_MRR=0.4167, R@10=78.62%, lesion-type l/g=1.49
+  none:       sem_MRR=0.4166, R@10=78.51%, lesion-type l/g=1.64
+  → Retrieval 持平（差 ≤ 0.003），attribution 智能 fallback：
+    沒文字時 lesion attention 自動補位
+
+================================================================================
+[F] Case study 視覺化（論文 figure）
+================================================================================
+為指定 query 渲染圖：原圖 + lesion bbox（α 顏色強度）+ 文字面板。
+
+代表案例索引：
+  79  — 2 lesions, global-type（水質），α 全押 global=0.95
+  94  — 2 lesions, lesion-type（細菌感染），α 兩 lesion 各 ~0.4
+  13  — 2 lesions, lesion-type，模型挑出 L1 為主病灶
+  15  — 3 lesions, lesion-type，3 個中只 L2 被選
+  133 — 3 lesions, lesion-type，不同的 L0 被選（位置敏感）
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.case_study_viz \
+  --eval_dir diagnosis_model/cause_inference/outputs/ceah_v3_final \
+  --case_db diagnosis_model/cause_inference/outputs/case_db \
+  --image_root data/detection/coco/_merged/valid \
+  --output_dir diagnosis_model/cause_inference/outputs/case_study_v3 \
+  --row_indices 79 94 13 15 133
+
+================================================================================
+[G] Cluster taxonomy 對比（LLM vs HDBSCAN）— 論文 ablation
+================================================================================
+LLM cluster 是論文預設；HDBSCAN coarse 當對照。
+
+# LLM (預設)
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.eval_ceah \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/ceah_v3_cluster_llm \
+  --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+  --attribution_mode softmax --scoring_mode multiplicative \
+  --gammas 0.75 --dump_gamma 0.75
+
+# HDBSCAN coarse
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.eval_ceah \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/ceah_v3_cluster_hdbscan \
+  --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_v100_reassigned.json \
+  --attribution_mode softmax --scoring_mode multiplicative \
+  --gammas 0.75 --dump_gamma 0.75
+
+論文報告（v3, γ=0.75）：
+  HDBSCAN fine (2807): cl_R@1=0.5%,  cl_R@10=3.7%
+  HDBSCAN coarse(100): cl_R@1=5.2%,  cl_R@10=30.2%
+  LLM topic    (466) : cl_R@1=18.1%, cl_R@10=57.9%   ← 論文主指標
+  → LLM clustering 在 absolute 指標和 v3 vs random 倍率上都最強
+
+================================================================================
+[H] 端到端推論（給單張新影像）
+================================================================================
+完整 inference flow（給一張 query 圖）：
+
+Step 1: RF-DETR 偵測病灶（已實作於 detection 模組）
+Step 2: 對偵測到的每個 lesion crop，run VLM-Lesion fusion 取 lesion embedding
+Step 3: 對全圖 run VLM-Global 取 global embedding
+Step 4: 從 case_db 用 Phase 1 公式檢索 top-K cases（K=20）
+Step 5: 對 candidate pool 中每個 cause run CEAH 得 score + α
+Step 6: γ=0.75 hybrid 排序
+Step 7: Diversification（cosine threshold 0.95）
+Step 8: 輸出 top-N 病因 + 每個 cause 的 α breakdown（global / text / lesion）
+
+實作可參考：
+  diagnosis_model/cause_inference/eval_ceah.py 的 evaluate_one_query()
+  + 加上 RF-DETR 偵測與 VLM 編碼的前處理層

@@ -1,13 +1,13 @@
 note/
-annotation_web/frontend/dist/
 temp/
+.gradio/
 
 *.env
 *.log
 *.pth
 *.pt
+_*
 
 **/node_modules/
-**/__pycache__/
 **/data/
 **/outputs/

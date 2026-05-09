@@ -40,24 +40,50 @@ def _pool_from_last_hidden(last_hidden: torch.Tensor) -> torch.Tensor:
 
 
 
+def _unwrap_to_tensor(x) -> torch.Tensor:
+    """Unwrap encoder outputs to a [B, D] embedding tensor.
+
+    Some transformers versions return BaseModelOutput-like objects from
+    get_image_features/get_text_features instead of returning the embedding
+    tensor directly. Keep this compatibility logic in common.py so all callers,
+    including LocalGlobalFusionWrapper, share the same behavior.
+    """
+    if isinstance(x, torch.Tensor):
+        return x
+
+    for attr in ("image_embeds", "text_embeds", "pooler_output"):
+        v = getattr(x, attr, None)
+        if v is not None:
+            return v
+
+    last_hidden = getattr(x, "last_hidden_state", None)
+    if last_hidden is not None:
+        return _pool_from_last_hidden(last_hidden)
+
+    raise RuntimeError(
+        f"Cannot unwrap {type(x).__name__} to a feature tensor. "
+        "Expected a Tensor or a model output with image_embeds, text_embeds, "
+        "pooler_output, or last_hidden_state."
+    )
+
+
+
 def get_image_features(model, pixel_values: torch.Tensor) -> torch.Tensor:
     if hasattr(model, "get_image_features"):
-        return model.get_image_features(pixel_values=pixel_values)
+        return _unwrap_to_tensor(model.get_image_features(pixel_values=pixel_values))
 
     out = model(pixel_values=pixel_values, return_dict=True)
-    if hasattr(out, "image_embeds") and out.image_embeds is not None:
-        return out.image_embeds
-    if hasattr(out, "pooler_output") and out.pooler_output is not None:
-        return out.pooler_output
-    if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
-        return _pool_from_last_hidden(out.last_hidden_state)
+    try:
+        return _unwrap_to_tensor(out)
+    except RuntimeError:
+        pass
 
     if hasattr(model, "vision_model"):
         vout = model.vision_model(pixel_values=pixel_values, return_dict=True)
-        if hasattr(vout, "pooler_output") and vout.pooler_output is not None:
-            return vout.pooler_output
-        if hasattr(vout, "last_hidden_state") and vout.last_hidden_state is not None:
-            return _pool_from_last_hidden(vout.last_hidden_state)
+        try:
+            return _unwrap_to_tensor(vout)
+        except RuntimeError:
+            pass
 
     raise RuntimeError("Cannot extract image features from model output. Please use a dual-encoder model (CLIP/SigLIP).")
 
@@ -65,22 +91,22 @@ def get_image_features(model, pixel_values: torch.Tensor) -> torch.Tensor:
 
 def get_text_features(model, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     if hasattr(model, "get_text_features"):
-        return model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
+        return _unwrap_to_tensor(
+            model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
+        )
 
     out = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-    if hasattr(out, "text_embeds") and out.text_embeds is not None:
-        return out.text_embeds
-    if hasattr(out, "pooler_output") and out.pooler_output is not None:
-        return out.pooler_output
-    if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
-        return _pool_from_last_hidden(out.last_hidden_state)
+    try:
+        return _unwrap_to_tensor(out)
+    except RuntimeError:
+        pass
 
     if hasattr(model, "text_model"):
         tout = model.text_model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        if hasattr(tout, "pooler_output") and tout.pooler_output is not None:
-            return tout.pooler_output
-        if hasattr(tout, "last_hidden_state") and tout.last_hidden_state is not None:
-            return _pool_from_last_hidden(tout.last_hidden_state)
+        try:
+            return _unwrap_to_tensor(tout)
+        except RuntimeError:
+            pass
 
     raise RuntimeError("Cannot extract text features from model output. Please use a dual-encoder model (CLIP/SigLIP).")
 

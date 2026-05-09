@@ -31,10 +31,12 @@ from typing import List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from diagnosis_model.cause_inference.phase1_baseline import (
     build_candidate_pool,
     compute_case_similarities,
+    select_positive_top_cases,
     stack_train_lesions,
 )
 
@@ -60,12 +62,15 @@ def main():
     case_db_dir = Path(args.case_db_dir)
     train_cases = torch.load(case_db_dir / "train_cases.pt", weights_only=False)
     cause_pack = torch.load(case_db_dir / "cause_text_embs.pt", weights_only=False)
-    cause_table_embs = cause_pack["embeddings"].to(device)
+    # Match phase1_baseline.py: explicitly L2-normalize so dot products are cosine.
+    cause_table_embs = F.normalize(cause_pack["embeddings"].to(device), dim=-1)
     print(f"[load] train={len(train_cases)}  causes={cause_table_embs.size(0)}")
 
-    train_global_stack = torch.stack([c["global_emb"] for c in train_cases]).to(device)
+    train_global_stack = F.normalize(
+        torch.stack([c["global_emb"] for c in train_cases]).to(device), dim=-1,
+    )
     train_lesion_stack, train_offsets = stack_train_lesions(train_cases)
-    train_lesion_stack = train_lesion_stack.to(device)
+    train_lesion_stack = F.normalize(train_lesion_stack.to(device), dim=-1)
     print(f"[stack] global={tuple(train_global_stack.shape)}  "
           f"lesions={tuple(train_lesion_stack.shape)}")
 
@@ -74,8 +79,8 @@ def main():
     t0 = time.time()
 
     for qi, q in enumerate(train_cases):
-        q_global = q["global_emb"].to(device)
-        q_lesions = q["lesion_embs"].to(device)
+        q_global = F.normalize(q["global_emb"].to(device), dim=-1)
+        q_lesions = F.normalize(q["lesion_embs"].to(device), dim=-1)
 
         sims = compute_case_similarities(
             q_global, q_lesions,
@@ -83,16 +88,16 @@ def main():
             args.alpha_global, args.beta_lesion,
             lesion_match=args.lesion_match,
         )
-        sims[qi] = -np.inf  # leave-one-out: exclude self
+        sims[qi] = -np.inf  # leave-one-out: exclude self (filtered by select_positive_top_cases)
 
-        top_k_idx = np.argsort(-sims)[: args.top_k_cases]
-        top_k_w = sims[top_k_idx]
+        # Drop train cases with similarity <= 0; positive weights normalized to sum to 1.
+        top_k_idx, _, top_k_raw_w = select_positive_top_cases(sims, args.top_k_cases)
 
         candidate_indices = build_candidate_pool(top_k_idx, train_cases)
         if not candidate_indices:
             case_pool.append({
                 "top_k_idx": torch.tensor(top_k_idx, dtype=torch.long),
-                "top_k_w": torch.tensor(top_k_w, dtype=torch.float32),
+                "top_k_w": torch.tensor(top_k_raw_w, dtype=torch.float32),
                 "candidate_cause_indices": torch.empty(0, dtype=torch.long),
                 "positive_mask": torch.empty(0, dtype=torch.bool),
                 "gt_exact_mask": torch.empty(0, dtype=torch.bool),
@@ -116,7 +121,7 @@ def main():
 
         case_pool.append({
             "top_k_idx": torch.tensor(top_k_idx, dtype=torch.long),
-            "top_k_w": torch.tensor(top_k_w, dtype=torch.float32),
+            "top_k_w": torch.tensor(top_k_raw_w, dtype=torch.float32),
             "candidate_cause_indices": cand_idx_t.cpu(),
             "positive_mask": positive_mask.cpu(),
             "gt_exact_mask": gt_exact_mask,

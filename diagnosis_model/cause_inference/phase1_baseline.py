@@ -3,24 +3,34 @@
 Pipeline per query (valid case):
   1. Combined case similarity vs every train case
        sim(q, c) = α · cos(q.global, c.global)
-                 + β · Hungarian-matched lesion-set cosine
-  2. Top-K retrieved cases (with similarity weights)
-  3. Build CANDIDATE POOL: union of (deduped) cause embedding indices
-     appearing in those top-K retrieved cases. Pool size ≤ K × max-causes-per-case.
+                 + β · lesion-set cosine score
+  2. Top-K retrieved cases, restricted to positive similarity only
+  3. Build CANDIDATE POOL: union of deduped cause embedding indices
+     appearing in those positive-similarity top-K retrieved cases.
   4. Score each candidate c in the pool using Option A:
-       score(c) = Σ_{j in top-K} w_j · max_g cos(c, e_{j,g})
-  5. Rank candidates by score → top-N predictions
-     (Causes outside the retrieved cases' cause sets are not scored at all —
-     this matches the case-based-reasoning intuition: only suggest a cause
-     if at least one similar past case had it.)
+       score(c) = Σ_{j in top-K-positive} w_j · max_g cos(c, e_{j,g})
+     where w_j is normalized over the retained positive retrieved cases.
+  5. Raw ranking is used for metrics.
+  6. Diversified ranking is used only for predicted_top_n inspection output.
 
 Metrics:
-  - exact: rank of each GT cause within the candidate pool
-           (rank = pool_size + 1 if GT not covered by pool)
+  - exact: rank of each GT cause within the raw candidate-pool ranking.
+           Misses are represented internally as +inf for metrics and as null
+           in per_query_results.jsonl, so R@K never counts uncovered GTs.
   - semantic (cosine ≥ threshold): rank of first candidate semantically
-           equivalent to GT
-  - cluster (HDBSCAN): rank of first candidate in the same cluster as GT
-  - coverage_*: per-GT fraction of "GT covered by pool" under each match type
+           equivalent to GT within the raw candidate-pool ranking
+  - cluster (HDBSCAN): rank of first candidate in the same cluster as each GT
+                         cause occurrence within the raw candidate-pool ranking
+  - coverage_*: per-GT-cause-occurrence fraction of "GT covered by pool"
+                under each match type
+
+Notes:
+  - Embeddings are explicitly L2-normalized before dot products are used as cosine.
+  - Retrieved train cases with similarity <= 0 are excluded from both candidate-pool
+    construction and candidate scoring.
+  - Cluster metric is computed per GT cause occurrence, matching exact and
+    semantic metric denominators. Duplicate GT causes/clusters in a query each
+    contribute one occurrence.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 
@@ -96,18 +107,27 @@ _LESION_MATCH_FNS = {
 
 
 def compute_case_similarities(
-    q_global: torch.Tensor,           # [D]
-    q_lesions: torch.Tensor,          # [N_q, D]
-    train_global_stack: torch.Tensor, # [n_train, D]
-    train_lesion_stack: torch.Tensor, # [total_lesions, D]
+    q_global: torch.Tensor,           # [D], already normalized
+    q_lesions: torch.Tensor,          # [N_q, D], already normalized
+    train_global_stack: torch.Tensor, # [n_train, D], already normalized
+    train_lesion_stack: torch.Tensor, # [total_lesions, D], already normalized
     train_offsets: List[int],
-    alpha: float, beta: float,
+    alpha: float,
+    beta: float,
     lesion_match: str = "hungarian",
 ) -> np.ndarray:
-    """Return [n_train] combined similarity scores."""
+    """Return [n_train] combined similarity scores.
+
+    Because all embeddings are L2-normalized before this function is called,
+    matrix multiplication is cosine similarity.
+    """
     match_fn = _LESION_MATCH_FNS[lesion_match]
     g_sim = (q_global.unsqueeze(0) @ train_global_stack.T).squeeze(0)
-    les_sim = (q_lesions @ train_lesion_stack.T).cpu().numpy()
+
+    if q_lesions.size(0) == 0 or train_lesion_stack.size(0) == 0:
+        les_sim = np.empty((q_lesions.size(0), train_lesion_stack.size(0)), dtype=np.float32)
+    else:
+        les_sim = (q_lesions @ train_lesion_stack.T).detach().cpu().numpy()
 
     n_train = len(train_offsets) - 1
     l_score = np.zeros(n_train, dtype=np.float32)
@@ -115,18 +135,45 @@ def compute_case_similarities(
         s, e = train_offsets[i], train_offsets[i + 1]
         if e > s:
             l_score[i] = match_fn(les_sim[:, s:e])
-    return alpha * g_sim.cpu().numpy() + beta * l_score
+    return alpha * g_sim.detach().cpu().numpy() + beta * l_score
 
 
 # ---------------------------------------------------------------------------
-# Candidate-restricted cause scoring (Option A on retrieved-cases-only pool)
+# Candidate-restricted cause scoring
 # ---------------------------------------------------------------------------
+
+def select_positive_top_cases(
+    sims: np.ndarray,
+    top_k_cases: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Select top-K train cases with strictly positive similarity.
+
+    Returns:
+      top_k_idx: selected train-case indices
+      top_k_w: normalized positive weights for scoring
+      top_k_raw_w: raw positive similarities, kept for inspection output
+    """
+    ranked_idx = np.argsort(-sims)
+    positive_idx = ranked_idx[sims[ranked_idx] > 0]
+    top_k_idx = positive_idx[:top_k_cases]
+
+    top_k_raw_w = sims[top_k_idx].astype(np.float32)
+    if top_k_raw_w.size > 0:
+        top_k_w = top_k_raw_w / (top_k_raw_w.sum() + 1e-8)
+    else:
+        top_k_w = np.empty(0, dtype=np.float32)
+
+    return top_k_idx, top_k_w.astype(np.float32), top_k_raw_w
+
 
 def build_candidate_pool(
     top_case_idx: np.ndarray,
     train_cases: list,
 ) -> List[int]:
-    """Unique cause-table indices appearing in the K retrieved cases (preserving first-seen order)."""
+    """Unique cause-table indices appearing in the retained retrieved cases.
+
+    The order preserves first-seen order across retrieved cases.
+    """
     seen: set = set()
     pool: List[int] = []
     for case_i in top_case_idx.tolist():
@@ -142,24 +189,32 @@ def diversify(
     cand_embs: torch.Tensor,     # [pool_size, D]
     threshold: float,
 ) -> np.ndarray:
-    """Greedy MMR-style dedup: keep the highest-scored candidate, then suppress any
-    later candidate whose cosine to ANY already-kept candidate ≥ threshold.
+    """Greedy MMR-style dedup for output inspection only.
 
-    Returns the kept local indices in score order. If threshold ≥ 1.0, returns
+    Keep the highest-scored candidate, then suppress any later candidate whose
+    cosine to any already-kept candidate is >= threshold.
+
+    Returns kept local indices in score order. If threshold >= 1.0, returns
     sorted_local unchanged.
     """
     if sorted_local.size == 0 or threshold >= 1.0:
         return sorted_local
+
     kept_local: List[int] = [int(sorted_local[0])]
     kept_emb_rows: List[int] = [int(sorted_local[0])]
+
     for li in sorted_local[1:].tolist():
         e = cand_embs[int(li)]
-        kept_t = cand_embs[torch.tensor(kept_emb_rows, device=cand_embs.device,
-                                        dtype=torch.long)]
+        kept_t = cand_embs[torch.tensor(
+            kept_emb_rows,
+            device=cand_embs.device,
+            dtype=torch.long,
+        )]
         max_sim = (kept_t @ e).max().item()
         if max_sim < threshold:
             kept_local.append(int(li))
             kept_emb_rows.append(int(li))
+
     return np.array(kept_local, dtype=np.int64)
 
 
@@ -170,27 +225,93 @@ def score_candidates(
     train_cases: list,
     cause_table_embs: torch.Tensor,
 ) -> torch.Tensor:
-    """For each c in candidate_indices, score(c) = Σ_j w_j · max_g cos(emb[c], emb_{j,g}).
+    """For each c in candidate_indices:
 
+       score(c) = Σ_j w_j · max_g cos(emb[c], emb_{j,g})
+
+    top_case_weights are expected to be non-negative and normalized.
     Returns [len(candidate_indices)] tensor on cause_table_embs' device.
     """
     device = cause_table_embs.device
     if not candidate_indices:
         return torch.zeros(0, device=device)
+
     cand_embs = cause_table_embs.index_select(
-        0, torch.tensor(candidate_indices, device=device, dtype=torch.long),
+        0,
+        torch.tensor(candidate_indices, device=device, dtype=torch.long),
     )  # [U_cand, D]
+
     score = torch.zeros(len(candidate_indices), device=device)
+
     for case_i, w in zip(top_case_idx.tolist(), top_case_weights.tolist()):
         case_cidx = train_cases[int(case_i)]["cause_emb_indices"]
         if not case_cidx:
             continue
+
         case_embs = cause_table_embs.index_select(
-            0, torch.tensor(case_cidx, device=device, dtype=torch.long),
+            0,
+            torch.tensor(case_cidx, device=device, dtype=torch.long),
         )  # [G, D]
+
         sims = cand_embs @ case_embs.T  # [U_cand, G]
         score = score + float(w) * sims.max(dim=1).values
+
     return score
+
+
+# ---------------------------------------------------------------------------
+# Metric helpers
+# ---------------------------------------------------------------------------
+
+MISS_RANK = float("inf")
+
+
+def summarize_rank_metric(
+    ranks: np.ndarray,
+    coverage_flags: List[int],
+) -> dict:
+    """Summarize occurrence-level ranking metrics with correct miss handling.
+
+    Uncovered GT occurrences must not be encoded as pool_size + 1, because that
+    makes R@K depend on candidate-pool size and can incorrectly count misses as
+    hits for large K. Internally, misses are +inf; therefore:
+      - R@K counts only finite ranks <= K.
+      - MRR gives misses reciprocal rank 0.
+      - mean/median rank are reported over covered occurrences only.
+    """
+    ranks = np.asarray(ranks, dtype=np.float64)
+    finite_mask = np.isfinite(ranks)
+    finite_ranks = ranks[finite_mask]
+
+    reciprocal = np.zeros_like(ranks, dtype=np.float64)
+    reciprocal[finite_mask] = 1.0 / finite_ranks
+
+    return {
+        "coverage": float(np.mean(coverage_flags)) if coverage_flags else 0.0,
+        "MRR": float(reciprocal.mean()) if ranks.size else 0.0,
+        "mean_rank": float(finite_ranks.mean()) if finite_ranks.size else None,
+        "median_rank": float(np.median(finite_ranks)) if finite_ranks.size else None,
+        "n_covered": int(finite_ranks.size),
+        "n_missed": int(ranks.size - finite_ranks.size),
+        "rank_meaning": (
+            "mean_rank and median_rank are computed over covered occurrences only; "
+            "misses contribute 0 to MRR and R@K."
+        ),
+    }
+
+
+def add_recall_at_ks(metric_block: dict, ranks: np.ndarray, ks: List[int]) -> None:
+    """Add R@K values. Misses are +inf, so they never satisfy rank <= K."""
+    ranks = np.asarray(ranks, dtype=np.float64)
+    for k in ks:
+        metric_block[f"R@{k}"] = float((ranks <= k).mean()) if ranks.size else 0.0
+
+
+def fmt_metric(value) -> str:
+    """Pretty-print scalar metric values, including None for unavailable ranks."""
+    if value is None:
+        return "NA"
+    return f"{float(value):.4f}"
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +340,8 @@ def main():
                     help="HDBSCAN clustering JSON (raw_string -> cluster_id). "
                          "Enables cluster-level metrics. Set to '' to disable.")
     ap.add_argument("--diversify_threshold", type=float, default=0.95,
-                    help="when ranking candidates for output / metrics, suppress any "
-                         "candidate whose cosine to a previously-kept candidate exceeds this. "
+                    help="For predicted_top_n output only: suppress any candidate whose cosine "
+                         "to a previously kept candidate exceeds this. "
                          "Set to 1.0 to disable diversification.")
     args = ap.parse_args()
 
@@ -229,12 +350,16 @@ def main():
     device = args.device
 
     train_cases, valid_cases, cause_pack, meta = load_case_db(Path(args.case_db_dir))
-    cause_table_embs = cause_pack["embeddings"].to(device)
+
+    # Explicit normalization: all following dot products are cosine similarities.
+    cause_table_embs = F.normalize(cause_pack["embeddings"].to(device), dim=-1)
     cause_texts = cause_pack["texts"]
+
     print(f"[load] train={len(train_cases)}  valid={len(valid_cases)}  "
           f"unique_causes={len(cause_texts)}  dim={cause_table_embs.size(-1)}")
 
-    # Optional: cluster-based evaluation
+    # Optional: cluster-based evaluation.
+    # Cluster metrics are computed per GT cause occurrence, matching exact/semantic.
     cluster_id_array: np.ndarray | None = None
     if args.cluster_json:
         with open(args.cluster_json, encoding="utf-8") as f:
@@ -247,29 +372,37 @@ def main():
         print(f"[cluster] loaded {n_clusters} clusters from {args.cluster_json}")
 
     train_global_stack = torch.stack([c["global_emb"] for c in train_cases]).to(device)
+    train_global_stack = F.normalize(train_global_stack, dim=-1)
+
     train_lesion_stack, train_offsets = stack_train_lesions(train_cases)
-    train_lesion_stack = train_lesion_stack.to(device)
+    train_lesion_stack = F.normalize(train_lesion_stack.to(device), dim=-1)
+
     print(f"[stack] train_globals={tuple(train_global_stack.shape)}  "
           f"train_lesions={tuple(train_lesion_stack.shape)}")
 
     queries = valid_cases if args.max_queries <= 0 else valid_cases[: args.max_queries]
     print(f"[eval] queries={len(queries)}  K={args.top_k_cases}  N={args.top_n_causes}  "
-          f"alpha={args.alpha_global}  beta={args.beta_lesion}")
+          f"alpha={args.alpha_global}  beta={args.beta_lesion}  "
+          f"positive_case_only=True")
 
     per_query_results: list = []
     pool_sizes: List[int] = []
-    all_gt_ranks: List[int] = []          # exact-index rank within candidate pool
-    all_gt_sem_ranks: List[int] = []      # semantic-cosine rank within candidate pool
-    all_gt_cluster_ranks: List[int] = []  # cluster-level rank within candidate pool
-    cov_exact: List[int] = []             # 1 if GT exactly in pool, 0 otherwise
-    cov_semantic: List[int] = []          # 1 if any pool cand ≥ threshold to GT
-    cov_cluster: List[int] = []           # 1 if any pool cand in same cluster
-    all_top1_max_cos: List[float] = []    # max cos(top-1 pred, any GT) per query
+    retained_case_counts: List[int] = []
+
+    all_gt_ranks: List[float] = []          # exact-index rank; MISS_RANK for uncovered GT
+    all_gt_sem_ranks: List[float] = []      # semantic-cosine rank; MISS_RANK for uncovered GT
+    all_gt_cluster_ranks: List[float] = []  # cluster-level rank; MISS_RANK for uncovered GT
+
+    cov_exact: List[int] = []             # 1 if GT exactly in raw candidate pool
+    cov_semantic: List[int] = []          # 1 if any raw pool cand >= threshold to GT
+    cov_cluster: List[int] = []           # 1 if any raw pool cand in same cluster
+
+    all_top1_max_cos: List[float] = []    # max cos(raw top-1 pred, any GT) per query
 
     t0 = time.time()
     for qi, q in enumerate(queries):
-        q_global = q["global_emb"].to(device)
-        q_lesions = q["lesion_embs"].to(device)
+        q_global = F.normalize(q["global_emb"].to(device), dim=-1)
+        q_lesions = F.normalize(q["lesion_embs"].to(device), dim=-1)
 
         sims = compute_case_similarities(
             q_global, q_lesions,
@@ -277,90 +410,122 @@ def main():
             args.alpha_global, args.beta_lesion,
             lesion_match=args.lesion_match,
         )
-        top_k_idx = np.argsort(-sims)[: args.top_k_cases]
-        top_k_w = sims[top_k_idx]
 
-        # Build candidate pool from the top-K cases' causes (deduped)
+        # Only positive-similarity retrieved cases are allowed into candidate generation/scoring.
+        top_k_idx, top_k_w, top_k_raw_w = select_positive_top_cases(
+            sims=sims,
+            top_k_cases=args.top_k_cases,
+        )
+        retained_case_counts.append(int(len(top_k_idx)))
+
+        # Build candidate pool from the retained positive-similarity cases only.
         candidate_indices = build_candidate_pool(top_k_idx, train_cases)
         pool_size = len(candidate_indices)
         pool_sizes.append(pool_size)
-        not_covered_rank = pool_size + 1  # rank assigned to uncovered GT
 
-        # Score the pool only
+        # Score the raw candidate pool only.
         cand_scores = score_candidates(
             candidate_indices, top_k_idx, top_k_w, train_cases, cause_table_embs,
         )  # [pool_size]
 
         if pool_size == 0:
-            sorted_local = np.empty(0, dtype=np.int64)
-            sorted_global = np.empty(0, dtype=np.int64)
+            raw_sorted_local = np.empty(0, dtype=np.int64)
+            raw_sorted_global = np.empty(0, dtype=np.int64)
+            div_sorted_local = raw_sorted_local
+            div_sorted_global = raw_sorted_global
             cand_embs = torch.empty(0, cause_table_embs.size(-1), device=device)
         else:
             cand_embs = cause_table_embs.index_select(
-                0, torch.tensor(candidate_indices, device=device, dtype=torch.long),
+                0,
+                torch.tensor(candidate_indices, device=device, dtype=torch.long),
             )
-            score_sorted_local = torch.argsort(cand_scores, descending=True).cpu().numpy()
-            sorted_local = diversify(score_sorted_local, cand_embs, args.diversify_threshold)
-            sorted_global = np.array(candidate_indices)[sorted_local]
+
+            # Raw sorted ranking: this is the ranking used for all metrics.
+            raw_sorted_local = torch.argsort(cand_scores, descending=True).detach().cpu().numpy()
+            raw_sorted_global = np.array(candidate_indices)[raw_sorted_local]
+
+            # Diversified ranking: output inspection only, not used for metrics.
+            div_sorted_local = diversify(raw_sorted_local, cand_embs, args.diversify_threshold)
+            div_sorted_global = np.array(candidate_indices)[div_sorted_local]
 
         gt_cause_idx = q["cause_emb_indices"]
 
-        # ---- Exact-index rank within pool ----
-        global_to_pool_pos = {int(g): i for i, g in enumerate(sorted_global.tolist())}
-        gt_ranks_local: List[int] = []
+        # ---- Exact-index rank within raw pool ranking ----
+        # Store misses as null in per_query_results and as +inf internally.
+        # This prevents R@K from counting uncovered GTs as hits when K exceeds
+        # the candidate-pool size.
+        global_to_pool_pos = {int(g): i for i, g in enumerate(raw_sorted_global.tolist())}
+        gt_ranks_local: List[int | None] = []
         for g in gt_cause_idx:
             pos = global_to_pool_pos.get(int(g))
-            gt_ranks_local.append((pos + 1) if pos is not None else not_covered_rank)
-            cov_exact.append(1 if pos is not None else 0)
-        all_gt_ranks.extend(gt_ranks_local)
+            if pos is None:
+                gt_ranks_local.append(None)
+                all_gt_ranks.append(MISS_RANK)
+                cov_exact.append(0)
+            else:
+                rank = int(pos) + 1
+                gt_ranks_local.append(rank)
+                all_gt_ranks.append(float(rank))
+                cov_exact.append(1)
 
-        # ---- Semantic-cosine rank within pool ----
-        gt_sem_ranks_local: List[int] = []
+        # ---- Semantic-cosine rank within raw pool ranking ----
+        gt_sem_ranks_local: List[int | None] = []
         if pool_size == 0:
-            gt_sem_ranks_local = [not_covered_rank] * len(gt_cause_idx)
             for _ in gt_cause_idx:
+                gt_sem_ranks_local.append(None)
+                all_gt_sem_ranks.append(MISS_RANK)
                 cov_semantic.append(0)
         else:
             gt_idx_t = torch.tensor(gt_cause_idx, device=device, dtype=torch.long)
-            gt_embs = cause_table_embs.index_select(0, gt_idx_t)        # [G, D]
-            # Sorted candidate embeddings (in score-descending order)
-            sorted_cand_embs = cand_embs[
-                torch.from_numpy(sorted_local).to(device)
+            gt_embs = cause_table_embs.index_select(0, gt_idx_t)  # [G, D]
+
+            raw_sorted_cand_embs = cand_embs[
+                torch.from_numpy(raw_sorted_local).to(device)
             ]  # [pool_size, D]
-            cos_sorted = gt_embs @ sorted_cand_embs.T                   # [G, pool_size]
+
+            cos_sorted = gt_embs @ raw_sorted_cand_embs.T  # [G, pool_size]
             sem_match = cos_sorted >= args.semantic_threshold
+
             for g_i in range(sem_match.size(0)):
                 hits = torch.nonzero(sem_match[g_i], as_tuple=False)
                 if hits.numel() > 0:
-                    gt_sem_ranks_local.append(int(hits[0].item()) + 1)
+                    rank = int(hits[0].item()) + 1
+                    gt_sem_ranks_local.append(rank)
+                    all_gt_sem_ranks.append(float(rank))
                     cov_semantic.append(1)
                 else:
-                    gt_sem_ranks_local.append(not_covered_rank)
+                    gt_sem_ranks_local.append(None)
+                    all_gt_sem_ranks.append(MISS_RANK)
                     cov_semantic.append(0)
-        all_gt_sem_ranks.extend(gt_sem_ranks_local)
 
-        # ---- Cluster rank within pool ----
-        gt_cluster_ranks_local: List[int] = []
+        # ---- Cluster rank within raw pool ranking ----
+        # Per GT cause occurrence, matching exact-index and semantic-cosine metrics.
+        # If multiple GT causes map to the same cluster, each occurrence contributes
+        # one rank/coverage item. This intentionally does NOT deduplicate clusters
+        # within a query.
+        gt_cluster_ranks_local: List[int | None] = []
         gt_clusters_local: List[int] = []
         if cluster_id_array is not None:
-            gt_clusters_set = sorted(set(int(cluster_id_array[i]) for i in gt_cause_idx))
-            sorted_clusters = cluster_id_array[sorted_global] if pool_size > 0 \
-                              else np.empty(0, dtype=np.int64)
-            for cid in gt_clusters_set:
-                hits = np.flatnonzero(sorted_clusters == cid) if pool_size > 0 \
+            raw_sorted_clusters = cluster_id_array[raw_sorted_global] if pool_size > 0 \
+                                  else np.empty(0, dtype=np.int64)
+            for g in gt_cause_idx:
+                cid = int(cluster_id_array[int(g)])
+                hits = np.flatnonzero(raw_sorted_clusters == cid) if pool_size > 0 \
                        else np.empty(0, dtype=np.int64)
                 if hits.size > 0:
-                    gt_cluster_ranks_local.append(int(hits[0]) + 1)
+                    rank = int(hits[0]) + 1
+                    gt_cluster_ranks_local.append(rank)
+                    all_gt_cluster_ranks.append(float(rank))
                     cov_cluster.append(1)
                 else:
-                    gt_cluster_ranks_local.append(not_covered_rank)
+                    gt_cluster_ranks_local.append(None)
+                    all_gt_cluster_ranks.append(MISS_RANK)
                     cov_cluster.append(0)
                 gt_clusters_local.append(cid)
-            all_gt_cluster_ranks.extend(gt_cluster_ranks_local)
 
-        # ---- Top-1 max-cos diagnostic ----
+        # ---- Raw top-1 max-cos diagnostic ----
         if pool_size > 0:
-            top1_global = int(sorted_global[0])
+            top1_global = int(raw_sorted_global[0])
             gt_idx_t = torch.tensor(gt_cause_idx, device=device, dtype=torch.long)
             gt_embs = cause_table_embs.index_select(0, gt_idx_t)
             top1_cos = float((gt_embs @ cause_table_embs[top1_global]).max().item())
@@ -368,19 +533,20 @@ def main():
             top1_cos = 0.0
         all_top1_max_cos.append(top1_cos)
 
-        # ---- Top-N predictions for inspection ----
-        top_n_count = min(args.top_n_causes, pool_size)
-        top_n_global = sorted_global[:top_n_count].tolist()
+        # ---- Top-N predictions for inspection: diversified output ranking ----
+        top_n_count = min(args.top_n_causes, len(div_sorted_global))
+        top_n_global = div_sorted_global[:top_n_count].tolist()
         top_n_scores = (
-            cand_scores[torch.from_numpy(sorted_local[:top_n_count]).to(device)]
-            .cpu().tolist()
-        )
+            cand_scores[torch.from_numpy(div_sorted_local[:top_n_count]).to(device)]
+            .detach().cpu().tolist()
+        ) if top_n_count > 0 else []
         top_n_texts = [cause_texts[int(i)] for i in top_n_global]
 
         per_query_results.append({
             "query_image_id": int(q["image_id"]),
             "query_file_name": q["file_name"],
             "query_lesion_count": int(q["lesion_embs"].size(0)),
+            "retained_positive_case_count": int(len(top_k_idx)),
             "candidate_pool_size": pool_size,
             "gt_causes": list(q["causes"]),
             "gt_cause_indices": list(gt_cause_idx),
@@ -393,7 +559,8 @@ def main():
                 {
                     "case_id": int(top_k_idx[ki]),
                     "image_id": int(train_cases[int(top_k_idx[ki])]["image_id"]),
-                    "similarity": float(top_k_w[ki]),
+                    "similarity_raw": float(top_k_raw_w[ki]),
+                    "similarity_weight_normalized": float(top_k_w[ki]),
                     "causes": list(train_cases[int(top_k_idx[ki])]["causes"]),
                 }
                 for ki in range(len(top_k_idx))
@@ -415,50 +582,58 @@ def main():
     ranks = np.array(all_gt_ranks, dtype=np.float64)
     sem_ranks = np.array(all_gt_sem_ranks, dtype=np.float64)
     pool_arr = np.array(pool_sizes, dtype=np.float64)
+    retained_arr = np.array(retained_case_counts, dtype=np.float64)
+
     metrics = {
         "n_queries": len(queries),
         "n_gt_cause_occurrences": int(len(ranks)),
+        "retrieved_cases": {
+            "requested_top_k": int(args.top_k_cases),
+            "positive_similarity_only": True,
+            "mean_retained": float(retained_arr.mean()) if retained_arr.size else 0.0,
+            "median_retained": float(np.median(retained_arr)) if retained_arr.size else 0.0,
+            "min_retained": int(retained_arr.min()) if retained_arr.size else 0,
+            "max_retained": int(retained_arr.max()) if retained_arr.size else 0,
+        },
         "candidate_pool": {
             "mean_size": float(pool_arr.mean()) if pool_arr.size else 0.0,
             "median_size": float(np.median(pool_arr)) if pool_arr.size else 0.0,
             "min_size": int(pool_arr.min()) if pool_arr.size else 0,
             "max_size": int(pool_arr.max()) if pool_arr.size else 0,
         },
-        "exact": {
-            "coverage": float(np.mean(cov_exact)) if cov_exact else 0.0,
-            "MRR": float((1.0 / ranks).mean()),
-            "mean_rank": float(ranks.mean()),
-            "median_rank": float(np.median(ranks)),
-        },
+        "exact": summarize_rank_metric(ranks, cov_exact),
         "semantic": {
             "threshold": args.semantic_threshold,
-            "coverage": float(np.mean(cov_semantic)) if cov_semantic else 0.0,
-            "MRR": float((1.0 / sem_ranks).mean()),
-            "mean_rank": float(sem_ranks.mean()),
-            "median_rank": float(np.median(sem_ranks)),
-            "mean_top1_max_cos_to_gt": float(np.mean(all_top1_max_cos)),
+            **summarize_rank_metric(sem_ranks, cov_semantic),
+            "mean_top1_max_cos_to_gt": float(np.mean(all_top1_max_cos)) if all_top1_max_cos else 0.0,
         },
     }
-    for k in args.ks:
-        metrics["exact"][f"R@{k}"] = float((ranks <= k).mean())
-        metrics["semantic"][f"R@{k}"] = float((sem_ranks <= k).mean())
+
+    add_recall_at_ks(metrics["exact"], ranks, args.ks)
+    add_recall_at_ks(metrics["semantic"], sem_ranks, args.ks)
 
     if all_gt_cluster_ranks:
         cl_ranks = np.array(all_gt_cluster_ranks, dtype=np.float64)
         metrics["cluster"] = {
-            "n_gt_clusters_total": int(len(cl_ranks)),
-            "coverage": float(np.mean(cov_cluster)) if cov_cluster else 0.0,
-            "MRR": float((1.0 / cl_ranks).mean()),
-            "mean_rank": float(cl_ranks.mean()),
-            "median_rank": float(np.median(cl_ranks)),
+            "n_gt_cause_occurrences": int(len(cl_ranks)),
+            **summarize_rank_metric(cl_ranks, cov_cluster),
         }
-        for k in args.ks:
-            metrics["cluster"][f"R@{k}"] = float((cl_ranks <= k).mean())
+        add_recall_at_ks(metrics["cluster"], cl_ranks, args.ks)
 
     config = {
         **vars(args),
         "case_db_meta": meta,
+        "implementation_notes": {
+            "embedding_normalization": "L2-normalize global, lesion, and cause embeddings before dot products.",
+            "retrieved_case_filter": "Only train cases with combined similarity > 0 are retained for candidate-pool construction and scoring.",
+            "case_weighting": "Positive retained similarities are normalized to sum to 1 before candidate scoring.",
+            "metrics_ranking": "All metrics use raw candidate-pool score ranking, before diversification.",
+            "output_ranking": "predicted_top_n uses diversified ranking for inspection only.",
+            "cluster_metric": "Computed per GT cause occurrence; duplicate GT clusters within a query are not deduplicated.",
+            "missing_rank_handling": "Misses are +inf internally, null in per_query_results, and never counted by R@K; mean/median rank are covered-only.",
+        },
     }
+
     with (out_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump({"metrics": metrics, "config": config}, f,
                   ensure_ascii=False, indent=2)
@@ -467,33 +642,49 @@ def main():
         for r in per_query_results:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    print("\n=== Phase 1 baseline metrics (candidate-restricted) ===")
+    print("\n=== Phase 1 baseline metrics (candidate-restricted, fixed) ===")
     print(f"  n_queries={metrics['n_queries']}  "
           f"n_gt_occ={metrics['n_gt_cause_occurrences']}")
+    print(f"  retrieved_cases: positive_only=True  "
+          f"requested_K={metrics['retrieved_cases']['requested_top_k']}  "
+          f"mean_retained={metrics['retrieved_cases']['mean_retained']:.1f}  "
+          f"median_retained={metrics['retrieved_cases']['median_retained']:.0f}  "
+          f"min={metrics['retrieved_cases']['min_retained']}  "
+          f"max={metrics['retrieved_cases']['max_retained']}")
     print(f"  candidate_pool: mean={metrics['candidate_pool']['mean_size']:.1f}  "
           f"median={metrics['candidate_pool']['median_size']:.0f}  "
           f"min={metrics['candidate_pool']['min_size']}  "
           f"max={metrics['candidate_pool']['max_size']}")
+
     print(f"\n  -- exact-string match --")
     print(f"    coverage: {metrics['exact']['coverage']:.4f}")
+    print(f"    n_covered: {metrics['exact']['n_covered']}  "
+          f"n_missed: {metrics['exact']['n_missed']}")
     for k in ["MRR", "median_rank", "mean_rank"]:
-        print(f"    {k}: {metrics['exact'][k]:.4f}")
+        print(f"    {k}: {fmt_metric(metrics['exact'][k])}")
     for k in args.ks:
         print(f"    R@{k}: {metrics['exact'][f'R@{k}']:.4f}")
+
     print(f"\n  -- semantic match (threshold={args.semantic_threshold}) --")
     print(f"    coverage: {metrics['semantic']['coverage']:.4f}")
+    print(f"    n_covered: {metrics['semantic']['n_covered']}  "
+          f"n_missed: {metrics['semantic']['n_missed']}")
     for k in ["MRR", "median_rank", "mean_rank", "mean_top1_max_cos_to_gt"]:
-        print(f"    {k}: {metrics['semantic'][k]:.4f}")
+        print(f"    {k}: {fmt_metric(metrics['semantic'][k])}")
     for k in args.ks:
         print(f"    R@{k}: {metrics['semantic'][f'R@{k}']:.4f}")
+
     if "cluster" in metrics:
         print(f"\n  -- cluster-level match (HDBSCAN) --")
         print(f"    coverage: {metrics['cluster']['coverage']:.4f}")
+        print(f"    n_covered: {metrics['cluster']['n_covered']}  "
+              f"n_missed: {metrics['cluster']['n_missed']}")
         for k in ["MRR", "median_rank", "mean_rank"]:
-            print(f"    {k}: {metrics['cluster'][k]:.4f}")
-        print(f"    n_gt_clusters_total: {metrics['cluster']['n_gt_clusters_total']}")
+            print(f"    {k}: {fmt_metric(metrics['cluster'][k])}")
+        print(f"    n_gt_cause_occurrences: {metrics['cluster']['n_gt_cause_occurrences']}")
         for k in args.ks:
             print(f"    R@{k}: {metrics['cluster'][f'R@{k}']:.4f}")
+
     print(f"\n[save] metrics.json + per_query_results.jsonl -> {out_dir}")
     print(f"[done] total time {time.time()-t0:.1f}s")
 

@@ -185,23 +185,23 @@ $PY -m diagnosis_model.cause_inference.preprocessing.recluster_causes reassign-s
 對每個 valid query：
 
 1. 跟所有 train case 算組合相似度
-   - `sim(q, c) = α · cos(q.global, c.global) + β · Hungarian(q.lesions, c.lesions)`
-   - 預設 α=0.25, β=0.75
-2. 取 top-K cases（預設 K=20）
+   - `sim(q, c) = α · cos(q.global, c.global) + β · lesion-set cosine`
+   - 預設 α=0.25, β=0.75；lesion-set 預設 hungarian matching
+2. 取 sim > 0 的 top-K cases（預設 K=20），權重 sum-to-1 標準化
 3. 候選池 = 這 K 個 case 的去重病因（~87 個候選）
 4. 候選打分（embedding-space）：
    - `score(c) = Σ_j w_j · max_g cos(emb(c), emb(e_{j,g}))`
-5. greedy diversification（cos > 0.95 視為重複，suppress）
-6. 輸出 top-N
+5. raw ranking 直接給 metrics；diversification（cos ≥ 0.95 suppress）只用於 `predicted_top_n` 輸出
+6. cluster metric 是 per GT cause occurrence
 
 ```bash
 $PY -m diagnosis_model.cause_inference.phase1_baseline \
   --case_db_dir outputs/case_db \
-  --output_dir outputs/phase1_full \
+  --output_dir outputs/phase1_final \
   --top_k_cases 20 --alpha_global 0.25 --beta_lesion 0.75 \
   --diversify_threshold 0.95 --semantic_threshold 0.95 \
   --lesion_match hungarian \
-  --cluster_json outputs/cause_clusters_v100_reassigned.json
+  --cluster_json outputs/cause_clusters_llm.json
 ```
 
 **hyperparameter sweep：**
@@ -211,18 +211,18 @@ bash diagnosis_model/cause_inference/run_phase1_sweep.sh
 測試 K ∈ {10, 20, 30, 50}, α ∈ {0, 0.25, 1.0}, diversify ∈ {0.95, 0.97, 0.99}。
 Sweet spot：**K=20, α=0.25, diversify=0.95**。
 
-**Phase 1 baseline 全量結果（1573 valid queries）：**
+**Phase 1 baseline 全量結果（1573 valid queries, LLM 466 clusters）：**
 
 | Metric | Value |
 |---|---|
 | Pool size mean | 87 |
-| Semantic R@1 | 22.3% |
-| Semantic R@10 | **78.6%** |
-| Semantic R@20 | 84.4% |
-| Semantic coverage | 85.8% |
-| Semantic MRR | 0.42 |
+| Semantic coverage | **93.1%** |
+| Semantic MRR | 0.298 |
+| Semantic R@1 / R@10 / R@20 | 22.3% / 44.4% / 58.9% |
+| Cluster MRR | 0.235 |
+| Cluster R@1 / R@10 / R@20 | 17.2% / 35.8% / 47.6% |
 
-`coverage = 85.8%` 是 retrieval-only 上限——剩下 14% 是真的「相似 case 庫沒這種病因」的 OOD。
+`semantic coverage = 93.1%` 是 retrieval-only 上限——剩下 ~7% 是真的「相似 case 庫沒這種病因」的 OOD。
 
 ---
 
@@ -312,16 +312,16 @@ $PY -m diagnosis_model.cause_inference.eval_ceah \
 
 **Hybrid scoring**：`final = γ · phase1_score + (1−γ) · ceah_score`（per-query min-max 標準化）。掃 γ 找 sweet spot。
 
-**γ 掃描結果（v3，1573 valid queries）：**
+**γ 掃描結果（v3，1573 valid queries，LLM 466 cluster）：**
 
-| γ | sem_MRR | sem_R@10 | sem_R@20 | cluster_R@10 |
+| γ | sem_MRR | sem_R@10 | cl_MRR | cl_R@10 |
 |---|---|---|---|---|
-| 0.00 (CEAH only) | 0.393 | 76.2% | 84.0% | 30.4% |
-| 0.50 | 0.413 | 78.4% | 84.6% | 30.4% |
-| **0.75** | **0.417** | **78.7%** | 84.6% | 30.2% |
-| 1.00 (Phase 1 only) | 0.415 | 78.6% | 84.4% | 30.9% |
+| 0.00 (CEAH only) | 0.301 | **46.8%** | **0.271** | **39.8%** |
+| 0.50 | **0.303** | 45.9% | 0.254 | 37.6% |
+| 0.75 | 0.302 | 45.3% | 0.245 | 37.0% |
+| 1.00 (Phase 1 only) | 0.298 | 44.4% | 0.235 | 35.8% |
 
-→ **γ=0.75 hybrid 微贏 Phase 1 baseline**，CEAH 沒退化 retrieval。
+→ CEAH 對 cluster recall 有實質提升（γ=0 比 γ=1 多 +4pp cl_R@10），semantic 端 γ=0.5 達 sem_MRR 最佳。γ=0.75 為 paper figure dump 預設。
 
 ---
 
@@ -450,13 +450,12 @@ $PY -m diagnosis_model.cause_inference.case_study_viz \
 
 ## 完整結果 Summary
 
-### Retrieval（v3 hybrid γ=0.75 vs Phase 1 baseline）
+### Retrieval（v3 hybrid γ=0.75，1573 valid，LLM 466 cluster）
 
-| 評估層級 | R@1 | R@5 | R@10 | R@20 | MRR |
-|---|---|---|---|---|---|
-| Exact 字串（56k 唯一） | 0.06% | 0.3% | 0.4% | 0.6% | 0.002 |
-| **Semantic（cos≥0.95）** | 22.4% | 68.4% | **78.7%** | 84.6% | **0.417** |
-| **Cluster（100 topics）** | 5.2% | 20.8% | **30.4%** | 39.7% | **0.131** |
+| 評估層級 | R@1 | R@5 | R@10 | R@20 | MRR | coverage |
+|---|---|---|---|---|---|---|
+| **Semantic（cos≥0.95）** | 22.4% | 36.1% | **45.3%** | 57.9% | **0.302** | 93.1% |
+| **Cluster（LLM 466）** | 18.2% | 29.3% | **37.0%** | 46.6% | **0.245** | 72.7% |
 
 ### Attribution（cause type × α 分佈）
 
@@ -481,13 +480,13 @@ $PY -m diagnosis_model.cause_inference.case_study_viz \
 
 > **FaCE-R 由三個元件組成：**
 >
-> **C¹ (Phase 1)**: Hungarian-matched lesion-set similarity 做 zero-training 案例檢索。在 1,573 個 valid query 上達到 **semantic R@10 = 78.6%**。Hyperparameter sweep 顯示 K=20, α=0.25 是最佳配置；global-only / lesion-only 分別給 77.4% / 74.5%，證明 global 是主信號（VLM-Global pretraining 的優勢）。
+> **C¹ (Phase 1)**: Hungarian-matched lesion-set similarity 做 zero-training 案例檢索。在 1,573 個 valid query 上達到 **semantic R@10 = 44.4%、coverage = 93.1%、MRR = 0.298；cluster R@10 = 35.8%**。Hyperparameter sweep 顯示 K=20, α=0.25 是最佳配置；global 是主信號（VLM-Global pretraining 的優勢）。
 >
 > **C² (Phase 2 ablation)**: Cause-overlap supervised projection learning 在 frozen VLM 上提供不到 0.001 的 MRR 改進，作為 negative result 報告——VLM 表徵已飽和。
 >
 > **C³ (Phase 3, CEAH)**: 設計 softmax + multiplicative scoring 的 attribution head：
 > - **架構強制 faithfulness**：α 透過 gated pooling 直接門控 evidence 對分數的貢獻
-> - **Hybrid γ=0.75 retrieval = 78.7%**，跟 Phase 1 持平不退化
+> - **CEAH 提升 cluster recall**：γ=0 cl_R@10 = 39.8% vs γ=1 (Phase 1 only) 35.8%，+4pp；semantic 端 γ=0.5 達 sem_MRR=0.303 最佳
 > - **Cause-type-aware attribution**：global-type 病因 lesion/global α ratio = 0.44, lesion-type ratio = 1.39（3.2× 反轉）
 > - **Faithfulness 驗證**：遮 lesion 對 N≥3 的 case 影響是隨機遮的 **18 倍**
 > - **Multi-lesion 整合行為**：N=3+ 時 attribution 平均分散到所有 lesion（concentration = 1/N），證明模型採「集體視覺證據」策略

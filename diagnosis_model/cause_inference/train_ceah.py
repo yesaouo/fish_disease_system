@@ -31,8 +31,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from diagnosis_model.cause_inference.models import CEAH
 from diagnosis_model.cause_inference.phase1_baseline import (
-    build_candidate_pool, compute_case_similarities,
-    diversify, stack_train_lesions,
+    MISS_RANK,
+    add_recall_at_ks,
+    build_candidate_pool,
+    compute_case_similarities,
+    select_positive_top_cases,
+    stack_train_lesions,
+    summarize_rank_metric,
 )
 
 
@@ -145,46 +150,55 @@ def eval_valid_with_ceah(
     alpha_global: float = 0.25,
     beta_lesion: float = 0.75,
 ) -> Dict[str, float]:
-    """Phase 1 retrieval → CEAH re-rank → semantic recall metrics."""
+    """Phase 1 retrieval → CEAH re-rank → semantic recall metrics.
+
+    Mirrors phase1_baseline.py / eval_ceah.py contract: L2-normalize, drop
+    non-positive-sim cases, raw ranking for metrics, miss=+inf.
+    """
     ceah.eval()
-    train_global_stack = torch.stack([c["global_emb"] for c in train_cases]).to(device)
+    cause_table_embs = F.normalize(cause_table_embs, dim=-1)
+    train_global_stack = F.normalize(
+        torch.stack([c["global_emb"] for c in train_cases]).to(device), dim=-1,
+    )
     train_lesion_stack, train_offsets = stack_train_lesions(train_cases)
-    train_lesion_stack = train_lesion_stack.to(device)
+    train_lesion_stack = F.normalize(train_lesion_stack.to(device), dim=-1)
 
     queries = valid_cases if max_queries <= 0 else valid_cases[:max_queries]
-    sem_ranks: List[int] = []
+    sem_ranks: List[float] = []
     cov: List[int] = []
     in_dim = cause_table_embs.size(-1)
     text_key = f"text_{use_text_kind}_emb"
 
     for q in queries:
-        q_global = q["global_emb"].to(device)
-        q_lesions = q["lesion_embs"].to(device)
+        q_global = F.normalize(q["global_emb"].to(device), dim=-1)
+        q_lesions = F.normalize(q["lesion_embs"].to(device), dim=-1)
 
         sims = compute_case_similarities(
             q_global, q_lesions,
             train_global_stack, train_lesion_stack, train_offsets,
             alpha_global, beta_lesion, lesion_match="hungarian",
         )
-        top_k_idx = np.argsort(-sims)[:top_k_cases]
+        top_k_idx, _, _ = select_positive_top_cases(sims, top_k_cases)
         candidate_indices = build_candidate_pool(top_k_idx, train_cases)
         pool_size = len(candidate_indices)
         if pool_size == 0:
             for _ in q["cause_emb_indices"]:
-                sem_ranks.append(1)
+                sem_ranks.append(MISS_RANK)
                 cov.append(0)
             continue
 
         # Build CEAH inputs for this query (B=1, run all candidates as the
-        # cause-axis batch by replicating evidence across candidates)
-        global_emb = q["global_emb"].unsqueeze(0).expand(pool_size, -1).to(device)
-        n_les = q["lesion_embs"].size(0)
-        lesion_embs = q["lesion_embs"].unsqueeze(0).expand(pool_size, -1, -1).to(device)
+        # cause-axis batch by replicating evidence across candidates).
+        # CEAH calls .view(B*N, -1) internally, so expanded tensors must be
+        # materialized contiguous before being passed in.
+        global_emb = q_global.unsqueeze(0).expand(pool_size, -1).contiguous()
+        n_les = q_lesions.size(0)
+        lesion_embs = q_lesions.unsqueeze(0).expand(pool_size, -1, -1).contiguous()
         lesion_mask = torch.ones(pool_size, n_les, dtype=torch.bool, device=device)
 
         t = q.get(text_key)
         if t is not None:
-            text_emb = t.unsqueeze(0).expand(pool_size, -1).to(device)
+            text_emb = t.to(device).unsqueeze(0).expand(pool_size, -1).contiguous()
             text_present = torch.ones(pool_size, dtype=torch.bool, device=device)
         else:
             text_emb = torch.zeros(pool_size, in_dim, device=device)
@@ -195,33 +209,37 @@ def eval_valid_with_ceah(
 
         scores, _, _ = ceah(global_emb, text_emb, text_present,
                             lesion_embs, lesion_mask, cand_embs)
-        # Diversify on score order
-        score_sorted = torch.argsort(scores, descending=True).cpu().numpy()
-        sorted_local = diversify(score_sorted, cand_embs, diversify_threshold)
-        sorted_global = np.array(candidate_indices)[sorted_local]
+        # Raw ranking is used for metrics (no diversification).
+        raw_sorted_local = torch.argsort(scores, descending=True).detach().cpu().numpy()
 
         gt_idx_t = torch.tensor(q["cause_emb_indices"], device=device, dtype=torch.long)
         gt_embs = cause_table_embs.index_select(0, gt_idx_t)
-        sorted_cand_embs = cand_embs[torch.from_numpy(sorted_local).to(device)]
-        cos_sorted = gt_embs @ sorted_cand_embs.T
+        raw_sorted_cand_embs = cand_embs[torch.from_numpy(raw_sorted_local).to(device)]
+        cos_sorted = gt_embs @ raw_sorted_cand_embs.T
         sem_match = cos_sorted >= semantic_threshold
         for g_i in range(sem_match.size(0)):
             hits = torch.nonzero(sem_match[g_i], as_tuple=False)
             if hits.numel() > 0:
-                sem_ranks.append(int(hits[0].item()) + 1)
+                sem_ranks.append(float(hits[0].item()) + 1.0)
                 cov.append(1)
             else:
-                sem_ranks.append(pool_size + 1)
+                sem_ranks.append(MISS_RANK)
                 cov.append(0)
 
-    arr = np.array(sem_ranks, dtype=np.float64) if sem_ranks else np.array([1.0])
+    arr = np.asarray(sem_ranks, dtype=np.float64)
+    block = summarize_rank_metric(arr, cov)
     metrics = {
-        "sem_MRR": float((1.0 / arr).mean()),
-        "sem_median_rank": float(np.median(arr)),
-        "sem_coverage": float(np.mean(cov)) if cov else 0.0,
+        "sem_MRR": block["MRR"],
+        "sem_median_rank": block["median_rank"],
+        "sem_mean_rank": block["mean_rank"],
+        "sem_coverage": block["coverage"],
+        "sem_n_covered": block["n_covered"],
+        "sem_n_missed": block["n_missed"],
     }
+    add_recall_at_ks(metrics, arr, list(ks))
+    # Rename R@k -> sem_R@k
     for k in ks:
-        metrics[f"sem_R@{k}"] = float((arr <= k).mean())
+        metrics[f"sem_R@{k}"] = metrics.pop(f"R@{k}")
     return metrics
 
 
