@@ -39,8 +39,14 @@ from diagnosis_model.cause_inference.models import (
     MLPProjection, pairwise_max_mean_set_sim,
 )
 from diagnosis_model.cause_inference.phase1_baseline import (
-    build_candidate_pool, diversify, score_candidates,
-    stack_train_lesions, compute_case_similarities,
+    MISS_RANK,
+    add_recall_at_ks,
+    build_candidate_pool,
+    score_candidates,
+    select_positive_top_cases,
+    stack_train_lesions,
+    compute_case_similarities,
+    summarize_rank_metric,
 )
 
 
@@ -107,11 +113,18 @@ def make_collate(D: int):
 
 def compute_pred_sim(
     global_emb: torch.Tensor,    # [B, D]
-    proj_lesion: torch.Tensor,   # [B, max_N, D']  L2-normalized
+    proj_lesion: torch.Tensor,   # [B, max_N, D']
     lesion_mask: torch.Tensor,   # [B, max_N]
     alpha: float, beta: float,
 ) -> torch.Tensor:
-    g_sim = global_emb @ global_emb.T  # already L2-normalized in case DB
+    """Predicted case-pair similarity.
+
+    Make the cosine contract explicit: global embeddings and projected lesion
+    embeddings are L2-normalized immediately before dot products / set-sim.
+    """
+    global_emb = F.normalize(global_emb, dim=-1)
+    proj_lesion = F.normalize(proj_lesion, dim=-1)
+    g_sim = global_emb @ global_emb.T
     l_sim = pairwise_max_mean_set_sim(proj_lesion, lesion_mask, proj_lesion, lesion_mask)
     return alpha * g_sim + beta * l_sim
 
@@ -120,6 +133,11 @@ def compute_target_sim(
     cause_emb: torch.Tensor,    # [B, max_G, D]
     cause_mask: torch.Tensor,   # [B, max_G]
 ) -> torch.Tensor:
+    """Target case-pair similarity from frozen cause embeddings.
+
+    Cause embeddings are explicitly L2-normalized so target sim is cosine set-sim.
+    """
+    cause_emb = F.normalize(cause_emb, dim=-1)
     return pairwise_max_mean_set_sim(cause_emb, cause_mask, cause_emb, cause_mask)
 
 
@@ -138,12 +156,12 @@ def offdiag_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def project_all_lesions(
     train_cases: list, lesion_head: nn.Module, device: str, batch_size: int = 4096,
 ) -> Tuple[torch.Tensor, List[int]]:
-    """Project all train lesion embeddings; return stacked tensor and offsets."""
+    """Project and L2-normalize all train lesion embeddings; return stack + offsets."""
     stacked, offsets = stack_train_lesions(train_cases)
     out = []
     for i in range(0, stacked.size(0), batch_size):
         chunk = stacked[i : i + batch_size].to(device)
-        out.append(lesion_head(chunk).cpu())
+        out.append(F.normalize(lesion_head(chunk), dim=-1).cpu())
     return torch.cat(out, dim=0), offsets
 
 
@@ -151,13 +169,14 @@ def project_all_lesions(
 def project_query_lesions(
     cases: list, lesion_head: nn.Module, device: str, batch_size: int = 4096,
 ) -> List[torch.Tensor]:
+    """Project and L2-normalize query lesion embeddings case-by-case."""
     sizes = [c["lesion_embs"].size(0) for c in cases]
     if not sizes:
         return []
     stacked = torch.cat([c["lesion_embs"] for c in cases], dim=0)
     chunks = []
     for i in range(0, stacked.size(0), batch_size):
-        chunks.append(lesion_head(stacked[i : i + batch_size].to(device)).cpu())
+        chunks.append(F.normalize(lesion_head(stacked[i : i + batch_size].to(device)), dim=-1).cpu())
     flat = torch.cat(chunks, dim=0)
     out, cursor = [], 0
     for n in sizes:
@@ -170,7 +189,7 @@ def project_query_lesions(
 def eval_valid(
     train_cases: list, valid_cases: list,
     cause_table_embs: torch.Tensor,
-    cluster_id_array: np.ndarray,
+    cluster_id_array: np.ndarray | None,
     lesion_head: nn.Module,
     device: str,
     top_k_cases: int = 10,
@@ -181,105 +200,128 @@ def eval_valid(
     max_queries: int = -1,
     ks: Tuple[int, ...] = (1, 5, 10, 20),
 ) -> Dict[str, float]:
-    """Run the candidate-restricted Phase 1 pipeline using projected lesions.
-    Returns aggregate metrics dict.
+    """Run Phase-1-compatible valid eval using projected lesions.
+
+    Contract matched to phase1_baseline.py / Phase 3 eval:
+      - L2-normalize embeddings before cosine dot products.
+      - Retain only positive-similarity retrieved train cases.
+      - Normalize retained positive case similarities before candidate scoring.
+      - Use raw candidate ranking for metrics; diversification is not used here.
+      - Store misses as +inf so misses contribute 0 to MRR/R@K.
+      - Cluster metric is per GT cause occurrence, not per unique cluster.
     """
+    del top_n_causes          # kept for CLI/API compatibility; eval returns aggregate metrics only
+    del diversify_threshold   # diversification must not affect metrics
+
     lesion_head.eval()
 
-    train_global_stack = torch.stack([c["global_emb"] for c in train_cases]).to(device)
+    cause_table_embs = F.normalize(cause_table_embs.to(device), dim=-1)
+    train_global_stack = F.normalize(
+        torch.stack([c["global_emb"] for c in train_cases]).to(device), dim=-1,
+    )
     train_lesion_proj, train_offsets = project_all_lesions(train_cases, lesion_head, device)
     train_lesion_proj = train_lesion_proj.to(device)
-    valid_lesion_proj = project_query_lesions(valid_cases, lesion_head, device)
 
     queries = valid_cases if max_queries <= 0 else valid_cases[:max_queries]
+    valid_lesion_proj = project_query_lesions(queries, lesion_head, device)
 
-    sem_ranks: List[int] = []
-    cl_ranks: List[int] = []
-    cov_sem = 0
-    cov_cl = 0
-    n_gt_sem = 0
-    n_gt_cl = 0
+    sem_ranks: List[float] = []
+    cl_ranks: List[float] = []
+    cov_sem: List[int] = []
+    cov_cl: List[int] = []
 
     for qi, q in enumerate(queries):
-        q_global = q["global_emb"].to(device)
-        q_lesions_proj = (
-            valid_lesion_proj[qi] if max_queries <= 0 else valid_lesion_proj[qi]
-        ).to(device)
+        q_global = F.normalize(q["global_emb"].to(device), dim=-1)
+        q_lesions_proj = valid_lesion_proj[qi].to(device)
 
         sims = compute_case_similarities(
             q_global, q_lesions_proj,
             train_global_stack, train_lesion_proj, train_offsets,
             alpha, beta, lesion_match="hungarian",
         )
-        top_k_idx = np.argsort(-sims)[:top_k_cases]
-        top_k_w = sims[top_k_idx]
 
+        # Phase 1 / Phase 3 contract: positive-similarity cases only, normalized weights.
+        top_k_idx, top_k_w, _ = select_positive_top_cases(sims, top_k_cases)
         candidate_indices = build_candidate_pool(top_k_idx, train_cases)
         pool_size = len(candidate_indices)
+
         if pool_size == 0:
             for _ in q["cause_emb_indices"]:
-                sem_ranks.append(pool_size + 1)
-                n_gt_sem += 1
+                sem_ranks.append(MISS_RANK)
+                cov_sem.append(0)
                 if cluster_id_array is not None:
-                    cl_ranks.append(pool_size + 1); n_gt_cl += 1
+                    cl_ranks.append(MISS_RANK)
+                    cov_cl.append(0)
             continue
 
-        cand_embs = cause_table_embs.index_select(
-            0, torch.tensor(candidate_indices, device=device, dtype=torch.long),
-        )
+        cand_idx_t = torch.tensor(candidate_indices, device=device, dtype=torch.long)
+        cand_embs = cause_table_embs.index_select(0, cand_idx_t)
         cand_scores = score_candidates(
             candidate_indices, top_k_idx, top_k_w, train_cases, cause_table_embs,
         )
-        score_sorted = torch.argsort(cand_scores, descending=True).cpu().numpy()
-        sorted_local = diversify(score_sorted, cand_embs, diversify_threshold)
-        sorted_global = np.array(candidate_indices)[sorted_local]
 
-        # semantic match
+        # Raw ranking is used for metrics. Do not diversify here.
+        raw_sorted_local = torch.argsort(cand_scores, descending=True).detach().cpu().numpy()
+        raw_sorted_global = np.array(candidate_indices)[raw_sorted_local]
+
+        # Semantic match: per GT cause occurrence.
         gt_idx_t = torch.tensor(q["cause_emb_indices"], device=device, dtype=torch.long)
         gt_embs = cause_table_embs.index_select(0, gt_idx_t)
-        sorted_cand_embs = cand_embs[torch.from_numpy(sorted_local).to(device)]
-        cos_sorted = gt_embs @ sorted_cand_embs.T
+        raw_sorted_cand_embs = cand_embs[torch.from_numpy(raw_sorted_local).to(device)]
+        cos_sorted = gt_embs @ raw_sorted_cand_embs.T
         sem_match = cos_sorted >= semantic_threshold
         for g_i in range(sem_match.size(0)):
             hits = torch.nonzero(sem_match[g_i], as_tuple=False)
             if hits.numel() > 0:
-                sem_ranks.append(int(hits[0].item()) + 1)
-                cov_sem += 1
+                sem_ranks.append(float(hits[0].item()) + 1.0)
+                cov_sem.append(1)
             else:
-                sem_ranks.append(pool_size + 1)
-            n_gt_sem += 1
+                sem_ranks.append(MISS_RANK)
+                cov_sem.append(0)
 
-        # cluster match
+        # Cluster match: per GT cause occurrence, matching Phase 1 denominator.
         if cluster_id_array is not None:
-            gt_clusters_set = sorted(set(int(cluster_id_array[i]) for i in q["cause_emb_indices"]))
-            sorted_clusters = cluster_id_array[sorted_global]
-            for cid in gt_clusters_set:
-                hits = np.flatnonzero(sorted_clusters == cid)
+            raw_sorted_clusters = cluster_id_array[raw_sorted_global]
+            for g in q["cause_emb_indices"]:
+                cid = int(cluster_id_array[int(g)])
+                hits = np.flatnonzero(raw_sorted_clusters == cid)
                 if hits.size > 0:
-                    cl_ranks.append(int(hits[0]) + 1)
-                    cov_cl += 1
+                    cl_ranks.append(float(hits[0]) + 1.0)
+                    cov_cl.append(1)
                 else:
-                    cl_ranks.append(pool_size + 1)
-                n_gt_cl += 1
+                    cl_ranks.append(MISS_RANK)
+                    cov_cl.append(0)
 
-    sem_arr = np.array(sem_ranks, dtype=np.float64) if sem_ranks else np.array([1.0])
-    cl_arr  = np.array(cl_ranks,  dtype=np.float64) if cl_ranks  else np.array([1.0])
-
-    metrics = {
-        "sem_MRR": float((1.0 / sem_arr).mean()),
-        "sem_median_rank": float(np.median(sem_arr)),
-        "sem_coverage": cov_sem / max(n_gt_sem, 1),
+    sem_arr = np.asarray(sem_ranks, dtype=np.float64)
+    sem_block = summarize_rank_metric(sem_arr, cov_sem)
+    metrics: Dict[str, float] = {
+        "sem_MRR": sem_block["MRR"],
+        "sem_median_rank": sem_block["median_rank"],
+        "sem_mean_rank": sem_block["mean_rank"],
+        "sem_coverage": sem_block["coverage"],
+        "sem_n_covered": sem_block["n_covered"],
+        "sem_n_missed": sem_block["n_missed"],
     }
+    add_recall_at_ks(metrics, sem_arr, list(ks))
     for k in ks:
-        metrics[f"sem_R@{k}"] = float((sem_arr <= k).mean())
+        metrics[f"sem_R@{k}"] = metrics.pop(f"R@{k}")
+
     if cl_ranks:
-        metrics["cl_MRR"] = float((1.0 / cl_arr).mean())
-        metrics["cl_coverage"] = cov_cl / max(n_gt_cl, 1)
+        cl_arr = np.asarray(cl_ranks, dtype=np.float64)
+        cl_block = summarize_rank_metric(cl_arr, cov_cl)
+        metrics.update({
+            "cl_MRR": cl_block["MRR"],
+            "cl_median_rank": cl_block["median_rank"],
+            "cl_mean_rank": cl_block["mean_rank"],
+            "cl_coverage": cl_block["coverage"],
+            "cl_n_covered": cl_block["n_covered"],
+            "cl_n_missed": cl_block["n_missed"],
+        })
+        add_recall_at_ks(metrics, cl_arr, list(ks))
         for k in ks:
-            metrics[f"cl_R@{k}"] = float((cl_arr <= k).mean())
+            metrics[f"cl_R@{k}"] = metrics.pop(f"R@{k}")
 
     return metrics
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -383,8 +425,19 @@ def main():
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     log_path = out_dir / "train_log.jsonl"
+    config = {
+        **vars(args),
+        "implementation_notes": {
+            "training_objective": "In-batch all-pairs case similarity regression; loss is MSE over off-diagonal pairs only.",
+            "embedding_normalization": "Global, projected lesion, and cause embeddings are L2-normalized before cosine/set-sim computations.",
+            "eval_case_filter": "Validation retains only positive-similarity retrieved train cases, then normalizes their weights before candidate scoring.",
+            "eval_ranking": "Validation metrics use raw candidate-pool ranking; diversification is intentionally not used for metrics.",
+            "eval_missing_rank_handling": "Validation misses are +inf internally and therefore contribute 0 to MRR/R@K.",
+            "cluster_metric": "Validation cluster metrics are per GT cause occurrence, not deduplicated by cluster within a query.",
+        },
+    }
     with (out_dir / "config.json").open("w") as f:
-        json.dump(vars(args), f, indent=2)
+        json.dump(config, f, indent=2)
     log_f = log_path.open("w", encoding="utf-8")
 
     best_mrr = -1.0

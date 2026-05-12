@@ -121,12 +121,16 @@ for mode in medical colloquial none; do
     --text_kind ${mode}
 done
 
-論文報告數字（1573 valid，三個 mode）：
-  medical:    sem_MRR=0.4170, R@10=78.65%, lesion-type l/g=1.36
-  colloquial: sem_MRR=0.4167, R@10=78.62%, lesion-type l/g=1.49
-  none:       sem_MRR=0.4166, R@10=78.51%, lesion-type l/g=1.64
-  → Retrieval 持平（差 ≤ 0.003），attribution 智能 fallback：
+論文報告數字（1573 valid，三個 mode，2026-05-11 用當前 code 重跑）：
+  medical:    sem_MRR=0.3020, R@10=45.27%, lesion-type l/g=1.36
+  colloquial: sem_MRR=0.3016, R@10=45.30%, lesion-type l/g=1.49
+  none:       sem_MRR=0.3019, R@10=45.32%, lesion-type l/g=1.64
+  → Retrieval 持平（差 ≤ 0.0004），attribution 智能 fallback：
     沒文字時 lesion attention 自動補位
+
+  (舊版同位置記錄為 R@10=78.65/78.62/78.51%，那是 phase1_baseline.py / eval_ceah.py
+   metric 語意改寫前的數字，已不可重現。lesion-type l/g ratio 為先前 analyze_v3_n_buckets
+   產出，若新 metric 影響需重跑驗證。)
 
 ================================================================================
 [F] Case study 視覺化（論文 figure）
