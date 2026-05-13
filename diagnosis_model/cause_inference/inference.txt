@@ -35,6 +35,33 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
   cluster  R@1=17.2%, R@5=27.8%, R@10=35.8%, R@20=47.6%, MRR=0.235
 
 ================================================================================
+[A-ablation] Phase 1 VLM dependency ablation（raw SigLIP2 vs fine-tuned）
+================================================================================
+論文 ablation：把整個 case_db 用 raw `google/siglip2-base-patch16-224` 重建
+（見 training.txt [0-raw]），lesion crop 走原生 image encoder、跳過 fusion module，
+然後重跑 Phase 1。驗證 frozen-teacher 範式：retrieval 不依賴 in-domain finetune。
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.phase1_baseline \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \
+  --output_dir diagnosis_model/cause_inference/outputs/phase1_raw \
+  --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
+  --top_k_cases 20 \
+  --alpha_global 0.25 --beta_lesion 0.75 \
+  --lesion_match hungarian \
+  --diversify_threshold 0.95 \
+  --semantic_threshold 0.95
+
+論文報告數字（1573 valid，LLM 466 cluster）：
+  Fine-tuned VLMs:  sem R@1=22.3%  R@10=44.4%  R@20=58.9%  MRR=0.298  cl_R@10=35.8%
+  Raw SigLIP2:      sem R@1=22.2%  R@10=45.6%  R@20=59.2%  MRR=0.300  cl_R@10=35.8%
+
+  → Raw 在 retrieval 持平甚至略勝（R@10 +1.2 pp，MRR +0.002，cluster 完全等價）；
+    確認 Phase 1 是 zero-shot vision-language retrieval 範式，不依賴 in-domain 微調。
+
+警告：把這個 raw case_db 拿去訓 CEAH 會 faithfulness 反轉（見 [C-ablation]）。
+Phase 3 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
+
+================================================================================
 [B] CEAH v3 hybrid retrieval（論文主要結果）
 ================================================================================
 時間: ~50 秒（1573 valid queries）
@@ -88,6 +115,50 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
     N=2: lesion drop 0.051 (10× random)
     N≥3: lesion drop 0.055 (18× random)
   → multi-lesion case 下，lesion 是 load-bearing 的解釋來源
+
+================================================================================
+[C-ablation] Phase 3 VLM dependency（為什麼 CEAH 必須用 fine-tuned VLM-Lesion）
+================================================================================
+論文 ablation：把 raw SigLIP2 case_db（見 training.txt [0-raw]）拿去訓 CEAH，
+然後跑 faithfulness eval。驗證 CEAH 對 fusion-trained lesion encoder 的必要性。
+
+# 流程
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.build_train_candidate_pool \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \
+  --output_path diagnosis_model/cause_inference/outputs/case_db_raw/train_candidate_pool.pt \
+  --top_k_cases 20 --alpha_global 0.25 --beta_lesion 0.75 \
+  --lesion_match hungarian --semantic_threshold 0.95
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.train_ceah \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \
+  --train_pool_path diagnosis_model/cause_inference/outputs/case_db_raw/train_candidate_pool.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/ceah_raw \
+  --attribution_mode softmax --scoring_mode multiplicative \
+  --epochs 20 --batch_size 32 --lr 1e-4 \
+  --lambda_sparsity 0.0 --text_dropout 0.5 \
+  --warmup_steps 200 --eval_every 2 --eval_max_queries 300
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.faithfulness_eval \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \
+  --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_raw/best_ceah.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/ceah_raw_faithfulness \
+  --attribution_mode softmax --scoring_mode multiplicative \
+  --gamma 0.5 --max_queries -1
+
+論文報告數字（1573 valid，CEAH trained on raw case_db）：
+  Retrieval 持平：       γ=0.75 sem R@10 = 46.4% (raw) vs 45.3% (fine-tuned)
+                       γ=0.75 sem MRR  = 0.306 (raw) vs 0.302 (fine-tuned)
+
+  Faithfulness 反轉：
+    no_lesion drop:  global-type=-0.019, lesion-type=-0.031, mixed=-0.035  ← 全部負值
+    no_random drop:  +0.004
+    no_global drop:  +0.05
+
+  → CEAH 把 attention 放在 lesion 上（lesion sum α 仍 0.23–0.42），但遮 lesion 後
+    分數反而上升 — 即 lesion 內容不是有效訊號，違反 architecture-enforced
+    lesion-grounded explainability 的設計目標。
+  → 結論：retrieval 可以 zero-shot（Phase 1），但 attribution 必須有 lesion-
+    specialized 視覺特徵（Phase 3 必須使用 fine-tuned VLM-Lesion + fusion）。
 
 ================================================================================
 [D] N=1/2/3+ lesion bucket 分析（論文 ablation）
@@ -187,7 +258,9 @@ LLM cluster 是論文預設；HDBSCAN coarse 當對照。
 把 Phase 1 的 multi-vector hungarian 比對壓成單一 cosine，加速 14×、品質
 微幅超越老師。CEAH 下游接得起來，不需要任何改動。
 
-ENV：mamba3, CC=/usr/bin/gcc-12
+ENV：SDM（DeepSets / mean 都是純 PyTorch；mamba 變體已搬到
+diagnosis_model/cause_inference/mamba_ablation/，要訓那條才需要 mamba3 env +
+CC=/usr/bin/gcc-12）。
 
 --------------------------------------------------------------------------------
 [I-1] 標準 Phase-1-aligned 評估（最常用）
@@ -195,8 +268,7 @@ ENV：mamba3, CC=/usr/bin/gcc-12
 比較任何 encoder vs Phase 1 hungarian，沿用同一條 candidate-pool aggregation
 + semantic-rank metric（純檢索評估，無 CEAH）。
 
-CC=/usr/bin/gcc-12 \
-/home/lab603/anaconda3/envs/mamba3/bin/python \
+/home/lab603/anaconda3/envs/SDM/bin/python \
   -m diagnosis_model.cause_inference.eval_phase1_aligned \
   --include_phase1 \
   --checkpoints \
@@ -216,8 +288,7 @@ CC=/usr/bin/gcc-12 \
 --------------------------------------------------------------------------------
 把 case encoder 嵌進完整 hybrid pipeline，驗證跟 CEAH 串接無痛。
 
-CC=/usr/bin/gcc-12 \
-/home/lab603/anaconda3/envs/mamba3/bin/python \
+/home/lab603/anaconda3/envs/SDM/bin/python \
   -m diagnosis_model.cause_inference.eval_hybrid_aligned \
   --include_phase1 \
   --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt \
@@ -230,6 +301,31 @@ CC=/usr/bin/gcc-12 \
   phase1+ceah:        sem_R@10 = 45.3%   |  18.2 ms/query
   deepsets_dual+ceah: sem_R@10 = 45.3%   |   3.4 ms/query  ( 5.4× faster )
   → 端到端速度從 18.2 ms 降到 3.4 ms，品質完全等價
+
+================================================================================
+[I-ablation] Phase 4 VLM dependency（raw case_db 上的 distillation）
+================================================================================
+論文 ablation：dual-target distillation 是否依賴 in-domain VLM finetune？
+需先建好 outputs/case_db_raw/ 與 outputs/encoder_raw/（見 training.txt [0-raw] / [5-raw]）。
+
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.eval_phase1_aligned \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \
+  --include_phase1 \
+  --checkpoints \
+      deepsets_raw=diagnosis_model/cause_inference/outputs/encoder_raw/best_encoder.pt \
+  --top_k_cases 20 \
+  --semantic_threshold 0.95
+
+論文報告數字（1573 valid，K=20，case_db_raw）：
+  phase1-hungarian (raw teacher):   sem_R@10 = 45.6%   MRR = 0.300   |  15.2 ms/q
+  deepsets_dual    (raw student):   sem_R@10 = 45.6%   MRR = 0.303   |   1.1 ms/q  (14× faster)
+
+  → 跟 fine-tuned case_db 上的行為一致（student 持平甚至略勝 teacher、14× 加速）。
+    distillation 不依賴 in-domain VLM finetune，再次支持 Phase 1 retrieval 屬於
+    zero-shot vision-language 範式的論點。
+  → 跟 [C-ablation] 對照：retrieval-side（Phase 1 + Phase 4）對 VLM training 不敏感；
+    attribution-side（Phase 3 CEAH）必須 fine-tuned VLM-Lesion fusion。
 
 ================================================================================
 [H] 端到端推論（給單張新影像）

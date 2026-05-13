@@ -5,7 +5,7 @@ For every train case treated as anchor:
 
 where lesion_set_score uses Hungarian (paper best config) by default. The result
 is the input for listwise-KL distillation when training the Mamba master-slave
-encoder (see train_mamba_encoder.py).
+encoder (see train_case_encoder.py).
 
 Output:
   outputs/case_db/teacher_train_train.pt = {

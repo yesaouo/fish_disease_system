@@ -1,8 +1,7 @@
 from .ceah import CEAH
 from .projection_head import MLPProjection, pairwise_max_mean_set_sim
-from .mamba_encoder import (
+from .case_encoder import (
     EncoderConfig,
-    MambaCaseEncoder,
     MeanPoolEncoder,
     DeepSetsEncoder,
     build_encoder,
@@ -16,7 +15,6 @@ __all__ = [
     "MLPProjection",
     "pairwise_max_mean_set_sim",
     "EncoderConfig",
-    "MambaCaseEncoder",
     "MeanPoolEncoder",
     "DeepSetsEncoder",
     "build_encoder",

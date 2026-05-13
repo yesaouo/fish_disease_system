@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from diagnosis_model.cause_inference.models.mamba_encoder import (
+from diagnosis_model.cause_inference.models.case_encoder import (
     EncoderConfig,
     build_encoder,
 )
@@ -31,7 +31,7 @@ from diagnosis_model.cause_inference.phase1_baseline import (
     load_case_db,
     stack_train_lesions,
 )
-from diagnosis_model.cause_inference.train_mamba_encoder import (
+from diagnosis_model.cause_inference.train_case_encoder import (
     encode_all,
     retrieval_metrics,
 )
@@ -75,7 +75,7 @@ def _phase1_latency(
 
 def _student_latency(H_train, encoder, valid_cases, device, n_queries=200):
     """Per-query time for student: encode query + cosine top-K against H_train."""
-    from diagnosis_model.cause_inference.train_mamba_encoder import (
+    from diagnosis_model.cause_inference.train_case_encoder import (
         CaseEncoderDataset, make_collate
     )
     ds = CaseEncoderDataset(valid_cases[:n_queries])

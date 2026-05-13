@@ -1,4 +1,4 @@
-"""Train the master-slave Mamba case encoder via Phase 1 distillation.
+"""Train the Phase 4 case encoder via Phase 1 distillation.
 
 Listwise-KL distillation against the precomputed Phase 1 hungarian teacher
 score table (teacher_train_train.pt). For each batch of B train cases, the
@@ -8,15 +8,21 @@ The encoder consumes (global_emb, lesion_embs sorted by area DESC) and emits
 one L2-normed h_final ∈ R^768 per case so that retrieval becomes a single
 case-to-case cosine.
 
-CLI quickstart from repo root:
-    CC=/usr/bin/gcc-12 \
-    /home/lab603/anaconda3/envs/mamba3/bin/python \
-        -m diagnosis_model.cause_inference.train_mamba_encoder \
-        --output_dir diagnosis_model/cause_inference/outputs/mamba_encoder/mamba_v1
+Production choice is `--encoder_type deepsets` (see README Phase 4). The
+'mean' baseline is also pure PyTorch and runs in the SDM env. The 'mamba'
+choice lives under diagnosis_model.cause_inference.mamba_ablation and
+requires the mamba3 conda env + CC=/usr/bin/gcc-12; build_encoder() lazy-
+imports it only when requested.
 
-Notes:
-  - mamba_ssm requires CC env var pointing to gcc on this host (gcc-12).
-  - Encoder type is selectable via --encoder_type ∈ {mamba, mean, deepsets}.
+CLI quickstart from repo root (SDM env, default deepsets):
+    /home/lab603/anaconda3/envs/SDM/bin/python \
+        -m diagnosis_model.cause_inference.train_case_encoder \
+        --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+        --teacher_path diagnosis_model/cause_inference/outputs/case_db/teacher_train_train.pt \
+        --output_dir diagnosis_model/cause_inference/outputs/encoder_final \
+        --encoder_type deepsets \
+        --batch_size 256 --epochs 50 \
+        --use_infonce --infonce_weight 0.5 --infonce_temp 0.07
 """
 
 from __future__ import annotations
@@ -34,7 +40,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from diagnosis_model.cause_inference.models.mamba_encoder import (
+from diagnosis_model.cause_inference.models.case_encoder import (
     EncoderConfig,
     build_encoder,
     listwise_kl_loss,
@@ -186,8 +192,11 @@ def main():
                             "teacher_train_train.pt")
     ap.add_argument("--output_dir", type=str, required=True)
     # Encoder config
-    ap.add_argument("--encoder_type", type=str, default="mamba",
-                    choices=["mamba", "mean", "deepsets"])
+    ap.add_argument("--encoder_type", type=str, default="deepsets",
+                    choices=["deepsets", "mean", "mamba"],
+                    help="'deepsets' (default, production) and 'mean' are pure "
+                         "PyTorch. 'mamba' is an architecture ablation; needs "
+                         "mamba3 conda env and CC=/usr/bin/gcc-12.")
     ap.add_argument("--n_layers", type=int, default=2)
     ap.add_argument("--d_state", type=int, default=128)
     ap.add_argument("--headdim", type=int, default=64)

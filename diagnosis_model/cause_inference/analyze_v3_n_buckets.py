@@ -59,6 +59,9 @@ def main():
         pool = int(r["pool_size"])
         pool_b[b].append(pool)
         for sr in r["ranks_per_gamma"][args.gamma_tag]["sem_ranks"]:
+            if sr is None:
+                cov_b[b].append(0)
+                continue
             sem_ranks_b[b].append(int(sr))
             cov_b[b].append(1 if int(sr) <= pool else 0)
 

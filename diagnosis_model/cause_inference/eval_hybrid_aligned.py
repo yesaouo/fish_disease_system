@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from diagnosis_model.cause_inference.models import CEAH
-from diagnosis_model.cause_inference.models.mamba_encoder import (
+from diagnosis_model.cause_inference.models.case_encoder import (
     EncoderConfig, build_encoder,
 )
 from diagnosis_model.cause_inference.phase1_baseline import (
@@ -33,7 +33,7 @@ from diagnosis_model.cause_inference.phase1_baseline import (
     select_positive_top_cases,
     stack_train_lesions,
 )
-from diagnosis_model.cause_inference.train_mamba_encoder import encode_all
+from diagnosis_model.cause_inference.train_case_encoder import encode_all
 from diagnosis_model.cause_inference.eval_ceah import (
     ceah_forward_for_pool,
     minmax_norm,

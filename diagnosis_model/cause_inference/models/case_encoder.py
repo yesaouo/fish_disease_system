@@ -1,4 +1,4 @@
-"""Master-slave Mamba case encoder for Phase 1 retrieval distillation.
+"""Case encoder for Phase 4 retrieval distillation (DeepSets / MeanPool).
 
 Each case is represented by:
     global_emb         (1 x D, master)
@@ -7,21 +7,24 @@ Each case is represented by:
 The encoder maps the variable-length set to a single L2-normed vector h_final
 (D-dim) so that case-to-case retrieval becomes one cosine dot-product.
 
-Three encoder variants are implemented in this file (selected by name) so that
-training / eval scripts can A/B them with the same teacher distillation loss:
+Two encoder variants live here:
 
-    'mamba'       - master-slave Mamba3 stack (this paper's proposal)
     'mean'        - mean-pooled (W_g g) + (W_l l_i) baseline
     'deepsets'    - mean+max+sum -> MLP baseline (set-aware, no sequence)
 
-All three accept the same forward signature so they are drop-in
-interchangeable for ablation.
+The production choice is 'deepsets' (see README Phase 4). A third variant
+('mamba', master-slave Mamba3 stack) lives in
+``diagnosis_model.cause_inference.mamba_ablation.mamba_encoder``; it is kept
+as an architecture ablation and requires the ``mamba3`` conda env (mamba_ssm
+needs ``CC=/usr/bin/gcc-12`` for triton kernel JIT). ``build_encoder``
+lazy-imports it only when ``encoder_type='mamba'`` so the SDM env runs the
+production path without any extra deps.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -34,15 +37,14 @@ from torch import nn
 
 @dataclass
 class EncoderConfig:
-    encoder_type: str = "mamba"          # mamba | mean | deepsets
+    encoder_type: str = "deepsets"       # mean | deepsets | mamba (ablation)
     d_model: int = 768                   # input/output feature dim
-    # Mamba-specific
+    # Mamba-specific (only used when encoder_type='mamba'; harmless otherwise)
     n_layers: int = 2
     d_state: int = 128
     headdim: int = 64
     # MIMO bwd kernel currently fails to compile in this env (tilelang CUDA
     # codegen bug). Vanilla Mamba3 backward works -> default to is_mimo=False.
-    # If MIMO ever compiles, re-enabling is just a flag flip.
     is_mimo: bool = False
     mimo_rank: int = 4
     chunk_size: int = 16
@@ -57,7 +59,7 @@ class EncoderConfig:
 
 
 # ---------------------------------------------------------------------------
-# Token builder (shared by all variants)
+# Token builder (shared by all variants, including the Mamba ablation)
 # ---------------------------------------------------------------------------
 
 class TokenBuilder(nn.Module):
@@ -109,85 +111,6 @@ class TokenBuilder(nn.Module):
 
         seq = torch.cat([g.unsqueeze(1), L], dim=1)            # [B, max_N+1, D]
         return seq
-
-
-# ---------------------------------------------------------------------------
-# Mamba master-slave encoder
-# ---------------------------------------------------------------------------
-
-class _MambaBlock(nn.Module):
-    """Pre-norm Mamba3 block with residual."""
-
-    def __init__(self, cfg: EncoderConfig, layer_idx: int):
-        super().__init__()
-        from mamba_ssm import Mamba3
-        self.norm = nn.RMSNorm(cfg.d_model)
-        self.mamba = Mamba3(
-            d_model=cfg.d_model,
-            d_state=cfg.d_state,
-            headdim=cfg.headdim,
-            is_mimo=cfg.is_mimo,
-            mimo_rank=cfg.mimo_rank,
-            chunk_size=cfg.chunk_size,
-            is_outproj_norm=False,
-            layer_idx=layer_idx,
-            n_layer=cfg.n_layers,
-            dtype=cfg.dtype,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Mamba3 expects bfloat16 input on CUDA.
-        h = self.norm(x)
-        h = self.mamba(h.to(self.mamba.in_proj.weight.dtype))
-        return x + h.to(x.dtype)
-
-
-class MambaCaseEncoder(nn.Module):
-    """Sequence: [global, lesion_1, ..., lesion_N (area DESC)] -> Mamba -> last.
-
-    The first token (global) seeds the SSM state; subsequent lesion tokens
-    update it via Mamba's selective scan. We pool by extracting the output at
-    the last real position per sample (true_len - 1).
-    """
-
-    def __init__(self, cfg: EncoderConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.token_builder = TokenBuilder(cfg)
-        self.layers = nn.ModuleList(
-            [_MambaBlock(cfg, layer_idx=i) for i in range(cfg.n_layers)]
-        )
-        self.final_norm = nn.RMSNorm(cfg.d_model)
-        if cfg.use_projection_head:
-            self.head = nn.Sequential(
-                nn.Linear(cfg.d_model, cfg.head_hidden),
-                nn.GELU(),
-                nn.LayerNorm(cfg.head_hidden),
-                nn.Linear(cfg.head_hidden, cfg.d_model),
-            )
-        else:
-            self.head = nn.Identity()
-
-    def forward(
-        self,
-        global_emb: torch.Tensor,        # [B, D]
-        lesion_pad: torch.Tensor,        # [B, max_N, D]
-        lesion_lens: torch.Tensor,       # [B]
-    ) -> torch.Tensor:
-        seq = self.token_builder(global_emb, lesion_pad, lesion_lens)  # [B, L, D]
-        for layer in self.layers:
-            seq = layer(seq)
-        seq = self.final_norm(seq)
-
-        # Pool: output at last *real* position. Real-token count = lesion_lens + 1
-        # (because the global token sits at index 0).
-        true_last = (lesion_lens + 1) - 1                  # [B]   (= lesion_lens)
-        idx = true_last.view(-1, 1, 1).expand(-1, 1, seq.size(-1))
-        h = seq.gather(dim=1, index=idx).squeeze(1)        # [B, D]
-
-        z = self.head(h)
-        z = F.normalize(z, dim=-1)
-        return z
 
 
 # ---------------------------------------------------------------------------
@@ -275,16 +198,28 @@ class DeepSetsEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 ENCODERS = {
-    "mamba": MambaCaseEncoder,
     "mean": MeanPoolEncoder,
     "deepsets": DeepSetsEncoder,
 }
 
 
 def build_encoder(cfg: EncoderConfig) -> nn.Module:
+    """Build a case encoder by name.
+
+    'mean' and 'deepsets' are pure PyTorch and run in any env. 'mamba' is an
+    ablation kept under diagnosis_model.cause_inference.mamba_ablation; it is
+    lazy-imported here so callers that never request it don't need mamba_ssm.
+    """
+    if cfg.encoder_type == "mamba":
+        from diagnosis_model.cause_inference.mamba_ablation.mamba_encoder import (
+            MambaCaseEncoder,
+        )
+        return MambaCaseEncoder(cfg)
     if cfg.encoder_type not in ENCODERS:
-        raise ValueError(f"unknown encoder_type={cfg.encoder_type}; "
-                         f"choices={list(ENCODERS)}")
+        raise ValueError(
+            f"unknown encoder_type={cfg.encoder_type}; "
+            f"choices={list(ENCODERS) + ['mamba (ablation)']}"
+        )
     return ENCODERS[cfg.encoder_type](cfg)
 
 

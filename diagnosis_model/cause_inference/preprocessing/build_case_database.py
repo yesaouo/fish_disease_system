@@ -254,6 +254,7 @@ def process_split(
     max_length: int, use_amp: bool,
     chunk_size: int = 64, lesion_scale: float = 1.0,
     progress_every: int = 200,
+    raw_lesion: bool = False,
 ) -> List[Dict]:
     """Encode all per-case embeddings in chunks of `chunk_size` cases.
 
@@ -288,10 +289,17 @@ def process_split(
             per_case_n.append(len(crops))
 
         if all_local:
-            l_embs_flat = encode_lesion_fusion(
-                vlm_lesion, processor_lesion, all_local, all_global,
-                device=device, img_batch_size=img_batch_size, use_amp=use_amp,
-            )  # [sum(N_i), D]
+            if raw_lesion:
+                # raw mode: encode lesion crops with plain VLM (no global-context fusion)
+                l_embs_flat = encode_global_vision(
+                    vlm_lesion, processor_lesion, all_local,
+                    device=device, img_batch_size=img_batch_size, use_amp=use_amp,
+                )
+            else:
+                l_embs_flat = encode_lesion_fusion(
+                    vlm_lesion, processor_lesion, all_local, all_global,
+                    device=device, img_batch_size=img_batch_size, use_amp=use_amp,
+                )  # [sum(N_i), D]
         else:
             l_embs_flat = torch.empty(0, g_embs.size(-1)) if g_embs.numel() else torch.empty(0)
 
@@ -375,6 +383,11 @@ def main():
     ap.add_argument("--lesion_scale", type=float, default=1.0)
     ap.add_argument("--max_cases", type=int, default=-1,
                     help="cap cases per split (smoke testing); -1 = all")
+    ap.add_argument("--raw_lesion", action="store_true",
+                    help="Treat VLM-Lesion as a plain (un-fusion) image encoder. "
+                         "Skips wrapper_state.pt requirement and encodes lesion crops "
+                         "with get_image_features only (no global-context fusion). "
+                         "Used for the raw-SigLIP2 ablation.")
     args = ap.parse_args()
 
     device = args.device
@@ -413,10 +426,19 @@ def main():
     vlm_global, proc_global = load_vlm(args.vlm_global, device=device, force_fusion=False)
     if vlm_global.is_wrapper:
         raise RuntimeError("VLM-Global unexpectedly loaded as fusion wrapper")
-    print(f"[load] VLM-Lesion: {args.vlm_lesion}")
-    vlm_lesion, proc_lesion = load_vlm(args.vlm_lesion, device=device, force_fusion=True)
-    if not vlm_lesion.is_wrapper:
-        raise RuntimeError("VLM-Lesion failed to load as fusion wrapper")
+    print(f"[load] VLM-Lesion: {args.vlm_lesion}  (raw_lesion={args.raw_lesion})")
+    vlm_lesion, proc_lesion = load_vlm(
+        args.vlm_lesion, device=device, force_fusion=not args.raw_lesion,
+    )
+    if args.raw_lesion:
+        if vlm_lesion.is_wrapper:
+            raise RuntimeError(
+                "--raw_lesion was given but VLM-Lesion path contains wrapper_state.pt; "
+                "point --vlm_lesion at a raw HF model id (e.g. google/siglip2-base-patch16-224)."
+            )
+    else:
+        if not vlm_lesion.is_wrapper:
+            raise RuntimeError("VLM-Lesion failed to load as fusion wrapper")
 
     # 4) Encode unique cause text
     cause_texts, cause_embs = build_cause_text_embeddings(
@@ -435,6 +457,7 @@ def main():
         text_batch_size=args.text_batch_size, max_length=args.max_length,
         use_amp=use_amp, chunk_size=args.chunk_size,
         lesion_scale=args.lesion_scale,
+        raw_lesion=args.raw_lesion,
     )
 
     if valid_cases_raw:
@@ -446,6 +469,7 @@ def main():
             text_batch_size=args.text_batch_size, max_length=args.max_length,
             use_amp=use_amp, chunk_size=args.chunk_size,
             lesion_scale=args.lesion_scale,
+            raw_lesion=args.raw_lesion,
         )
     else:
         valid_cases = []
@@ -467,6 +491,7 @@ def main():
     meta = {
         "vlm_global": str(args.vlm_global),
         "vlm_lesion": str(args.vlm_lesion),
+        "raw_lesion": bool(args.raw_lesion),
         "global_dim": int(cause_embs.size(-1)),
         "lesion_dim": int(train_cases[0]["lesion_embs"].size(-1)) if train_cases else None,
         "n_train_cases": len(train_cases),

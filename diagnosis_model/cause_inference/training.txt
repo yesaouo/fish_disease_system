@@ -7,9 +7,13 @@ Python env:
   SDM:    /home/lab603/anaconda3/envs/SDM/bin/python
 
 ================================================================================
-[0] Phase 0 — 建立 case database（一次性）
+[0] Phase 0 — 建立 case database（一次性，production）
 ================================================================================
-輸入: train + valid COCO 標註 + 兩個 frozen VLM
+Production case_db 使用 fine-tune 過的兩個 VLM。Phase 3 CEAH 的 lesion-grounded
+faithfulness 依賴 VLM-Lesion + LocalGlobalFusion；Phase 1 retrieval 用 raw 也行
+（見下方 [0-raw]），所以這個 case_db 同時服務 Phase 1 + Phase 3。
+
+輸入: train + valid COCO 標註 + 兩個 frozen VLM (fine-tuned)
 輸出: case_db/{train_cases.pt, valid_cases.pt, cause_text_embs.pt, meta.json}
 時間: ~7 分鐘
 
@@ -22,6 +26,30 @@ Python env:
   --vlm_lesion diagnosis_model/vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh \
   --output_dir diagnosis_model/cause_inference/outputs/case_db \
   --chunk_size 64 --img_batch_size 64 --text_batch_size 256
+
+--------------------------------------------------------------------------------
+[0-raw] Phase 1 VLM-dependency ablation：raw SigLIP2 case_db（一次性）
+--------------------------------------------------------------------------------
+論文 ablation：把 case_db 用原始 `google/siglip2-base-patch16-224` 重建（lesion
+crop 跳過 fusion module），驗證 Phase 1 retrieval 在 frozen-teacher 範式下持平
+甚至略勝；Phase 3 CEAH 在此 case_db 上重訓會 faithfulness 反轉（見 inference.txt）。
+
+時間: ~7 分鐘
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.build_case_database \
+  --coco_train data/detection/coco/_merged/train/_annotations.coco.json \
+  --image_root_train data/detection/coco/_merged/train \
+  --coco_valid data/detection/coco/_merged/valid/_annotations.coco.json \
+  --image_root_valid data/detection/coco/_merged/valid \
+  --vlm_global google/siglip2-base-patch16-224 \
+  --vlm_lesion google/siglip2-base-patch16-224 \
+  --raw_lesion \
+  --output_dir diagnosis_model/cause_inference/outputs/case_db_raw \
+  --chunk_size 64 --img_batch_size 64 --text_batch_size 256
+
+對應 ablation 訓練：在 case_db_raw 上跑 build_train_candidate_pool（[2]）→
+train_ceah（[4]），輸出到 outputs/ceah_raw/，用 inference.txt 的 ablation 區塊
+評估。
 
 ================================================================================
 [1] Cause clustering（一次性，論文用 LLM 版）
@@ -117,10 +145,12 @@ v3 best 配方：softmax attribution + multiplicative scoring + 無 sparsity pen
 直接監督後微幅超越老師。
 
 最終選擇配方：DeepSets encoder + dual-target loss（listwise KL distillation
-+ case-to-cause SupCon InfoNCE）。沿用 ceah 的 mamba3 conda env。
++ case-to-cause SupCon InfoNCE）。**直接用 SDM env 跑，無 mamba_ssm 依賴。**
 
-注意：mamba_ssm 在這台機器需要 CC=/usr/bin/gcc-12（triton kernel JIT 編譯）。
-ENV=mamba3：/home/lab603/anaconda3/envs/mamba3/bin/python
+Mamba 變體現在是 architecture ablation，code 已搬到
+`diagnosis_model/cause_inference/mamba_ablation/`（見最後 [5-mamba] 區塊）；
+build_encoder lazy-import，只在 `--encoder_type mamba` 時才需要 mamba3 env +
+CC=/usr/bin/gcc-12。
 
 --------------------------------------------------------------------------------
 [5a] 建立 teacher score table（一次性，~3 分鐘）
@@ -129,8 +159,7 @@ ENV=mamba3：/home/lab603/anaconda3/envs/mamba3/bin/python
 listwise KL distillation 的監督信號。
 輸出：teacher_train_train.pt（~312 MB fp16，gitignored）
 
-CC=/usr/bin/gcc-12 \
-/home/lab603/anaconda3/envs/mamba3/bin/python \
+/home/lab603/anaconda3/envs/SDM/bin/python \
   -m diagnosis_model.cause_inference.preprocessing.build_teacher_table \
   --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
   --output_path diagnosis_model/cause_inference/outputs/case_db/teacher_train_train.pt \
@@ -143,9 +172,8 @@ CC=/usr/bin/gcc-12 \
 Loss = listwise_KL(student case-pair sim, teacher case-pair sim) at T=0.1
      + 0.5 * SupCon(h_final, GT cause text embs) at T=0.07
 
-CC=/usr/bin/gcc-12 \
-/home/lab603/anaconda3/envs/mamba3/bin/python \
-  -m diagnosis_model.cause_inference.train_mamba_encoder \
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.train_case_encoder \
   --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
   --teacher_path diagnosis_model/cause_inference/outputs/case_db/teacher_train_train.pt \
   --output_dir diagnosis_model/cause_inference/outputs/encoder_final \
@@ -163,3 +191,51 @@ CC=/usr/bin/gcc-12 \
 備註：in-training 的 sem_R@10 用 case-to-case GT-intersection naive metric（為了
 省每個 epoch 跑全 Phase 1-aligned pipeline 的時間）。真實 Phase 1-aligned R@10
 要事後用 eval_phase1_aligned.py 評（見 inference.txt [I]）。
+
+--------------------------------------------------------------------------------
+[5-raw] Phase 4 VLM-dependency ablation：raw SigLIP2 case_db
+--------------------------------------------------------------------------------
+驗證 dual-target distillation 不依賴 in-domain VLM finetune（與 Phase 1 ablation
+一致）。需先建好 outputs/case_db_raw/（見 [0-raw]）。
+
+# Step 1: teacher table on raw（~3 min）
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.preprocessing.build_teacher_table \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \
+  --output_path diagnosis_model/cause_inference/outputs/case_db_raw/teacher_train_train.pt \
+  --alpha_global 0.25 --beta_lesion 0.75 \
+  --lesion_match hungarian
+
+# Step 2: DeepSets dual-target on raw（~10 min；早停 epoch 9，跟 fine-tuned 同步）
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.train_case_encoder \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \
+  --teacher_path diagnosis_model/cause_inference/outputs/case_db_raw/teacher_train_train.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/encoder_raw \
+  --encoder_type deepsets \
+  --batch_size 256 --epochs 50 \
+  --temp_target 0.1 --temp_pred 0.1 \
+  --use_infonce --infonce_weight 0.5 --infonce_temp 0.07
+
+對應評估見 inference.txt [I-ablation]。
+
+--------------------------------------------------------------------------------
+[5-mamba] Phase 4 architecture ablation：Mamba master-slave encoder（已搬離主流程）
+--------------------------------------------------------------------------------
+論文 architecture ablation：Mamba / MeanPool / DeepSets 三選一，結論是三者
+在此任務序列長度（avg 1.73 lesion）下打平，DeepSets 因參數最少被選為 production。
+
+Mamba code 已搬到 diagnosis_model/cause_inference/mamba_ablation/。要訓 Mamba
+變體必須切到 mamba3 env + CC=/usr/bin/gcc-12（build_encoder 在 SDM env 看到
+--encoder_type mamba 時會 lazy-import mamba_ssm 並失敗）：
+
+CC=/usr/bin/gcc-12 \
+/home/lab603/anaconda3/envs/mamba3/bin/python \
+  -m diagnosis_model.cause_inference.train_case_encoder \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --teacher_path diagnosis_model/cause_inference/outputs/case_db/teacher_train_train.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/mamba_encoder/mamba_v1 \
+  --encoder_type mamba \
+  --batch_size 256 --epochs 50
+
+MeanPool 同樣可用 `--encoder_type mean`，但 mean baseline 不需切 env。
