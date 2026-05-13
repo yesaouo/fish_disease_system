@@ -32,13 +32,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from diagnosis_model.cause_inference.models.mamba_encoder import (
     EncoderConfig,
     build_encoder,
     listwise_kl_loss,
     pairwise_mse_loss,
+    case_cause_infonce_loss,
 )
 from diagnosis_model.cause_inference.phase1_baseline import load_case_db
 
@@ -58,14 +59,14 @@ class CaseEncoderDataset(Dataset):
     """One sample = one train case. Lesions are pre-sorted by area DESC.
 
     Per-case dict keys returned:
-        case_id     : int (= index into teacher table)
-        global_emb  : [D] L2-normed
-        lesion_embs : [N, D] L2-normed, sorted by area DESC (largest first)
+        case_id            : int (= index into teacher table)
+        global_emb         : [D] L2-normed
+        lesion_embs        : [N, D] L2-normed, sorted by area DESC (largest first)
+        cause_emb_indices  : list[int] indices into cause_text_embs (for dual-target loss)
     """
 
     def __init__(self, cases: list):
         self.cases = cases
-        # Pre-sort lesions by area DESC and L2-normalize once.
         self.records = []
         for ci, c in enumerate(cases):
             g = c["global_emb"]
@@ -76,7 +77,12 @@ class CaseEncoderDataset(Dataset):
                 areas = _lesion_areas(c["lesion_boxes_xywh"])
                 order = torch.argsort(areas, descending=True)
                 L = L[order]
-            self.records.append(dict(case_id=c["case_id"], global_emb=g, lesion_embs=L))
+            self.records.append(dict(
+                case_id=c["case_id"],
+                global_emb=g,
+                lesion_embs=L,
+                cause_emb_indices=list(c.get("cause_emb_indices", [])),
+            ))
 
     def __len__(self):
         return len(self.records)
@@ -103,6 +109,7 @@ def make_collate(D: int):
             "global_emb": global_embs,
             "lesion_pad": lesion_pad,
             "lesion_lens": lesion_lens,
+            "cause_indices": [b["cause_emb_indices"] for b in batch],
         }
     return collate
 
@@ -194,6 +201,18 @@ def main():
                     choices=["listwise_kl", "pairwise_mse"])
     ap.add_argument("--temp_target", type=float, default=0.1)
     ap.add_argument("--temp_pred", type=float, default=0.1)
+    # Dual-target (case -> cause text) InfoNCE
+    ap.add_argument("--use_infonce", action="store_true",
+                    help="Add SupCon-style InfoNCE between h_final and GT cause text embs.")
+    ap.add_argument("--infonce_weight", type=float, default=0.5)
+    ap.add_argument("--infonce_temp", type=float, default=0.07)
+    # Hard-case mining (option b)
+    ap.add_argument("--miss_weight", type=float, default=1.0,
+                    help="Upweight hard cases (teacher miss >=1 GT) in sampler. "
+                         "weight(case) = 1 + miss_weight * miss_count. Default=1.0 disables.")
+    ap.add_argument("--train_pool_path", type=str,
+                    default="diagnosis_model/cause_inference/outputs/case_db/"
+                            "train_candidate_pool.pt")
     # Training
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=50)
@@ -230,12 +249,61 @@ def main():
     teacher_full = teacher_full[:len(train_cases), :len(train_cases)]
     print(f"teacher table: {tuple(teacher_full.shape)}  config={teacher_pkg['config']}")
 
+    # Cause text embeddings for InfoNCE (frozen, L2-normed, kept on GPU)
+    cause_text_embs = None
+    if args.use_infonce:
+        cause_pkg = torch.load(Path(args.case_db_dir) / "cause_text_embs.pt",
+                               weights_only=False, map_location="cpu")
+        cause_text_embs = cause_pkg["embeddings"].to(device)
+        cause_text_embs = F.normalize(cause_text_embs.float(), dim=-1)
+        V = cause_text_embs.size(0)
+        print(f"cause_text_embs: [{V}, {D}]  (InfoNCE on, weight={args.infonce_weight}, "
+              f"T={args.infonce_temp})")
+
     train_ds = CaseEncoderDataset(train_cases)
     collate = make_collate(D)
+
+    sampler = None
+    if args.miss_weight > 1.0:
+        # Hard-case mining: compute leave-one-out teacher miss count per train case
+        # using the precomputed candidate pool, then build a weighted sampler.
+        pool = torch.load(args.train_pool_path, weights_only=False,
+                          map_location="cpu")["case_pool"]
+        cause_embs_norm = F.normalize(
+            torch.load(Path(args.case_db_dir) / "cause_text_embs.pt",
+                       weights_only=False, map_location="cpu")["embeddings"].float(),
+            dim=-1,
+        ).to(device)
+
+        weights = torch.ones(len(train_ds), dtype=torch.float32)
+        n_hard = 0
+        for i in range(len(train_ds)):
+            gt_idx = train_cases[i]["cause_emb_indices"]
+            pool_idx = pool[i]["candidate_cause_indices"].tolist()
+            if not pool_idx or not gt_idx:
+                miss = len(gt_idx)
+            else:
+                gt_e = cause_embs_norm[
+                    torch.tensor(gt_idx, dtype=torch.long, device=device)]
+                pool_e = cause_embs_norm[
+                    torch.tensor(pool_idx, dtype=torch.long, device=device)]
+                cos = gt_e @ pool_e.T
+                miss = int((~(cos >= 0.95).any(dim=1)).sum().item())
+            if miss > 0:
+                n_hard += 1
+            weights[i] = 1.0 + args.miss_weight * miss
+        sampler = WeightedRandomSampler(
+            weights=weights, num_samples=len(train_ds), replacement=True,
+        )
+        print(f"[miss-weight] hard cases (miss>=1): {n_hard}/{len(train_ds)}  "
+              f"weight factor={args.miss_weight}  "
+              f"max_weight={weights.max():.1f}")
+
     loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         collate_fn=collate,
         num_workers=args.num_workers,
         drop_last=True,
@@ -280,6 +348,8 @@ def main():
     for epoch in range(args.epochs):
         encoder.train()
         epoch_loss = 0.0
+        epoch_loss_distill = 0.0
+        epoch_loss_infonce = 0.0
         n_batches = 0
         t0 = time.time()
         for batch in loader:
@@ -292,11 +362,27 @@ def main():
             teacher_block = teacher_full[case_ids][:, case_ids].to(device).float()
 
             if args.loss_type == "listwise_kl":
-                loss = listwise_kl_loss(z, teacher_block,
-                                        temp_target=args.temp_target,
-                                        temp_pred=args.temp_pred)
+                loss_distill = listwise_kl_loss(z, teacher_block,
+                                                temp_target=args.temp_target,
+                                                temp_pred=args.temp_pred)
             else:
-                loss = pairwise_mse_loss(z, teacher_block)
+                loss_distill = pairwise_mse_loss(z, teacher_block)
+
+            if args.use_infonce:
+                B = z.size(0)
+                V = cause_text_embs.size(0)
+                pos_mask = torch.zeros(B, V, dtype=torch.bool, device=device)
+                for i, cidxs in enumerate(batch["cause_indices"]):
+                    if cidxs:
+                        pos_mask[i, torch.tensor(cidxs, dtype=torch.long,
+                                                 device=device)] = True
+                loss_infonce = case_cause_infonce_loss(
+                    z, cause_text_embs, pos_mask, temp=args.infonce_temp,
+                )
+                loss = loss_distill + args.infonce_weight * loss_infonce
+            else:
+                loss_infonce = torch.tensor(0.0, device=device)
+                loss = loss_distill
 
             optim.zero_grad()
             loss.backward()
@@ -305,6 +391,8 @@ def main():
             sched.step()
 
             epoch_loss += loss.item()
+            epoch_loss_distill += loss_distill.item()
+            epoch_loss_infonce += loss_infonce.item()
             n_batches += 1
             global_step += 1
 
@@ -312,6 +400,8 @@ def main():
         epoch_dt = time.time() - t0
 
         log_row = {"epoch": epoch + 1, "train_loss": train_loss,
+                   "loss_distill": epoch_loss_distill / max(1, n_batches),
+                   "loss_infonce": epoch_loss_infonce / max(1, n_batches),
                    "lr": optim.param_groups[0]["lr"], "time_s": epoch_dt}
 
         if (epoch + 1) % args.eval_every_epochs == 0:

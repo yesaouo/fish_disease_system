@@ -340,3 +340,31 @@ def pairwise_mse_loss(
     eye = torch.eye(B, dtype=torch.bool, device=s_pred.device)
     valid = (~torch.isnan(s_teacher)) & (~eye)
     return F.mse_loss(s_pred[valid], s_teacher[valid])
+
+
+def case_cause_infonce_loss(
+    h_student: torch.Tensor,                # [B, D] L2-normed
+    cause_text_embs: torch.Tensor,          # [V, D] L2-normed (V = 56k)
+    pos_mask: torch.Tensor,                 # [B, V] bool, True = positive cause for anchor
+    temp: float = 0.07,
+) -> torch.Tensor:
+    """SupCon (L_out) multi-positive InfoNCE: case h_final aligned to GT causes.
+
+    Negatives are all causes that are NOT GT for the anchor (in-batch + full vocab).
+    Gives the encoder direct supervision the Phase-1 teacher never sees.
+    """
+    B = h_student.size(0)
+    device = h_student.device
+    logits = (h_student @ cause_text_embs.T) / temp              # [B, V]
+    pos_mask = pos_mask.to(device)
+
+    # L_out from SupCon: numerator = sum over positives; denominator = sum over all
+    pos_logits = logits.masked_fill(~pos_mask, float("-inf"))
+    pos_lse = torch.logsumexp(pos_logits, dim=-1)                # [B]
+    all_lse = torch.logsumexp(logits, dim=-1)                    # [B]
+
+    has_pos = pos_mask.any(dim=-1)
+    if not has_pos.any():
+        return logits.sum() * 0.0  # zero, but keeps graph
+    loss = -(pos_lse - all_lse)
+    return loss[has_pos].mean()

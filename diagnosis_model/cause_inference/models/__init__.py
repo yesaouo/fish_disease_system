@@ -8,6 +8,7 @@ from .mamba_encoder import (
     build_encoder,
     listwise_kl_loss,
     pairwise_mse_loss,
+    case_cause_infonce_loss,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "build_encoder",
     "listwise_kl_loss",
     "pairwise_mse_loss",
+    "case_cause_infonce_loss",
 ]

@@ -82,7 +82,7 @@ included as ablation showing VLM features are already saturated」
   --eval_every 2 --warmup_steps 200
 
 ================================================================================
-[4] Phase 3 — CEAH 訓練（論文主要結果）
+[4] Phase 3 — CEAH 訓練（論文主要結果之一）
 ================================================================================
 v3 best 配方：softmax attribution + multiplicative scoring + 無 sparsity penalty
             + text dropout 50% + 20 epochs
@@ -108,3 +108,58 @@ v3 best 配方：softmax attribution + multiplicative scoring + 無 sparsity pen
   last_ceah.pt    — 最終一個 epoch
   train_log.jsonl — per-epoch loss 與 eval 指標
   config.json     — hyperparams
+
+================================================================================
+[5] Phase 4 — Case encoder（單向量檢索，論文加速貢獻）
+================================================================================
+動機：Phase 1 hungarian 每 query 對 case_db 做 multi-vector + Hungarian
+匹配（~15 ms/q）。蒸餾成單一 cosine 後快 14×，且加上 case→cause text 的
+直接監督後微幅超越老師。
+
+最終選擇配方：DeepSets encoder + dual-target loss（listwise KL distillation
++ case-to-cause SupCon InfoNCE）。沿用 ceah 的 mamba3 conda env。
+
+注意：mamba_ssm 在這台機器需要 CC=/usr/bin/gcc-12（triton kernel JIT 編譯）。
+ENV=mamba3：/home/lab603/anaconda3/envs/mamba3/bin/python
+
+--------------------------------------------------------------------------------
+[5a] 建立 teacher score table（一次性，~3 分鐘）
+--------------------------------------------------------------------------------
+為 12780 個 train case 之間預算 full pairwise Phase 1 hungarian score，作為
+listwise KL distillation 的監督信號。
+輸出：teacher_train_train.pt（~312 MB fp16，gitignored）
+
+CC=/usr/bin/gcc-12 \
+/home/lab603/anaconda3/envs/mamba3/bin/python \
+  -m diagnosis_model.cause_inference.preprocessing.build_teacher_table \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --output_path diagnosis_model/cause_inference/outputs/case_db/teacher_train_train.pt \
+  --alpha_global 0.25 --beta_lesion 0.75 \
+  --lesion_match hungarian
+
+--------------------------------------------------------------------------------
+[5b] 訓練 DeepSets dual-target encoder（最終選擇，~10 分鐘）
+--------------------------------------------------------------------------------
+Loss = listwise_KL(student case-pair sim, teacher case-pair sim) at T=0.1
+     + 0.5 * SupCon(h_final, GT cause text embs) at T=0.07
+
+CC=/usr/bin/gcc-12 \
+/home/lab603/anaconda3/envs/mamba3/bin/python \
+  -m diagnosis_model.cause_inference.train_mamba_encoder \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --teacher_path diagnosis_model/cause_inference/outputs/case_db/teacher_train_train.pt \
+  --output_dir diagnosis_model/cause_inference/outputs/encoder_final \
+  --encoder_type deepsets \
+  --batch_size 256 --epochs 50 \
+  --temp_target 0.1 --temp_pred 0.1 \
+  --use_infonce --infonce_weight 0.5 --infonce_temp 0.07
+
+訓練輸出：
+  best_encoder.pt — best by valid naive R@10
+  last_encoder.pt
+  train_log.jsonl
+  config.json     — 含 encoder_type / dim / hyperparams
+
+備註：in-training 的 sem_R@10 用 case-to-case GT-intersection naive metric（為了
+省每個 epoch 跑全 Phase 1-aligned pipeline 的時間）。真實 Phase 1-aligned R@10
+要事後用 eval_phase1_aligned.py 評（見 inference.txt [I]）。

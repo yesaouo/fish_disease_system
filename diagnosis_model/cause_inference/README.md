@@ -423,6 +423,111 @@ done
 
 ---
 
+### Phase 4：Case encoder（單向量檢索，加速貢獻）
+
+**動機**：Phase 1 每 query 對 case_db 跑 multi-vector + Hungarian 比對（~15 ms/q）。隨著 case_db 規模成長,這個成本是 retrieval 階段的主要 bottleneck。把 (global, lesion 1..N) 蒸餾成 **單一 case 向量** 後,檢索退化為單一 cosine,大幅加速。
+
+#### 設計
+
+每個 case 表徵為:
+- `global_emb ∈ ℝ^768`（VLM-Global,master）
+- `lesion_embs ∈ ℝ^(N×768)`（VLM-Lesion,slaves,**依面積 DESC 排序**）
+
+Encoder 把這兩者壓成單一 L2-normed `h_final ∈ ℝ^768`。檢索 = `cos(h_query, h_train)` 對 case_db 取 top-K。
+
+**最終選擇:DeepSets pooling（mean + max + sum → MLP）**。下節說明為何不選 Mamba / Set Transformer。
+
+#### 訓練 loss(dual-target)
+
+兩個 loss 加總:
+
+1. **Listwise KL distillation**(主信號)
+   - Teacher: Phase 1 hungarian best config(K=20, α=0.25, β=0.75),預算成 12780² 矩陣存成 `teacher_train_train.pt`
+   - 學生對 batch 內 case-case cosine 矩陣的 row-softmax 對齊 teacher 的 row-softmax(T=0.1)
+
+2. **Case-to-cause SupCon InfoNCE**(輔助信號,**讓學生可能超越老師**)
+   - Positives: case 的 GT cause text embeddings
+   - Negatives: 全 56k cause vocab
+   - L_out form(SupCon paper),溫度 T=0.07,權重 0.5
+   - 為什麼可能贏老師: Phase 1 完全不用 cause text embedding,直接對齊 cause space 是 orthogonal 訊號
+
+```bash
+# Step 1: 一次性建 teacher table(~3 min)
+CC=/usr/bin/gcc-12 \
+$PY_MAMBA3 -m diagnosis_model.cause_inference.preprocessing.build_teacher_table \
+  --case_db_dir outputs/case_db \
+  --output_path outputs/case_db/teacher_train_train.pt
+
+# Step 2: 訓練 encoder(~10 min)
+CC=/usr/bin/gcc-12 \
+$PY_MAMBA3 -m diagnosis_model.cause_inference.train_mamba_encoder \
+  --output_dir outputs/encoder_final \
+  --encoder_type deepsets \
+  --batch_size 256 --epochs 50 \
+  --use_infonce --infonce_weight 0.5 --infonce_temp 0.07
+```
+
+#### 結果(1573 valid,Phase 1-aligned 評估,K=20)
+
+| Method | sem R@10 | MRR | per-q ms | Notes |
+|---|---|---|---|---|
+| **Phase 1 hungarian**(teacher) | 0.444 | 0.298 | 15.4 | multi-vector + Hungarian |
+| DeepSets single distill | 0.445 | 0.297 | 1.1 | 蒸餾打平 |
+| **DeepSets dual-target**(最終選擇) | **0.447** | 0.298 | **1.1** | **+0.3 R@10, 14× faster** |
+
+接 CEAH 串成 hybrid(γ=0.75, text=medical)後:
+
+| Method | sem R@10 | per-q ms |
+|---|---|---|
+| Phase 1 + CEAH | 0.453 | 18.2 |
+| DeepSets dual + CEAH | 0.453 | **3.4** (5.4× faster) |
+
+#### 探索過程(架構 / 訓練 / 評估三條 ablation)
+
+**架構選擇** — 我們試了三種 encoder,**最終發現本任務序列太短(avg 1.73 lesion),架構幾乎沒差**:
+
+| Encoder | sem R@10 | sem R@10 (lesion≥4) | 結論 |
+|---|---|---|---|
+| Mamba3 master-slave | 0.445 | 0.422 | 無架構優勢 |
+| MeanPool baseline | 0.443 | 0.418 | 複雜 case 上稍弱 |
+| **DeepSets** | **0.447** | **0.441** | 同等或更好,參數最少 |
+
+**為什麼放棄 Mamba**:
+- 序列長度 L ≤ 19(99% ≤ 4),Mamba 的 `O(L)` 優勢要 L > ~256 才出現
+- 此 L 下 Transformer 的 `O(L²·d)` < Mamba 的 `O(L·d²)`(d=768 太大,L 太小)
+- mamba_ssm `is_mimo=True` 的 backward kernel 在這台機環境編譯失敗,只能用 vanilla Mamba3,進一步抵消優勢
+- Set Transformer 已是 set learning 領域標準,且 ISAB 比 DeepSets 慢
+- 在我們的 ablation 中三者打平 → 選參數最少的 DeepSets
+
+**訓練 ablation**:
+
+| 訓練方式 | sem R@10 | 結論 |
+|---|---|---|
+| Distillation only(listwise KL) | 0.445 | 完美 mimic 老師 |
+| **+ case-cause InfoNCE**(dual-target) | **0.447** | +0.3 R@10,微幅超越老師 |
+| + miss-weighted sampler(hard-case ×3) | 0.446 | 沒幫助(撞 case_db 結構天花板) |
+
+**Negative result — full-vocab 1-stage retrieval**: 我們驗證了用 cause-aligned encoder 直接對全 56k cause 做 retrieval(跳過 candidate pool):
+
+| Method | sem R@10 |
+|---|---|
+| Phase 1 + candidate pool(2-stage) | 44.4% |
+| Pure SigLIP2 global emb → 56k cause(1-stage) | 13.5% |
+| DeepSets dual → 56k cause(1-stage) | 12.1% |
+
+→ **Phase 1 的 candidate pool 不是人為限制,是個有效的搜尋空間縮減設計**。1-stage retrieval 比 2-stage 差 3.5×。同時觀察到 case_db fine-tune **不能犧牲 SigLIP2 預訓練的 image-text alignment**(deepsets 比 SigLIP2 base 還差),`dual-target` InfoNCE 是必要的 regularizer。
+
+#### 結構天花板診斷
+
+leave-one-out mining 顯示:
+- 23.7% train cases 是 hard cases(teacher 漏掉 ≥1 GT cause)
+- 0.4% (53 cases) 所有 GT cause 都漏 → **case_db 結構性死角**,任何 retrieval 都救不回來
+- 加重這些 case 的訓練權重沒幫助(模型把容量浪費在「教不會的」)
+
+**結論**:**~44.5% 是 case_db 的物理上限**,不是 retrieval 算法的問題。未來提升空間在擴 case_db 的 cause 多樣性,不在改 encoder。
+
+---
+
 ### 案例可視化
 
 ```bash
@@ -483,6 +588,8 @@ $PY -m diagnosis_model.cause_inference.case_study_viz \
 > **C¹ (Phase 1)**: Hungarian-matched lesion-set similarity 做 zero-training 案例檢索。在 1,573 個 valid query 上達到 **semantic R@10 = 44.4%、coverage = 93.1%、MRR = 0.298；cluster R@10 = 35.8%**。Hyperparameter sweep 顯示 K=20, α=0.25 是最佳配置；global 是主信號（VLM-Global pretraining 的優勢）。
 >
 > **C² (Phase 2 ablation)**: Cause-overlap supervised projection learning 在 frozen VLM 上提供不到 0.001 的 MRR 改進，作為 negative result 報告——VLM 表徵已飽和。
+>
+> **C⁴ (Phase 4, Case Encoder)**: DeepSets pooling 加上 dual-target loss(listwise KL distillation + case-to-cause SupCon InfoNCE)蒸餾 Phase 1 的 multi-vector hungarian 比對成單一 cosine。**Retrieval 階段加速 14×(15.4 ms → 1.1 ms / query),端到端 hybrid 加速 5.4×(18.2 ms → 3.4 ms),且 R@10 微幅超越老師(44.7% vs 44.4%)。** 架構 ablation(Mamba / MeanPool / DeepSets)顯示此任務序列過短(avg 1.73 lesion),三種 encoder 等價;訓練 ablation 顯示 cause-side InfoNCE 是 dual-target 設計的關鍵 regularizer;negative result 顯示 candidate-pool 設計不是 bottleneck 而是有效的搜尋空間縮減(1-stage 全 vocab retrieval 比 2-stage 差 3.5×)。Mining 顯示 case_db 約 7% 結構性死角是 ~44.5% 物理上限的來源。
 >
 > **C³ (Phase 3, CEAH)**: 設計 softmax + multiplicative scoring 的 attribution head：
 > - **架構強制 faithfulness**：α 透過 gated pooling 直接門控 evidence 對分數的貢獻

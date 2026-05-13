@@ -181,6 +181,57 @@ LLM cluster 是論文預設；HDBSCAN coarse 當對照。
   → LLM clustering 在 absolute 指標和 v3 vs random 倍率上都最強
 
 ================================================================================
+[I] Case encoder retrieval（替代 Phase 1，論文加速貢獻）
+================================================================================
+最終選擇：DeepSets encoder + dual-target distillation（見 training.txt [5b]）。
+把 Phase 1 的 multi-vector hungarian 比對壓成單一 cosine，加速 14×、品質
+微幅超越老師。CEAH 下游接得起來，不需要任何改動。
+
+ENV：mamba3, CC=/usr/bin/gcc-12
+
+--------------------------------------------------------------------------------
+[I-1] 標準 Phase-1-aligned 評估（最常用）
+--------------------------------------------------------------------------------
+比較任何 encoder vs Phase 1 hungarian，沿用同一條 candidate-pool aggregation
++ semantic-rank metric（純檢索評估，無 CEAH）。
+
+CC=/usr/bin/gcc-12 \
+/home/lab603/anaconda3/envs/mamba3/bin/python \
+  -m diagnosis_model.cause_inference.eval_phase1_aligned \
+  --include_phase1 \
+  --checkpoints \
+      deepsets_dual=diagnosis_model/cause_inference/outputs/encoder_final/best_encoder.pt \
+  --top_k_cases 20 \
+  --semantic_threshold 0.95
+
+論文報告數字（1573 valid，K=20，semantic_threshold=0.95）：
+  phase1-hungarian:    sem_R@10 = 44.4%   |  15.4 ms/query  (teacher)
+  deepsets_dual:       sem_R@10 = 44.7%   |   1.1 ms/query  ( 14× faster )
+  → 品質微幅超越（+0.3 R@10）且 retrieval 加速 14×
+
+可選：--min_query_lesions N 評估 lesion-rich subset（N=2/3/4）。
+
+--------------------------------------------------------------------------------
+[I-2] 端到端 hybrid（case encoder + CEAH）
+--------------------------------------------------------------------------------
+把 case encoder 嵌進完整 hybrid pipeline，驗證跟 CEAH 串接無痛。
+
+CC=/usr/bin/gcc-12 \
+/home/lab603/anaconda3/envs/mamba3/bin/python \
+  -m diagnosis_model.cause_inference.eval_hybrid_aligned \
+  --include_phase1 \
+  --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt \
+  --checkpoints \
+      deepsets_dual=diagnosis_model/cause_inference/outputs/encoder_final/best_encoder.pt \
+  --gammas 0.0 0.5 0.75 1.0 \
+  --text_kind medical
+
+報告數字（γ=0.75, text=medical）：
+  phase1+ceah:        sem_R@10 = 45.3%   |  18.2 ms/query
+  deepsets_dual+ceah: sem_R@10 = 45.3%   |   3.4 ms/query  ( 5.4× faster )
+  → 端到端速度從 18.2 ms 降到 3.4 ms，品質完全等價
+
+================================================================================
 [H] 端到端推論（給單張新影像）
 ================================================================================
 完整 inference flow（給一張 query 圖）：
@@ -188,7 +239,9 @@ LLM cluster 是論文預設；HDBSCAN coarse 當對照。
 Step 1: RF-DETR 偵測病灶（已實作於 detection 模組）
 Step 2: 對偵測到的每個 lesion crop，run VLM-Lesion fusion 取 lesion embedding
 Step 3: 對全圖 run VLM-Global 取 global embedding
-Step 4: 從 case_db 用 Phase 1 公式檢索 top-K cases（K=20）
+Step 4: 用 case encoder 取 h_final（lesions 依面積大→小排序輸入），對 case_db
+        所有 h_final 做 cosine 取 top-K cases（K=20）。退路：Phase 1 hungarian
+        公式（[A]），品質等價速度慢 14×。
 Step 5: 對 candidate pool 中每個 cause run CEAH 得 score + α
 Step 6: γ=0.75 hybrid 排序
 Step 7: Diversification（cosine threshold 0.95）
