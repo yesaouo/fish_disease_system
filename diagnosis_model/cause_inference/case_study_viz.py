@@ -1,4 +1,4 @@
-"""Render Phase 3 case study figures: fish image + lesion bboxes color-coded by α
+"""Render Phase 2 case study figures: fish image + lesion bboxes color-coded by α
 plus a text panel with GT cause and CEAH top-1 attribution breakdown.
 
 Usage:

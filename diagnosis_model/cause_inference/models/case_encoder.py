@@ -1,4 +1,4 @@
-"""Case encoder for Phase 4 retrieval distillation (DeepSets / MeanPool).
+"""Case encoder for Phase 3 retrieval distillation (DeepSets / MeanPool).
 
 Each case is represented by:
     global_emb         (1 x D, master)
@@ -12,7 +12,7 @@ Two encoder variants live here:
     'mean'        - mean-pooled (W_g g) + (W_l l_i) baseline
     'deepsets'    - mean+max+sum -> MLP baseline (set-aware, no sequence)
 
-The production choice is 'deepsets' (see README Phase 4). A third variant
+The production choice is 'deepsets' (see README Phase 3). A third variant
 ('mamba', master-slave Mamba3 stack) lives in
 ``diagnosis_model.cause_inference.mamba_ablation.mamba_encoder``; it is kept
 as an architecture ablation and requires the ``mamba3`` conda env (mamba_ssm

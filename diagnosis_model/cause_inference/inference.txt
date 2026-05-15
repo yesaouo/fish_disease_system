@@ -59,7 +59,7 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
     確認 Phase 1 是 zero-shot vision-language retrieval 範式，不依賴 in-domain 微調。
 
 警告：把這個 raw case_db 拿去訓 CEAH 會 faithfulness 反轉（見 [C-ablation]）。
-Phase 3 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
+Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
 
 ================================================================================
 [B] CEAH v3 hybrid retrieval（論文主要結果）
@@ -117,7 +117,7 @@ Phase 3 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
   → multi-lesion case 下，lesion 是 load-bearing 的解釋來源
 
 ================================================================================
-[C-ablation] Phase 3 VLM dependency（為什麼 CEAH 必須用 fine-tuned VLM-Lesion）
+[C-ablation] Phase 2 VLM dependency（為什麼 CEAH 必須用 fine-tuned VLM-Lesion）
 ================================================================================
 論文 ablation：把 raw SigLIP2 case_db（見 training.txt [0-raw]）拿去訓 CEAH，
 然後跑 faithfulness eval。驗證 CEAH 對 fusion-trained lesion encoder 的必要性。
@@ -158,7 +158,7 @@ Phase 3 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
     分數反而上升 — 即 lesion 內容不是有效訊號，違反 architecture-enforced
     lesion-grounded explainability 的設計目標。
   → 結論：retrieval 可以 zero-shot（Phase 1），但 attribution 必須有 lesion-
-    specialized 視覺特徵（Phase 3 必須使用 fine-tuned VLM-Lesion + fusion）。
+    specialized 視覺特徵（Phase 2 必須使用 fine-tuned VLM-Lesion + fusion）。
 
 ================================================================================
 [D] N=1/2/3+ lesion bucket 分析（論文 ablation）
@@ -303,7 +303,7 @@ CC=/usr/bin/gcc-12）。
   → 端到端速度從 18.2 ms 降到 3.4 ms，品質完全等價
 
 ================================================================================
-[I-ablation] Phase 4 VLM dependency（raw case_db 上的 distillation）
+[I-ablation] Phase 3 VLM dependency（raw case_db 上的 distillation）
 ================================================================================
 論文 ablation：dual-target distillation 是否依賴 in-domain VLM finetune？
 需先建好 outputs/case_db_raw/ 與 outputs/encoder_raw/（見 training.txt [0-raw] / [5-raw]）。
@@ -324,25 +324,233 @@ CC=/usr/bin/gcc-12）。
   → 跟 fine-tuned case_db 上的行為一致（student 持平甚至略勝 teacher、14× 加速）。
     distillation 不依賴 in-domain VLM finetune，再次支持 Phase 1 retrieval 屬於
     zero-shot vision-language 範式的論點。
-  → 跟 [C-ablation] 對照：retrieval-side（Phase 1 + Phase 4）對 VLM training 不敏感；
-    attribution-side（Phase 3 CEAH）必須 fine-tuned VLM-Lesion fusion。
+  → 跟 [C-ablation] 對照：retrieval-side（Phase 1 + Phase 3）對 VLM training 不敏感；
+    attribution-side（Phase 2 CEAH）必須 fine-tuned VLM-Lesion fusion。
 
 ================================================================================
-[H] 端到端推論（給單張新影像）
+[J] CRR-DeepRVQ — 壓縮 case bank + 殘差 reranker（論文 method-level 貢獻）
 ================================================================================
-完整 inference flow（給一張 query 圖）：
+Phase 4 訓練見 training.txt [6]。本節提供：
+  J-1 純壓縮 sanity（dense vs RVQ-only）
+  J-2 RVQ 壓縮率 sweep（找出 quality 開始掉的 (M,K)）
+  J-3 雙 regime 評估（top_k=20 production vs top_k=1 ANN-style）
+  J-4 reranker 加進去後的完整對照（dense / RVQ-only / Light / Full-analytic）
+  J-5 規模 benchmark（latency / throughput / memory at N=12K..1M）
 
-Step 1: RF-DETR 偵測病灶（已實作於 detection 模組）
-Step 2: 對偵測到的每個 lesion crop，run VLM-Lesion fusion 取 lesion embedding
-Step 3: 對全圖 run VLM-Global 取 global embedding
-Step 4: 用 case encoder 取 h_final（lesions 依面積大→小排序輸入），對 case_db
-        所有 h_final 做 cosine 取 top-K cases（K=20）。退路：Phase 1 hungarian
-        公式（[A]），品質等價速度慢 14×。
-Step 5: 對 candidate pool 中每個 cause run CEAH 得 score + α
-Step 6: γ=0.75 hybrid 排序
-Step 7: Diversification（cosine threshold 0.95）
-Step 8: 輸出 top-N 病因 + 每個 cause 的 α breakdown（global / text / lesion）
+雙 regime 的設計動機：Phase 1 的 cause-aggregation buffer（top_k_cases=20）吸收
+所有 RVQ ranking 噪聲，所以 RVQ-only 在 production 設定下跟 dense 完全持平
+（甚至 M=1 K=16 把 12780 cases 壓成 16 個 prototype 都對 R@10 沒影響）。
+要 expose reranker 的價值必須拆掉 buffer：top_k_cases=1（單一 case 的 cause set
+直接當預測），這也是標準 ANN benchmark 的設定。
+
+--------------------------------------------------------------------------------
+[J-1] Sanity check — dense vs RVQ-only（~30 秒）
+--------------------------------------------------------------------------------
+驗證 RVQ 壓縮對 retrieval quality 的影響。在 production regime (top_k=20) 下
+RVQ-only 跟 dense 應該打平。
+
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.rvq_rerank.eval_sanity \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/encoder_final/best_encoder.pt \
+  --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
+  --rvq_dir diagnosis_model/cause_inference/outputs/rvq_rerank/rvq_M4_K256 \
+  --top_k_cases 20 --semantic_threshold 0.95 \
+  --output_json diagnosis_model/cause_inference/outputs/rvq_rerank/rvq_M4_K256/sanity_report.json
+
+論文報告數字（M=4 K=256, top_k=20, sem_thr=0.95, 1573 valid）：
+  dense       sem_R@1=22.3%  R@10=44.7%  R@100=92.9%  MRR=0.298
+  rvq_only    sem_R@1=21.9%  R@10=45.5%  R@100=92.5%  MRR=0.297
+  Δ R@10 = +0.76 pp（noise）；cos(z, ẑ) mean=0.977，384× memory compression
+
+--------------------------------------------------------------------------------
+[J-2] RVQ Pareto sweep — 12 個 (M, K) 配置 × 雙 regime（~2 分鐘）
+--------------------------------------------------------------------------------
+跨壓縮率掃 production regime 量化 aggregation buffer 強度，並另跑 stress
+regime（top_k=1 / 5、sem_thr=0.99）找 RVQ 開始傷害的點。
+
+# 12-cell Pareto sweep（production regime only）
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.rvq_rerank.run_sweep \
+  --M_list 1 2 4 8 --K_list 16 64 256
+
+# 雙 regime 對照（aggregation buffer 拿掉 vs 留著）
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.rvq_rerank.eval_harder \
+  --rvq_configs 4,256 2,64 1,16 \
+  --eval_configs 20,0.95 5,0.95 1,0.95 20,0.99 5,0.99
+
+論文報告數字（1573 valid）：
+  Regime A (top_k=20)：
+    所有 12 個 RVQ config R@10 Δ 全 ≤ ±1.7 pp（SE=1.26 pp，全部 noise）
+    M=1 K=16（6144× compression, 12780 cases → 16 prototypes）R@10 +0.03pp
+    R@100 才看出退化：M=1 K=16 −6.0 pp
+    結論：cause-aggregation pool 吸收 ranking 噪聲，retrieval 在此 regime
+          對 RVQ noise 幾乎免疫。
+
+  Regime B (top_k=1, no aggregation buffer)：
+    M=4 K=256 (768×):   dense 53.7%  rvq_only 50.6%  Δ = −3.1 pp
+    M=2 K=64  (2048×):  dense 53.7%  rvq_only 45.9%  Δ = −7.8 pp
+    M=1 K=16  (6144×):  dense 53.7%  rvq_only 38.2%  Δ = −15.5 pp
+    結論：buffer 消失後 RVQ 損害直接顯露，為 reranker 留出可挽回空間。
+
+mean_pool_size 在 top_k=20 / 5 / 1 分別約 87 / 22 / 4，量化 buffer 大小。
+
+輸出：outputs/rvq_rerank/sweep_report.json、harder_eval_report.json
+
+--------------------------------------------------------------------------------
+[J-3] 完整 final eval — 4 method × 3 RVQ × 雙 regime（~1 分鐘）
+--------------------------------------------------------------------------------
+集中報 dense / rvq_only / light_reranker / full_analytic（所有訓好的 reranker
++ analytic upper bound）。reranker checkpoint 必須事先訓好（training.txt [6c]）。
+
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.rvq_rerank.eval_final \
+  --configs 4,256,reranker_M4_K256_light 2,64,reranker_M2_K64_light 1,16,reranker_M1_K16_light \
+  --eval_configs 20,0.95 1,0.95 \
+  --K_top 50
+
+論文 Regime B 主表（top_k_cases=1, sem_thr=0.95, 1573 valid）：
+  Method                   Comp×   R@10    Δ vs dense  Gap recovered
+  Dense fp32               1×      0.537   —           —
+  RVQ-only  M=4 K=256       768×   0.506   −3.1 pp     —
+  + Light reranker          768×   0.518   −1.9 pp     39%
+  + Full analytic           768×   0.537   +0.0 pp     100%
+  RVQ-only  M=2 K=64       2048×   0.463   −7.4 pp     —
+  + Light reranker         2048×   0.500   −3.7 pp     50%
+  + Full analytic          2048×   0.515   −2.3 pp     69%
+  RVQ-only  M=1 K=16       6144×   0.372   −16.5 pp    —
+  + Light reranker         6144×   0.462   −7.6 pp     54%
+  + Full analytic          6144×   0.458   −7.9 pp     52% ← 被 first-stage 限制
+
+  → Light reranker 在所有壓縮率穩定回收 39–54% 的 gap（高壓縮下絕對 pp 越多）
+  → Full analytic 在 M=4 K=256 完全回補到 dense；M=1 K=16 saturate 在 0.458
+    因 top_K_rerank=50 對 16-prototype 不夠—— first-stage 包含 GT case 的機率
+    本身就低，dense rerank 也救不回
+  → M=1 K=16 + Light 達 0.462，比 M=4 K=256 純 RVQ 的 0.506 只差 4 pp，
+    但壓縮 8× 更多——Pareto frontier 被 reranker 推外
+
+論文 Regime A 持平表（top_k_cases=20）：所有 method Δ@10 全在 ±1 pp 內，
+production aggregation pipeline 對壓縮 + reranker 都無感。
+
+輸出：outputs/rvq_rerank/final_eval_report.json
+
+--------------------------------------------------------------------------------
+[J-4] Scale benchmark — latency / memory @ N ∈ {12K..1M}（~3 分鐘）
+--------------------------------------------------------------------------------
+合成 N 個 z（從 z_train 抽樣 + 小 Gaussian noise + L2-renormalize），用既有
+codebook 量化（不重 fit），測四個 method 的 per-query latency 與 throughput。
+不報 recall（合成 case 沒 GT），純 inference benchmark。
+
+/home/lab603/anaconda3/envs/SDM/bin/python \
+  -m diagnosis_model.cause_inference.rvq_rerank.benchmark_scale \
+  --rvq_dir diagnosis_model/cause_inference/outputs/rvq_rerank/rvq_M4_K256 \
+  --light_reranker_ckpt diagnosis_model/cause_inference/outputs/rvq_rerank/reranker_M4_K256_light/best.pt \
+  --N_list 12780 50000 100000 500000 1000000 \
+  --batch_sizes 1 32 \
+  --K_top_rerank 50 --K_top_final 20
+
+論文報告數字（M=4 K=256, 32 GB GPU, bs=1, latency p50）：
+  N             dense       rvq_only    rvq_light   rvq_full_analytic
+  12,780        0.08 ms     0.10 ms     0.56 ms     0.13 ms
+  100,000       0.56 ms     0.13 ms     0.60 ms     0.16 ms
+  500,000       2.59 ms     0.15 ms     0.62 ms     0.18 ms
+  1,000,000     5.15 ms     0.19 ms     0.59 ms     0.22 ms
+
+  → dense 線性成長（O(N)）：1M 已達 5 ms/q
+  → rvq_only 幾乎平坦：1M 仍 0.19 ms/q（27× 比 dense 快）
+  → rvq_light 約 0.6 ms 常數開銷（reranker forward 主導）：1M 仍 9× 比 dense 快
+  → rvq_full_analytic 跟 rvq_only 同步（top-K=50 dense rerank cost 微小）
+
+Memory @ N=1M：
+  Method               Index size      Compression vs fp16 dense
+  dense fp16           1,536 MB        1×
+  rvq_only (M=4)       4 MB            384×
+  rvq_light            17 MB (codes + 13 MB reranker)   90×
+  rvq_full_analytic    1,540 MB (需 z bank 給 rerank)   1× (memory)
+
+論文三層 deployment Pareto：
+  Memory + compute 緊  → rvq_light:          17 MB, 0.59 ms, R@10 0.518 (Regime B)
+  Compute 緊但 memory  → rvq_full_analytic: 1.5 GB, 0.22 ms, R@10 0.537 (=dense)
+  Memory 緊但 quality  → rvq_only:           4 MB,  0.19 ms, R@10 0.506
+
+輸出：outputs/rvq_rerank/benchmark_scale.json
+
+================================================================================
+[H] 端到端推論（cascade production flow）
+================================================================================
+Cascade = coarse-to-fine 二階段：
+  Stage 1 (coarse, zero-shot):  raw SigLIP2  → case_db_raw   → top-K cases
+  Stage 2 (fine, fine-tuned):   VLM-Fusion   → case_db       → cause + α
+
+Index 雙存：
+  outputs/case_db_raw/   raw SigLIP2 features        ← Stage 1 (retrieval)
+  outputs/case_db/       fine-tuned VLM features     ← Stage 2 (attribution)
+  兩者共享 case_id / image_id / causes / GT cause_emb_indices，差別只在 image
+  feature 是否經過 VLM-Fusion / VLM-Global fine-tune。
+
+Query-time inference flow（單張新影像）：
+
+Step 1  [Detection]   RF-DETR 偵測病灶 bbox
+
+Step 2  [Encode raw query features for Stage 1]
+        對全圖 + 每個 lesion crop，run raw `google/siglip2-base-patch16-224`：
+          raw_global   = raw_siglip2.get_image_features(whole_image)
+          raw_lesion_i = raw_siglip2.get_image_features(lesion_crop_i)
+        L2-normalize all.
+
+Step 3  [Encode fine-tuned query features for Stage 2]
+        對全圖 run VLM-Global（overall fine-tune）：
+          fused_global = vlm_global.get_image_features(whole_image)
+        對每個 lesion crop run VLM-Lesion (LocalGlobalFusionWrapper)：
+          fused_lesion_i = vlm_lesion.forward_image(lesion_crop_i, whole_image)
+                         = local_feat + gate * fusion_linear([local_feat, global_feat])
+        L2-normalize all.
+
+        部署優化：若記憶體允許，可只 forward base_model 一次取出 base SigLIP2
+        features（這就是 raw features），再透過 LocalGlobalFusionWrapper 計算
+        fused features，省一次 base forward。但 VLM-Global 是 full fine-tune（不
+        是 wrapper），所以 global 端 raw vs fused 仍需兩次 forward。
+
+Step 4  [Stage 1 — coarse retrieval]
+        用 Phase 3 encoder_raw 把 (raw_global, raw_lesions sorted by area DESC)
+        編成 h_query ∈ R^768，對 case_db_raw 取 top-K cases (K=20):
+          top_K = top_K_argmax_j  cos(h_query, h_case_j)    [encoder_raw]
+        Optional RVQ acceleration: 用 Phase 4 codebook + Light reranker (1M 規模 0.6 ms/q).
+        Optional teacher 退路: Phase 1 hungarian on case_db_raw, 品質等價 14× 慢.
+
+Step 5  [Build candidate cause pool]
+        candidate_causes = union(case_db[i].causes for i in top_K)
+        (~87 unique causes per query)
+
+Step 6  [Stage 2 — fine rerank]
+        對每個 candidate_cause c, 從 case_db 拿出 query 的 fine-tuned features
+        (fused_global, fused_lesions) 跑 CEAH:
+          score_c, alpha_c = CEAH(fused_global, text_emb_or_None,
+                                  fused_lesions, cause_text_emb=c)
+        其中 alpha_c ∈ R^(2+N) 是 softmax over (global, text, lesion_1..N).
+
+Step 7  [Diversification, optional]
+        如果要展示多元化 top-N，做 cosine ≥ 0.95 suppress（不影響 R@K metric）.
+
+Step 8  [Output]
+        Top-N causes ranked by score_c, each with α breakdown
+        (global / text / lesion_i) for explainability.
 
 實作可參考：
   diagnosis_model/cause_inference/eval_ceah.py 的 evaluate_one_query()
-  + 加上 RF-DETR 偵測與 VLM 編碼的前處理層
+    — Step 5–8 的範本，但需把 retrieval 階段（Phase 1 hungarian）換成
+      Phase 3 encoder_raw + case_db_raw.
+  demo/app_gradio.py
+    — 目前仍走 unified fine-tuned pipeline（單一 VLM 路徑、γ scoring）；
+      要 cascade-ify 須加 raw SigLIP2 loader + case_db_raw + encoder_raw 載入.
+
+注意：
+  - **γ hybrid 在 cascade 下不再使用**。Cascade ≡ γ=0（純 CEAH for fine stage），
+    這也是 γ-scan 中 sem R@10 + cluster R@10 最強的點（46.8% / 39.8% vs γ=0.75
+    的 45.3% / 37.0%）。如果要對照 hybrid γ scan 看 contribution breakdown，
+    用 [B] CEAH eval 的 --gammas 0.0 0.5 0.75 1.0 sweep.
+  - Coarse stage 對 fine-tuned 跟 raw case_db 都 work（ablation 在 [A-ablation]
+    / [I-ablation] 已驗證）；production 選 raw 是因為它 +1.2 pp R@10 且支持
+    paper 的 zero-shot vision-language retrieval claim.
+  - Fine stage 對 VLM-Fusion 是 architecturally required：raw case_db 上重訓
+    CEAH 會 faithfulness 反轉（[C-ablation]）.

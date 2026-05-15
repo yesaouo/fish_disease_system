@@ -1,12 +1,36 @@
-"""End-to-end Gradio demo for the FaCE-R fish disease pipeline.
+"""End-to-end Gradio demo for the FaCE-R fish disease pipeline (cascade).
+
+Cascade architecture (production):
+  Stage 1 (coarse, zero-shot) : raw frozen SigLIP2 → case_db_raw → top-K cases
+  Stage 2 (fine, fine-tuned)  : VLM-Fusion + CEAH on top-K       → cause + α
+
+Each query is forwarded through TWO encoder paths:
+  raw_global/lesion   ←  google/siglip2-base-patch16-224         (Stage 1 input)
+  fused_global/lesion ←  VLM-Global + VLM-Lesion(fusion wrapper) (Stage 2 input)
+
+Stage 1 retrieval scores against case_db_raw stacks; the resulting top-K case
+indices map (by shared case_id ordering) to case_db's fine-tuned cause pool
+which feeds CEAH at Stage 2. See `inference.txt` [H] for the full cascade
+spec, README "Cascade architecture & final results" for paper numbers.
+
+Cascade is pure (no γ knob): coarse stage selects top-K cases via Phase 1
+hungarian on raw features; fine stage ranks the candidate causes by CEAH
+score alone. The historic γ-hybrid scoring (γ * Phase1 + (1−γ) * CEAH) is
+intentionally removed from this demo — γ=0 (pure CEAH on the fine stage)
+is the strongest γ-scan point (sem R@10 = 46.8%, cluster R@10 = 39.8%)
+and the cleanest cascade interpretation. The γ sweep is still available
+in `diagnosis_model/cause_inference/eval_ceah.py` for ablation tables.
 
 Stages
   1. RF-DETR — detect lesion bboxes (single class: ABNORMAL)
-  2. VLM-Lesion (fusion) — classify each lesion against symptoms.json captions
-                          + gradient-based heatmap on the global image
-  3. VLM-Global — encode whole-image and optional overall text description
-  4. FaCE-R Phase 1 + CEAH — retrieve top-K cases, score candidate causes,
-                              return top-N causes with α (global / text / per-lesion)
+  2. Raw SigLIP2  → raw_global, raw_lesion features              (cascade Stage 1)
+     VLM-Lesion   → fused_lesion features (LocalGlobalFusion)    (cascade Stage 2)
+     VLM-Global   → fused_global feature                          (cascade Stage 2)
+     VLM-Lesion text tower also classifies each lesion against symptoms.json +
+     produces a grad-based heatmap on the global image.
+  3. Phase 1 hungarian retrieval on case_db_raw → top-K cases
+     CEAH on those top-K's candidate cause pool with fused query features
+  4. Return top-N causes with α (global / text / per-lesion).
 
 Run from repo root:
   /home/lab603/anaconda3/envs/SDM/bin/python demo/app_gradio.py
@@ -59,10 +83,14 @@ from diagnosis_model.cause_inference.phase1_baseline import (  # noqa: E402
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 RFDETR_CKPT     = REPO_ROOT / "diagnosis_model/detection/outputs/rfdetr/checkpoint_best_total.pth"
+# Fine-tuned VLMs: drive CEAH (fine stage, attribution).
 VLM_GLOBAL_DIR  = REPO_ROOT / "diagnosis_model/vl_classifier/outputs/siglip2_base_patch16_224_overall_multipos_zh"
 VLM_LESION_DIR  = REPO_ROOT / "diagnosis_model/vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh"
+# Raw frozen SigLIP2: drives coarse retrieval (Stage 1, zero-shot).
+RAW_SIGLIP_NAME = "google/siglip2-base-patch16-224"
 CEAH_CKPT       = REPO_ROOT / "diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt"
 CASE_DB_DIR     = REPO_ROOT / "diagnosis_model/cause_inference/outputs/case_db"
+CASE_DB_RAW_DIR = REPO_ROOT / "diagnosis_model/cause_inference/outputs/case_db_raw"
 CLUSTER_JSON    = REPO_ROOT / "diagnosis_model/cause_inference/outputs/cause_clusters_llm.json"
 SYMPTOMS_JSON   = REPO_ROOT / "data/raw/symptoms.json"
 TRAIN_IMG_ROOT  = REPO_ROOT / "data/detection/coco/_merged/train"
@@ -85,19 +113,28 @@ def _font(size: int = 12) -> FontProperties:
 
 class State:
     rfdetr = None
+    # Fine-tuned VLMs (Stage 2: attribution via CEAH)
     vlm_global = None
     vlm_global_proc = None
     vlm_lesion = None
     vlm_lesion_proc = None
+    # Raw frozen SigLIP2 (Stage 1: coarse retrieval, cascade production)
+    raw_siglip = None
+    raw_siglip_proc = None
     ceah = None
     train_cases = None
     valid_cases = None
     cause_table_embs = None
     cause_texts = None
     cluster_id_array = None
+    # Fine-tuned feature stacks (Stage 2 candidate scoring)
     train_global_stack = None
     train_lesion_stack = None
     train_offsets = None
+    # Raw feature stacks from case_db_raw (Stage 1 retrieval)
+    train_global_stack_raw = None
+    train_lesion_stack_raw = None
+    train_offsets_raw = None
     in_dim = None
     # symptom classification
     sym_text_feats = None       # [n_sym, D] L2-normalized in VLM-Lesion space
@@ -191,16 +228,21 @@ def load_all():
     State.rfdetr = RFDETRMedium(pretrain_weights=str(RFDETR_CKPT), num_classes=1)
     State.rfdetr.optimize_for_inference(compile=False)
 
-    print(f"[load] VLM-Global: {VLM_GLOBAL_DIR}")
+    print(f"[load] VLM-Global (fine-tuned, Stage 2): {VLM_GLOBAL_DIR}")
     State.vlm_global, State.vlm_global_proc = _load_vlm(str(VLM_GLOBAL_DIR), force_fusion=False)
     if State.vlm_global.is_wrapper:
         raise RuntimeError("VLM-Global unexpectedly loaded as fusion wrapper")
-    print(f"[load] VLM-Lesion: {VLM_LESION_DIR}")
+    print(f"[load] VLM-Lesion (fine-tuned + fusion, Stage 2): {VLM_LESION_DIR}")
     State.vlm_lesion, State.vlm_lesion_proc = _load_vlm(str(VLM_LESION_DIR), force_fusion=True)
     if not State.vlm_lesion.is_wrapper:
         raise RuntimeError("VLM-Lesion failed to load as fusion wrapper")
 
-    print(f"[load] case_db: {CASE_DB_DIR}")
+    print(f"[load] raw SigLIP2 (frozen, Stage 1): {RAW_SIGLIP_NAME}")
+    from transformers import AutoModel, AutoProcessor
+    State.raw_siglip = AutoModel.from_pretrained(RAW_SIGLIP_NAME).to(DEVICE).eval()
+    State.raw_siglip_proc = AutoProcessor.from_pretrained(RAW_SIGLIP_NAME)
+
+    print(f"[load] case_db (fine-tuned features): {CASE_DB_DIR}")
     State.train_cases = torch.load(CASE_DB_DIR / "train_cases.pt", weights_only=False)
     State.valid_cases = torch.load(CASE_DB_DIR / "valid_cases.pt", weights_only=False)
     pack = torch.load(CASE_DB_DIR / "cause_text_embs.pt", weights_only=False)
@@ -226,6 +268,23 @@ def load_all():
     tls, off = stack_train_lesions(State.train_cases)
     State.train_lesion_stack = F.normalize(tls.to(DEVICE), dim=-1)
     State.train_offsets = off
+
+    print(f"[load] case_db_raw (raw SigLIP2 features, Stage 1 index): {CASE_DB_RAW_DIR}")
+    raw_train_cases = torch.load(
+        CASE_DB_RAW_DIR / "train_cases.pt", weights_only=False,
+    )
+    assert len(raw_train_cases) == len(State.train_cases), (
+        f"case_db_raw / case_db case count mismatch: "
+        f"{len(raw_train_cases)} vs {len(State.train_cases)} — "
+        "they must be built from the same COCO source in the same order."
+    )
+    State.train_global_stack_raw = F.normalize(
+        torch.stack([c["global_emb"] for c in raw_train_cases]).to(DEVICE), dim=-1,
+    )
+    tls_raw, off_raw = stack_train_lesions(raw_train_cases)
+    State.train_lesion_stack_raw = F.normalize(tls_raw.to(DEVICE), dim=-1)
+    State.train_offsets_raw = off_raw
+    del raw_train_cases  # free Python list; the GPU stacks are what we need
 
     print(f"[load] CEAH: {CEAH_CKPT}")
     State.ceah = CEAH(
@@ -298,6 +357,28 @@ def encode_lesion_fusion_batch(local_pils: List[Image.Image], global_pil: Image.
                return_tensors="pt")["pixel_values"].to(DEVICE)
     with torch.cuda.amp.autocast(enabled=DEVICE.startswith("cuda")):
         f = State.vlm_lesion.forward_image(lpx, gpx)
+    return F.normalize(f.float(), dim=-1)
+
+
+@torch.no_grad()
+def encode_global_raw(image_pil: Image.Image) -> torch.Tensor:
+    """Raw frozen SigLIP2 global feature (cascade Stage 1 input)."""
+    proc = State.raw_siglip_proc
+    px = proc(images=[image_pil], return_tensors="pt")["pixel_values"].to(DEVICE)
+    with torch.cuda.amp.autocast(enabled=DEVICE.startswith("cuda")):
+        f = get_image_features(State.raw_siglip, px)
+    return F.normalize(f.float(), dim=-1)[0]
+
+
+@torch.no_grad()
+def encode_lesion_raw_batch(local_pils: List[Image.Image]) -> torch.Tensor:
+    """Raw frozen SigLIP2 per-lesion features (cascade Stage 1 input)."""
+    if not local_pils:
+        return torch.empty(0, State.in_dim, device=DEVICE)
+    proc = State.raw_siglip_proc
+    lpx = proc(images=local_pils, return_tensors="pt")["pixel_values"].to(DEVICE)
+    with torch.cuda.amp.autocast(enabled=DEVICE.startswith("cuda")):
+        f = get_image_features(State.raw_siglip, lpx)
     return F.normalize(f.float(), dim=-1)
 
 
@@ -711,16 +792,19 @@ def _minmax(x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def retrieve_and_score(q: Dict, gamma: float, top_k_cases: int, top_n_causes: int,
+def retrieve_and_score(q: Dict, top_k_cases: int, top_n_causes: int,
                         diversify_threshold: float = 0.95) -> Dict:
-    # Encoders normalize before returning, but mirror phase1_baseline.py exactly.
-    q_global = F.normalize(q["global_emb"], dim=-1)
-    q_lesions = F.normalize(q["lesion_embs"], dim=-1) if q["lesion_embs"].numel() \
-                else q["lesion_embs"]
+    # Cascade Stage 1: coarse retrieval on raw frozen-SigLIP2 features against
+    # case_db_raw stacks. Matches the production cascade — retrieval uses raw,
+    # attribution uses fine-tuned (further down).
+    q_global_raw = F.normalize(q["global_emb_raw"], dim=-1)
+    q_lesions_raw = F.normalize(q["lesion_embs_raw"], dim=-1) \
+                    if q["lesion_embs_raw"].numel() else q["lesion_embs_raw"]
 
     sims = compute_case_similarities(
-        q_global, q_lesions,
-        State.train_global_stack, State.train_lesion_stack, State.train_offsets,
+        q_global_raw, q_lesions_raw,
+        State.train_global_stack_raw, State.train_lesion_stack_raw,
+        State.train_offsets_raw,
         alpha=0.25, beta=0.75, lesion_match="hungarian",
     )
     # Phase 1 contract: drop train cases with similarity <= 0; weights normalized to sum to 1.
@@ -752,12 +836,15 @@ def retrieve_and_score(q: Dict, gamma: float, top_k_cases: int, top_n_causes: in
 
     s_ceah, alphas, _ = State.ceah(g_emb, t_emb, t_present, l_emb, l_mask, cand_embs)
 
-    s1_n = _minmax(s1)
+    # Cascade: rank purely by CEAH (Stage 2 score). The legacy hybrid
+    # γ * Phase 1 + (1−γ) * CEAH was found suboptimal in the γ-scan; cascade
+    # ≡ γ=0 is the strongest point and matches the asymmetric VLM dependency
+    # framing. Phase 1 score is kept in the output for transparency / debugging.
     sc_n = _minmax(s_ceah)
-    hybrid = gamma * s1_n + (1.0 - gamma) * sc_n
-    sorted_local = torch.argsort(hybrid, descending=True).cpu().numpy()
+    sorted_local = torch.argsort(sc_n, descending=True).cpu().numpy()
     sorted_local = diversify(sorted_local, cand_embs, diversify_threshold)
     sorted_global = np.array(candidate_indices)[sorted_local]
+    s1_n_dbg = _minmax(s1)  # for the debug field only
 
     top_n_count = min(top_n_causes, len(sorted_local))
     out_top = []
@@ -768,9 +855,8 @@ def retrieve_and_score(q: Dict, gamma: float, top_k_cases: int, top_n_causes: in
             "rank":  r + 1,
             "cause_idx":  gi,
             "text":       State.cause_texts[gi],
-            "score":      float(hybrid[li].item()),
-            "score_p1":   float(s1_n[li].item()),
-            "score_ceah": float(sc_n[li].item()),
+            "score":      float(sc_n[li].item()),         # = CEAH (cascade)
+            "score_p1":   float(s1_n_dbg[li].item()),     # debug-only
             "alpha":      [float(a) for a in alphas[li].cpu().tolist()],
         })
 
@@ -802,9 +888,16 @@ def build_query_from_image(image_pil: Image.Image, det_thresh: float,
     bboxes = [d[0] for d in detections]
     det_scores = [d[1] for d in detections]
 
-    g_emb = encode_global_image(image_pil)
-
     crops = [scaled_rect_crop(image_pil, b) for b in bboxes]
+
+    # Cascade dual encoding:
+    #   raw features (frozen SigLIP2)  → Stage 1 coarse retrieval on case_db_raw
+    #   fused features (fine-tuned)    → Stage 2 CEAH attribution on case_db
+    g_emb_raw = encode_global_raw(image_pil)
+    l_emb_raw = encode_lesion_raw_batch(crops) if crops \
+                else torch.empty(0, State.in_dim, device=DEVICE)
+
+    g_emb = encode_global_image(image_pil)
     l_emb = encode_lesion_fusion_batch(crops, image_pil) if crops \
             else torch.empty(0, State.in_dim, device=DEVICE)
 
@@ -818,14 +911,18 @@ def build_query_from_image(image_pil: Image.Image, det_thresh: float,
         "bboxes_xywh":         bboxes,
         "det_scores":          det_scores,
         "crops":               crops,
+        # Fine-tuned features for Stage 2 (CEAH)
         "global_emb":          g_emb,
         "lesion_embs":         l_emb,
+        # Raw features for Stage 1 (coarse retrieval)
+        "global_emb_raw":      g_emb_raw,
+        "lesion_embs_raw":     l_emb_raw,
         "text_emb":            t_emb,
     }
 
 
 def run_full_pipeline(image_pil: Image.Image, text_desc: str,
-                      det_thresh: float, gamma: float, top_k_cases: int,
+                      det_thresh: float, top_k_cases: int,
                       top_n_causes: int) -> Tuple[Dict, List[Dict], Dict]:
     q = build_query_from_image(image_pil, det_thresh, text_desc)
 
@@ -850,7 +947,7 @@ def run_full_pipeline(image_pil: Image.Image, text_desc: str,
             "heatmap":   heat,
         })
 
-    cause_results = retrieve_and_score(q, gamma, top_k_cases, top_n_causes)
+    cause_results = retrieve_and_score(q, top_k_cases, top_n_causes)
     return q, lesions, cause_results
 
 
@@ -862,7 +959,7 @@ def _empty_button_updates():
     return [gr.update(visible=False) for _ in range(MAX_TOPN_BUTTONS)]
 
 
-def handler_run(image, text_desc, det_thresh, gamma,
+def handler_run(image, text_desc, det_thresh,
                 top_k_cases, top_n_causes):
     if image is None:
         return (
@@ -876,7 +973,7 @@ def handler_run(image, text_desc, det_thresh, gamma,
 
     q, lesions, cause_results = run_full_pipeline(
         image, text_desc or "",
-        float(det_thresh), float(gamma),
+        float(det_thresh),
         int(top_k_cases), int(top_n_causes),
     )
 
@@ -942,8 +1039,8 @@ def handler_select_cause(idx: int, state: Optional[Dict]):
     explain = (
         f"### Top-{r['rank']} 病因\n"
         f"**{r['text']}**\n\n"
-        f"- Hybrid score: **{r['score']:.3f}**  "
-        f"(Phase 1 = {r['score_p1']:.3f}, CEAH = {r['score_ceah']:.3f})\n"
+        f"- Stage 2 CEAH score: **{r['score']:.3f}**  "
+        f"(Stage 1 case-aggregation reference = {r['score_p1']:.3f})\n"
         f"- α 加總 = 1（softmax）；數字越大代表該證據對此病因的貢獻越強。"
     )
     return alpha_img, bar_img, explain
@@ -967,8 +1064,8 @@ def get_example_paths() -> List[List]:
     for fn in EXAMPLE_FILES:
         p = VALID_IMG_ROOT / fn
         if p.exists():
-            # image, text_desc, det_thresh, gamma, top_k_cases, top_n_causes
-            out.append([str(p), "", 0.35, 0.75, 20, 5])
+            # image, text_desc, det_thresh, top_k_cases, top_n_causes
+            out.append([str(p), "", 0.35, 20, 5])
     return out
 
 
@@ -979,15 +1076,18 @@ def get_example_paths() -> List[List]:
 DESCRIPTION = """
 # 🐟 FaCE-R 魚病診斷流水線 demo
 
-完整 pipeline：
-**RF-DETR 偵測病灶** → **VLM-Lesion 分類 + 熱力圖** → **VLM-Global 整圖編碼** →
-**Phase 1 案例檢索** → **CEAH 病因歸因 (α)**
+Cascade pipeline（coarse-to-fine, production framing）：
 
-上傳一張魚體圖，或從下方範例選一張。系統會：
-1. 偵測病灶 bbox 並用 VLM-Lesion 分類成 symptom 類別 + 產生 grad-based 熱力圖
-2. 從 12,780 個訓練 case 找 top-K 相似 → 形成候選病因池
-3. CEAH 對每個候選給分數 + 對 (global / text / 每個 lesion) 的 softmax α
-4. Hybrid γ 排序得到 top-N 病因，**點擊任一病因按鈕**查看 α 解釋
+| Stage | 用什麼 | 做什麼 | 出什麼 |
+|---|---|---|---|
+| **Stage 1 (coarse, zero-shot)** | raw SigLIP2 → `case_db_raw` | Phase 1 hungarian retrieval | top-K cases |
+| **Stage 2 (fine, fine-tuned)** | VLM-Fusion + CEAH → `case_db` | per-cause score + softmax α attribution | top-N causes + α |
+
+每個 query forward 走兩條路徑：raw（給 Stage 1 retrieval）+ fused（給 Stage 2 CEAH）。
+兩個 case_db 共享 case_id 順序，所以 Stage 1 取的 top-K 直接映射到 case_db 拿 candidate causes。
+
+Final ranking 純粹由 Stage 2 CEAH 決定（cascade 設計，無 γ hybrid）。
+**點擊任一病因按鈕**查看 α 歸因解釋。
 """
 
 
@@ -1007,8 +1107,6 @@ def build_ui() -> gr.Blocks:
                 with gr.Accordion("可調參數", open=False):
                     sld_det = gr.Slider(0.1, 0.9, value=0.5, step=0.05,
                                          label="Detection threshold")
-                    sld_gamma = gr.Slider(0.0, 1.0, value=0.75, step=0.05,
-                                           label="Hybrid γ  (1.0=Phase1 only, 0.0=CEAH only)")
                     sld_topk = gr.Slider(5, 50, value=20, step=1, label="top_k_cases (K)")
                     sld_topn = gr.Slider(1, MAX_TOPN_BUTTONS, value=5, step=1, label="top_n_causes (N)")
                 btn_run = gr.Button("Run pipeline", variant="primary")
@@ -1022,22 +1120,37 @@ def build_ui() -> gr.Blocks:
             columns=1, height=580, show_label=False, object_fit="contain",
         )
 
-        gr.Markdown("---\n## ③ Top-N 病因（點擊查看歸因 α）")
+        gr.Markdown(
+            "---\n"
+            "## ③ Cascade Stage 1 — Coarse retrieval (zero-shot, raw SigLIP2)\n"
+            "用 raw 的 `google/siglip2-base-patch16-224` features 對 `case_db_raw` "
+            "做 multi-vector hungarian 比對，取 top-K 相似 case。**不使用任何 in-domain "
+            "微調**——retrieval 端走 zero-shot vision-language 範式。"
+        )
+        out_retrieved_gallery = gr.Gallery(
+            label="Top-K retrieved cases (Stage 1 output)",
+            columns=5,
+            height=220,
+            show_label=True,
+            object_fit="contain",
+        )
+
+        gr.Markdown(
+            "---\n"
+            "## ④ Cascade Stage 2 — Fine rerank (fine-tuned VLM-Fusion + CEAH)\n"
+            "對 Stage 1 取出的 top-K cases 的 candidate cause pool 用 CEAH 重排。"
+            "CEAH 消費 fine-tuned VLM-Fusion 的 lesion features（含 LocalGlobalFusion），"
+            "為每個候選病因產出 score + softmax α 對 (global / text / 每個 lesion) "
+            "的歸因。**fine-tune 在此 architecturally 必要**——raw lesion 特徵會 faithfulness 反轉。\n\n"
+            "點擊任一病因按鈕查看 α 解釋。"
+        )
         cause_buttons: List[gr.Button] = []
         with gr.Row():
             with gr.Column(scale=1):
                 for i in range(MAX_TOPN_BUTTONS):
                     btn = gr.Button(value="", visible=False, size="sm")
                     cause_buttons.append(btn)
-
                 out_retrieved = gr.Markdown()
-                out_retrieved_gallery = gr.Gallery(
-                    label="最相似的 train cases",
-                    columns=5,
-                    height=220,
-                    show_label=True,
-                    object_fit="contain",
-                )
             with gr.Column(scale=2):
                 out_explain = gr.Markdown()
                 out_alpha_img = gr.Image(label="α attribution overlay", type="pil", height=420)
@@ -1051,8 +1164,7 @@ def build_ui() -> gr.Blocks:
         ]
         btn_run.click(
             fn=handler_run,
-            inputs=[inp_image, inp_text_desc, sld_det, sld_gamma,
-                    sld_topk, sld_topn],
+            inputs=[inp_image, inp_text_desc, sld_det, sld_topk, sld_topn],
             outputs=run_outputs,
         )
 
@@ -1067,8 +1179,7 @@ def build_ui() -> gr.Blocks:
         if ex:
             gr.Examples(
                 examples=ex,
-                inputs=[inp_image, inp_text_desc, sld_det, sld_gamma,
-                        sld_topk, sld_topn],
+                inputs=[inp_image, inp_text_desc, sld_det, sld_topk, sld_topn],
                 label="範例（valid set，論文 case study 用過的圖）",
                 examples_per_page=10,
             )

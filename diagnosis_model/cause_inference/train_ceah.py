@@ -1,4 +1,4 @@
-"""Phase 3: train CEAH (Cause-Evidence Attribution Head) with hard negatives.
+"""Phase 2: train CEAH (Cause-Evidence Attribution Head) with hard negatives.
 
 Each train query brings:
   - evidence: global_emb, optional text_emb (with dropout), lesion_embs

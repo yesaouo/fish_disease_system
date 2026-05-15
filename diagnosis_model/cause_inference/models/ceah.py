@@ -1,6 +1,6 @@
 """CEAH — Cause-Evidence Attribution Head.
 
-Architecture (gated MLP, see Phase 3 design):
+Architecture (gated MLP, see Phase 2 design):
 
   Inputs (per query):
     global_emb   [D_g]      raw VLM-Global vision

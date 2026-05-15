@@ -1,9 +1,9 @@
-"""Master-slave Mamba case encoder (Phase 4 architecture ablation).
+"""Master-slave Mamba case encoder (Phase 3 architecture ablation).
 
 This is the original ``MambaCaseEncoder`` that the paper compares against as
-an architecture ablation. The production Phase 4 encoder is DeepSets, defined
+an architecture ablation. The production Phase 3 encoder is DeepSets, defined
 in ``diagnosis_model.cause_inference.models.case_encoder``; this file is kept
-because the Phase 4 ablation table reports Mamba results.
+because the Phase 3 ablation table reports Mamba results.
 
 Activating this module imports ``mamba_ssm.Mamba3``, which on this host is
 only available in the ``mamba3`` conda env (with ``CC=/usr/bin/gcc-12`` for

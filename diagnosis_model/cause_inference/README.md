@@ -4,10 +4,10 @@
 
 ## 動機
 
-魚病診斷的病因標註是 **GPT 生成的自由文字**（每張圖約 4 個病因，總共 56,310 個 unique 字串，**94.7% 是 singleton**）。這個資料特性使得：
+魚病診斷的病因標註是 **LLM 生成的自由文字並經由水產專業人員審核**（每張圖約 4 個病因，總共 56,310 個 unique 字串，**94.7% 是 singleton**）。這個資料特性使得：
 
 1. 傳統的 closed-vocabulary multi-label classification **無法應用**
-2. 教授的硬性要求是「**lesion-grounded explainability**」——預測必須能對應到具體病灶
+2. 為了符合實際的診斷應用需求，系統必須具備「**lesion-grounded explainability**」——預測必須能對應到具體病灶
 
 FaCE-R 把問題重構成 **case-based 檢索 + lesion-attribution**，兩階段對 VLM 的依賴不對稱：
 
@@ -16,11 +16,11 @@ Query 影像
   ↓
 RF-DETR 偵測病灶（前一階段）
   ↓
-SigLIP2 抽特徵（frozen teacher，預訓練即可；Phase 3 額外需要 fine-tune 過的 fusion VLM-Lesion）
+SigLIP2 抽特徵（frozen teacher，預訓練即可；Phase 2 額外需要 fine-tune 過的 fusion VLM-Lesion）
   ↓
 [Phase 1] C²R 案例檢索 → 候選病因池（~87 個）         ← zero-shot retrieval（raw SigLIP2 即可）
   ↓
-[Phase 3] CEAH 重新打分 + 病灶歸因                    ← 需 VLM-Lesion fusion 才有 faithful attribution
+[Phase 2] CEAH 重新打分 + 病灶歸因                    ← 需 VLM-Lesion fusion 才有 faithful attribution
   ↓
 Top-N 病因預測 + α attribution 視覺化
 ```
@@ -32,14 +32,14 @@ Top-N 病因預測 + α attribution 視覺化
 FaCE-R 的兩個階段對 VLM 的依賴**不對稱**：
 
 - **Phase 1（C²R retrieval）**：把 SigLIP2 當 **frozen zero-shot teacher**。Ablation 顯示原始 `google/siglip2-base-patch16-224` 跟 fine-tune 過的 VLM-Global 在 retrieval 上**等價甚至略勝**（sem R@10 45.6% vs 44.4%），所以這個階段不需要任何 in-domain 微調。
-- **Phase 3（CEAH lesion attribution）**：**必須**用 fine-tune 過的 VLM-Lesion + LocalGlobalFusion。raw SigLIP2 的 lesion crop 特徵雖然能驅動 retrieval，但無法支撐 faithful attribution（lesion masking 結果反轉，見 [VLM dependency ablation](#phase-1-ablationvlm-dependency)）。
+- **Phase 2（CEAH lesion attribution）**：**必須**用 fine-tune 過的 VLM-Lesion + LocalGlobalFusion。raw SigLIP2 的 lesion crop 特徵雖然能驅動 retrieval，但無法支撐 faithful attribution（lesion masking 結果反轉，見 [VLM dependency ablation](#phase-1-ablationvlm-dependency)）。
 
 | 元件 | 路徑 | 訓練語料 | 用於哪個階段 |
 |---|---|---|---|
 | **RF-DETR 病灶偵測器** | [`../detection/`](../detection/) | COCO bbox | 推論前處理 |
 | **SigLIP2 base (frozen)** | `google/siglip2-base-patch16-224` | 原始預訓練 | **Phase 1 retrieval 的 zero-shot baseline** |
-| **VLM-Global**（整圖 ↔ 整體描述） | [`../vl_classifier/outputs/siglip2_base_patch16_224_overall_multipos_zh`](../vl_classifier/outputs/siglip2_base_patch16_224_overall_multipos_zh) | `overall.medical_zh` / `colloquial_zh` | Phase 1（與 raw 等價）、Phase 3 text encoder |
-| **VLM-Lesion**（病灶 crop ↔ 症狀描述，含 fusion wrapper） | [`../vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh`](../vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh) | per-bbox symptom captions | **Phase 3 CEAH faithfulness 必要** |
+| **VLM-Global**（整圖 ↔ 整體描述） | [`../vl_classifier/outputs/siglip2_base_patch16_224_overall_multipos_zh`](../vl_classifier/outputs/siglip2_base_patch16_224_overall_multipos_zh) | `overall.medical_zh` / `colloquial_zh` | Phase 1（與 raw 等價）、Phase 2 |
+| **VLM-Lesion**（病灶 crop ↔ 症狀描述，含 fusion wrapper） | [`../vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh`](../vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh) | per-bbox symptom captions | **Phase 2 CEAH faithfulness 必要** |
 | **COCO 標註** | `data/detection/coco/_merged/{train,valid,test}/_annotations.coco.json` | image-level + per-bbox annotations | 全程 |
 
 所有 VLM 在 cause_inference 內皆凍結，不進一步 finetune。Production case_db 用 fine-tune 過的兩個 VLM 建立（因 CEAH 依賴）；Phase 1 retrieval 在這個 case_db 上跑就好。
@@ -52,7 +52,7 @@ cause_inference/
 ├── preprocessing/
 │   ├── README.md                  ← cause text caching + clustering CLI
 │   ├── build_case_database.py     ← Phase 0: 建 case DB
-│   ├── build_train_candidate_pool.py  ← Phase 3 訓練前置
+│   ├── build_train_candidate_pool.py  ← Phase 2 訓練前置
 │   ├── text_embedding_cache.py    ← cause 文字 embedding cache
 │   ├── dim_reduction.py           ← UMAP 降維
 │   ├── hdbscan_clustering.py      ← HDBSCAN 一次性 clustering
@@ -63,27 +63,35 @@ cause_inference/
 │   ├── cause_texts.py             ← 從 COCO 抽 unique cause 文字
 │   └── export_unique_causes.py    ← 匯出 cause.txt
 ├── models/
-│   ├── projection_head.py         ← Phase 2 模型
-│   └── ceah.py                    ← Phase 3 模型（CEAH）
+│   ├── projection_head.py         ← supervised projection MLP（retrieval-side ablation）
+│   └── ceah.py                    ← Phase 2 模型（CEAH）
 ├── phase1_baseline.py             ← Phase 1 zero-training C²R 評估
-├── train_projection.py            ← Phase 2 projection head 訓練（ablation）
-├── train_ceah.py                  ← Phase 3 CEAH 訓練
-├── eval_ceah.py                   ← Phase 3 推論 + α 輸出
+├── train_projection.py            ← supervised projection MLP 訓練（retrieval-side ablation）
+├── train_ceah.py                  ← Phase 2 CEAH 訓練
+├── eval_ceah.py                   ← Phase 2 推論 + α 輸出
 ├── faithfulness_eval.py           ← Faithfulness 驗證（lesion masking）
 ├── analyze_lesion_buckets.py      ← Phase 1 N-lesion 分桶分析
-├── analyze_v3_n_buckets.py        ← Phase 3 v3 N-lesion 分桶分析
+├── analyze_v3_n_buckets.py        ← Phase 2 v3 N-lesion 分桶分析
 ├── case_study_viz.py              ← 案例可視化（論文 figure）
 ├── run_phase1_sweep.sh            ← Phase 1 hyperparameter sweep
+├── mamba_ablation/                ← Phase 3 Mamba 變體（architecture ablation）
+├── rvq_rerank/                    ← Phase 4 CRR-DeepRVQ（壓縮 + 殘差 reranker）
+│   ├── rvq.py                     ← RVQCodebook 模組
+│   ├── reranker.py                ← Light / Full reranker
+│   ├── fit_rvq.py / build_rvq_index.py / run_sweep.py
+│   ├── eval_sanity.py / eval_harder.py / eval_final.py
+│   ├── train_reranker.py / benchmark_scale.py
+│   └── outputs/                    ← codebooks、index、reranker checkpoints
 └── outputs/                       ← 所有產出
     ├── case_db/                   ← Phase 0（含 train_candidate_pool.pt）
     ├── phase1_full_maxmean/       ← Phase 1 baseline
     ├── phase1_sweep/              ← Phase 1 sweep
-    ├── projection_v1/             ← Phase 2 ablation
-    ├── ceah_v3/                   ← Phase 3 final model
-    ├── ceah_v3_eval_full/         ← Phase 3 retrieval eval（fine cluster）
-    ├── ceah_v3_eval_coarse/       ← Phase 3 retrieval eval（coarse 100 cluster）
-    ├── ceah_v3_text_{medical,colloquial,none}/  ← Phase 3 text mode ablation
-    ├── ceah_v3_faithfulness_v2/   ← Phase 3 faithfulness
+    ├── projection_v1/             ← supervised projection MLP ablation（retrieval-side）
+    ├── ceah_v3/                   ← Phase 2 final model
+    ├── ceah_v3_eval_full/         ← Phase 2 retrieval eval（fine cluster）
+    ├── ceah_v3_eval_coarse/       ← Phase 2 retrieval eval（coarse 100 cluster）
+    ├── ceah_v3_text_{medical,colloquial,none}/  ← Phase 2 text mode ablation
+    ├── ceah_v3_faithfulness_v2/   ← Phase 2 faithfulness
     ├── case_study_v3/             ← 案例圖
     ├── cause_cache/               ← cause text embeddings
     ├── cause_clusters_reassigned.json        ← 細粒度 (2807 clusters)
@@ -288,17 +296,17 @@ $PY -m diagnosis_model.cause_inference.phase1_baseline \
 | `no_lesion` drop（all） | +0.036 | −0.027 |
 | `no_random` drop | +0.005 | +0.004 |
 
-→ raw 的 CEAH 把 attention 放在 lesion 上，但**遮掉 lesion 後分數反而上升** — 即 lesion 內容不是有效的判別訊號。fine-tune 過的 VLM-Lesion（含 LocalGlobalFusion）對 Phase 3 的 architecture-enforced lesion-grounded explainability 是**必要**的。
+→ raw 的 CEAH 把 attention 放在 lesion 上，但**遮掉 lesion 後分數反而上升** — 即 lesion 內容不是有效的判別訊號。fine-tune 過的 VLM-Lesion（含 LocalGlobalFusion）對 Phase 2 的 architecture-enforced lesion-grounded explainability 是**必要**的。
 
-詳見 [Phase 3 design notes](#phase-3ceah主要貢獻) 對 VLM-Lesion 必要性的說明。
+詳見 [Phase 2 design notes](#phase-2ceah主要貢獻) 對 VLM-Lesion 必要性的說明。
 
 Artifacts：`outputs/case_db_raw/`、`outputs/phase1_raw/`、`outputs/ceah_raw/`、`outputs/ceah_raw_faithfulness/`。
 
 ---
 
-### Phase 2：projection head ablation
+### Retrieval-side fine-tune probe：supervised projection MLP（negative result）
 
-訓練一個輕量 MLP 把 lesion 特徵投到「對病因區分更好」的空間，用 cause-overlap supervised metric learning：
+延伸前一節的 VLM dependency 結論——除了「換掉 VLM」之外,我們也試過**保留 frozen VLM,在 lesion 特徵之上加一顆可學的 projection MLP**,直接用 cause-overlap 當監督訊號做 metric learning(`pred(i,j) = α·cos(g_i,g_j) + β·max_mean_set_sim(L'_i, L'_j)` vs `target(i,j) = max_mean_set_sim(C_i, C_j)`,MSE on off-diagonals):
 
 ```bash
 $PY -m diagnosis_model.cause_inference.train_projection \
@@ -307,13 +315,15 @@ $PY -m diagnosis_model.cause_inference.train_projection \
   --epochs 30 --batch_size 64 --lr 1e-4 --eval_every 2
 ```
 
-**結果**：sem_MRR 0.4061 → 0.4052（**沒有改進**）。
+**結果**:sem_MRR 0.4061 → 0.4052(**沒有改進**;Δ MRR −0.001)。
 
-**論文寫法（ablation）**：「Cause-overlap supervised projection on top of frozen VLM-Lesion provides no measurable improvement; we attribute this to the VLM's symptom-caption pretraining already saturating the cause-discriminative signal at the case-similarity level.」
+這個 probe 不是 pipeline 的一階,**下游沒有任何階段載入 `best_lesion_head.pt`**——Phase 2 CEAH 自帶 attribution MLP、Phase 3 DeepSets 的 φ 本身就是 per-lesion 的可學 projection(且訓練目標更強:listwise KL + SupCon InfoNCE),Phase 4 RVQ + reranker 坐在 Phase 3 的 z 上。Probe 的價值純粹是 retrieval-side fine-tune ablation 的**一個獨立資料點**,與「Phase 1 raw vs fine-tuned VLMs」、「Phase 3 raw distillation」、「Phase 4 raw RVQ + reranker」共同支持「coarse retrieval 在 zero-shot vision-language regime 下飽和」的論述。
+
+**論文寫法(ablation)**:「In addition to swapping in the raw SigLIP2 backbone, we also probe whether a cause-overlap supervised projection MLP on top of frozen VLM-Lesion can lift retrieval. Trained on pairwise lesion-set similarity aligned to pairwise cause-text similarity, the head produces no measurable improvement (Δ sem MRR = −0.001), consistent with the broader cross-ablation showing in-domain fine-tuning is a no-op for the coarse stage.」
 
 ---
 
-### Phase 3：CEAH（主要貢獻）
+### Phase 2：CEAH(主要貢獻)
 
 CEAH = **Cause-Evidence Attribution Head**。對 Phase 1 候選池中的每個候選病因，輸出：
 - 一個機率分數
@@ -494,7 +504,7 @@ done
 
 ---
 
-### Phase 4：Case encoder（單向量檢索，加速貢獻）
+### Phase 3：Case encoder（單向量檢索，加速貢獻）
 
 **動機**：Phase 1 每 query 對 case_db 跑 multi-vector + Hungarian 比對（~15 ms/q）。隨著 case_db 規模成長,這個成本是 retrieval 階段的主要 bottleneck。把 (global, lesion 1..N) 蒸餾成 **單一 case 向量** 後,檢索退化為單一 cosine,大幅加速。
 
@@ -536,7 +546,7 @@ $PY -m diagnosis_model.cause_inference.train_case_encoder \
   --use_infonce --infonce_weight 0.5 --infonce_temp 0.07
 ```
 
-> Production Phase 4 跑在 SDM env 即可，不需要 `mamba3`/`gcc-12`。Mamba master-slave
+> Production Phase 3 跑在 SDM env 即可，不需要 `mamba3`/`gcc-12`。Mamba master-slave
 > 變體已搬到 [`diagnosis_model/cause_inference/mamba_ablation/`](mamba_ablation/)，作為
 > architecture ablation 保留；`build_encoder` lazy-imports，傳 `--encoder_type mamba`
 > 才會觸發 `mamba_ssm` 載入並要求 mamba3 env。
@@ -600,9 +610,9 @@ leave-one-out mining 顯示:
 
 **結論**:**~44.5% 是 case_db 的物理上限**,不是 retrieval 算法的問題。未來提升空間在擴 case_db 的 cause 多樣性,不在改 encoder。
 
-#### Phase 4 ablation：raw case_db
+#### Phase 3 ablation：raw case_db
 
-把同樣的 dual-target distillation 跑在 raw SigLIP2 case_db 上（見 [Phase 1 VLM dependency ablation](#phase-1-ablationvlm-dependency)），驗證 Phase 4 加速貢獻是否依賴 in-domain VLM finetune：
+把同樣的 dual-target distillation 跑在 raw SigLIP2 case_db 上（見 [Phase 1 VLM dependency ablation](#phase-1-ablationvlm-dependency)），驗證 Phase 3 加速貢獻是否依賴 in-domain VLM finetune：
 
 | Method | Fine-tuned case_db | Raw case_db |
 |---|---|---|
@@ -611,9 +621,178 @@ leave-one-out mining 顯示:
 | Student per-q ms | 1.1 | 1.1 (14× faster than teacher in both) |
 | 訓練 epochs（早停） | 9 | 9 |
 
-→ **Phase 4 加速貢獻對 VLM training 不敏感**，跟 Phase 1 retrieval 一致。dual-target loss（listwise KL + case-cause InfoNCE）在兩種 case_db 上同樣 work，學生持平或微幅超越老師。和 Phase 1 一起構成「retrieval 端走 zero-shot 範式」的完整論證。
+→ **Phase 3 加速貢獻對 VLM training 不敏感**，跟 Phase 1 retrieval 一致。dual-target loss（listwise KL + case-cause InfoNCE）在兩種 case_db 上同樣 work，學生持平或微幅超越老師。和 Phase 1 一起構成「retrieval 端走 zero-shot 範式」的完整論證。
 
 Artifacts：`outputs/case_db_raw/teacher_train_train.pt`、`outputs/encoder_raw/best_encoder.pt`、`logs/encoder_raw.log`、`logs/eval_phase1_aligned_raw.log`。
+
+---
+
+### Phase 4：CRR-DeepRVQ（壓縮 + 殘差 reranker，method-level 貢獻）
+
+**動機**：Phase 3 把 retrieval 從 15.4 ms 壓到 1.1 ms，下一個 bottleneck 是 case bank 規模——12,780 cases × 768 dim fp32 = 39 MB 還能全進 GPU，但若部署到 1M+ cases（diagnostic platform 預期長期累積）則 brute-force dense 退化到 5 ms/q 並佔 1.5 GB。CRR-DeepRVQ 給出可擴展的壓縮 + 修正方案。
+
+#### 設計
+
+把凍結的 DeepSets case encoder 輸出 `z_i ∈ ℝ^768` 用 **Residual Vector Quantization** 壓成 `codes ∈ [K]^M` 的離散碼字（M levels × K codes/level）：
+
+```
+ẑ_i  = Σ_m  C_m[k_{i,m}]              # 重建
+e_i  = z_i − ẑ_i                       # 量化殘差
+```
+
+檢索分兩階段：
+- **First-stage**：`s_first(q, i) = qᵀẑ_i`，透過 lookup table `LUT[m, k] = q · C_m[k]` 每 candidate 只要 M 次加法
+- **Residual rerank**：對 top-K_top=50 candidates，用 neural net 預測 `Δ ≈ qᵀe_i` 並 `s_final = s_first + Δ`
+
+數學動機：`s_dense(q,i) = qᵀz_i = qᵀẑ_i + qᵀe_i = s_first + qᵀe_i`，所以 reranker 不是估計 score 而是估計 compression residual。
+
+#### 兩個 reranker variant
+
+| Variant | Candidate token 包含 | 部署假設 |
+|---|---|---|
+| **Light** | ẑ, codes embedding, q⊙ẑ, \|q−ẑ\|, s_first, ‖e‖ | 完全壓縮：只有 codes 在 memory 裡 |
+| **Full** | Light 全部 + z_i + e_i + q⊙e_i | 全 memory：top-K 時 fetch dense z |
+
+Full 因 `Δ = qᵀe` 解析可得，論文用 **analytic Full**（無訓練的 oracle）作為 upper bound。
+
+#### 評估的雙 regime
+
+| Regime | top_k_cases | 動機 | RVQ damage？ |
+|---|---|---|---|
+| **A (production)** | 20 | 經過 Phase 1 cause-aggregation pool（87 個 unique cause） | 全部持平，aggregation buffer 吸收 RVQ noise |
+| **B (ANN-style)** | 1 | 單一 case 的 cause set 直接當預測，無 buffer | 有壓縮的方法直接掉到 dense 以下 |
+
+**Regime A 是 production 設定，Regime B 是 method validation 設定**——後者拆掉 aggregation buffer 才能看出 reranker 的價值。論文兩個都報：A 是「壓縮 free lunch」的 happy byproduct，B 是「reranker 真的修補 RVQ」的 main claim。
+
+#### 訓練
+
+```bash
+# Step 1: fit RVQ codebook（~1 分鐘，每個 (M, K) 一次性）
+$PY -m diagnosis_model.cause_inference.rvq_rerank.fit_rvq \
+  --encoder_ckpt outputs/encoder_final/best_encoder.pt \
+  --case_db_dir outputs/case_db \
+  --output_dir outputs/rvq_rerank \
+  --M 4 --K 256
+
+# Step 2: 訓 Light reranker（~15–60 秒）
+$PY -m diagnosis_model.cause_inference.rvq_rerank.train_reranker \
+  --encoder_ckpt outputs/encoder_final/best_encoder.pt \
+  --case_db_dir outputs/case_db \
+  --rvq_M 4 --rvq_K 256 \
+  --rvq_dir outputs/rvq_rerank/rvq_M4_K256 \
+  --output_dir outputs/rvq_rerank/reranker_M4_K256_light \
+  --variant light --K_top 50 --batch_size 64 --epochs 30 \
+  --eval_top_k_cases 1   # Regime B 早停 metric
+```
+
+Training task：對每個 train query（LOO），由 s_first 取 top-K_top=50 候選，
+reranker 預測 Δ；`loss = listwise_KL(s_final, s_dense) + λ_mse · MSE(Δ, qᵀe)`。
+
+#### 結果 — RVQ 壓縮率 sweep（Regime A, top_k_cases=20, 1573 valid）
+
+12 個 (M, K) 配置全部 R@10 Δ 在 ±1.7 pp 內（SE = 1.26 pp），**全是 noise**：
+
+| RVQ config | Compression × | sem R@10 | Δ vs dense |
+|---|---|---|---|
+| Dense fp32 | 1× | 44.7% | — |
+| M=4 K=256 | 768× | 45.5% | +0.8 pp |
+| M=2 K=64 | 2048× | 43.5% | −1.2 pp |
+| **M=1 K=16** | **6144×** | **43.9%** | **+0.0 pp** ← 16 prototypes 而已！ |
+
+**Production regime 對 RVQ noise 幾乎免疫**：M=1 K=16 把整個 12,780 case bank 壓成 **16 個 prototype**（每 prototype ~800 cases），R@10 完全不掉。原因：Phase 1 的 cause-aggregation pool 是個有效的「coarse clustering buffer」，個別 case 排序錯誤被 union over 20 cases 吸收。
+
+只有 R@100 才看出 M=1 K=16 退化（−6 pp），但 R@10/MRR 完全持平。
+
+#### 結果 — Regime B 完整對照（top_k_cases=1, 1573 valid，主表）
+
+拆掉 aggregation buffer 後，RVQ 損害直接顯露，reranker 有用武之地：
+
+| Method | Comp × | sem R@10 | Δ vs dense | Gap recovered |
+|---|---|---|---|---|
+| **Dense fp32** | 1× | **0.537** | — | — |
+| RVQ-only M=4 K=256 | 768× | 0.506 | −3.1 pp | — |
+| **+ Light rerank** | 768× | 0.518 | −1.9 pp | **39%** |
+| + Full analytic | 768× | **0.537** | +0.0 pp | **100%** |
+| RVQ-only M=2 K=64 | 2048× | 0.463 | −7.4 pp | — |
+| **+ Light rerank** | 2048× | 0.500 | −3.7 pp | **50%** |
+| + Full analytic | 2048× | 0.515 | −2.3 pp | 69% |
+| RVQ-only M=1 K=16 | 6144× | 0.372 | −16.5 pp | — |
+| **+ Light rerank** | 6144× | 0.462 | −7.6 pp | **54%** |
+| + Full analytic | 6144× | 0.458 | −7.9 pp | 52% ← 被 first-stage recall 限制 |
+
+**三個 method-level 觀察：**
+
+1. **Light reranker 在所有壓縮率穩定回收 39–54% 的 gap**——method 不是 cherry-picked，對 768×–6144× 都有效。
+2. **Full analytic 在 M=4 K=256 完全回補到 dense (0.537)**——證明「reranker 的可挽回上限 = top-K 包含 GT case 的機率」。M=1 K=16 saturate 在 0.458，因為 top_K_rerank=50 對 16-prototype 不夠，first-stage 包含 GT 的機率本身就低，連 oracle Δ 都救不回。
+3. **M=1 K=16 + Light 達 0.462**，跟 M=4 K=256 純 RVQ 的 0.506 只差 4 pp，但壓縮率 **8× 更高**——Pareto frontier 被 reranker 整個推外。
+
+#### 結果 — Scale benchmark（latency / memory at N=12K..1M）
+
+```bash
+$PY -m diagnosis_model.cause_inference.rvq_rerank.benchmark_scale \
+  --rvq_dir outputs/rvq_rerank/rvq_M4_K256 \
+  --light_reranker_ckpt outputs/rvq_rerank/reranker_M4_K256_light/best.pt \
+  --N_list 12780 50000 100000 500000 1000000 --batch_sizes 1 32
+```
+
+合成 N 個 z（從 z_train 抽樣 + Gaussian + L2-renormalize），用既有 codebook 量化。**不報 recall**（合成 case 沒 GT），純 inference benchmark。
+
+Latency p50 @ bs=1（M=4 K=256, 32 GB GPU）：
+
+| N | dense | rvq_only | rvq_light | rvq_full_analytic |
+|---|---|---|---|---|
+| 12,780 | 0.08 ms | 0.10 ms | 0.56 ms | 0.13 ms |
+| 100,000 | 0.56 ms | 0.13 ms | 0.60 ms | 0.16 ms |
+| 500,000 | 2.59 ms | 0.15 ms | 0.62 ms | 0.18 ms |
+| **1,000,000** | **5.15 ms** | **0.19 ms** | **0.59 ms** | **0.22 ms** |
+
+- **dense** 線性成長（O(N)）：1M 已達 5 ms/q
+- **rvq_only** 幾乎平坦：1M 仍 0.19 ms/q（27× 比 dense 快）
+- **rvq_light** 約 0.6 ms 常數開銷（reranker forward 主導，跟 N 無關）
+- **rvq_full_analytic** 跟 rvq_only 同步：top-K=50 dense rerank cost 微小
+
+Memory @ N=1M（M=4 K=256 codes = uint8）：
+
+| Method | Index size | Compression vs fp16 dense |
+|---|---|---|
+| dense fp16 | 1,536 MB | 1× |
+| **rvq_only** | **4 MB** | **384×** |
+| rvq_light | 17 MB (codes + 13 MB reranker) | 90× |
+| rvq_full_analytic | 1,540 MB (z bank 為 rerank 必要) | 1× |
+
+#### Deployment Pareto（三層）
+
+| 部署情境 | 推薦方法 | Memory | Latency | Quality (Regime B) |
+|---|---|---|---|---|
+| Memory + compute 都緊 | **rvq_light** | 17 MB | 0.59 ms | 0.518 |
+| Compute 緊但 memory 寬鬆 | rvq_full_analytic | 1.5 GB | 0.22 ms | 0.537 (=dense) |
+| Memory 緊但 quality 可讓 | rvq_only | 4 MB | 0.19 ms | 0.506 |
+| 無壓力 | dense | 1.5 GB | 5.15 ms | 0.537 |
+
+#### 論文敘事建議
+
+> **CRR-DeepRVQ 把 case-based retrieval 推到 1M+ 規模的 deployment 範圍。** 後接在 Phase 3 DeepSets case encoder 之後，凍結 z_i，用 Residual Vector Quantization 壓成 M-byte codes（768× memory compression at M=4 K=256），再用 query-to-candidate cross-attention reranker 學 compression residual Δ ≈ qᵀe_i 修補 RVQ 引入的 ranking 誤差。
+>
+> 評估顯示**雙 regime 的不對稱**：在 production setting（Phase 1 top_k_cases=20 + cause-aggregation buffer），即使把 12,780 cases 壓成 16 個 prototype（6,144× compression）R@10 都不掉，是 cause-aggregation pool 充當 coarse clustering buffer 的副效應；但在 stress regime（top_k_cases=1, no aggregation），RVQ 損害 3–16 pp R@10，**Light reranker 穩定回收 39–54% 的 gap**，Full analytic 在輕度壓縮下完全回補到 dense。1M case bank latency benchmark 顯示 dense 退化到 5.15 ms/q，但 rvq_light 維持 0.59 ms/q + 17 MB（90× 壓縮、9× 加速），證明 case-based retrieval framework 在數據集規模成長下仍可實時部署。
+
+#### 子套件結構
+
+```
+cause_inference/rvq_rerank/
+├── __init__.py
+├── rvq.py                # RVQCodebook：fit (k-means on residuals) / encode / LUT
+├── reranker.py           # Reranker（Light + Full）；listwise KL + Δ MSE loss
+├── fit_rvq.py            # Stage A1 CLI：fit codebook on z_train
+├── build_rvq_index.py    # Stage A2 CLI：編 train + valid into index.pt（可選）
+├── eval_sanity.py        # dense vs RVQ-only 純壓縮 sanity
+├── run_sweep.py          # (M, K) 12 格 Pareto sweep
+├── eval_harder.py        # 雙 regime stress eval（top_k_cases × sem_thr）
+├── train_reranker.py     # Light reranker 訓練（Regime B 早停）
+├── eval_final.py         # 4 method × 雙 regime 完整對照
+└── benchmark_scale.py    # latency / memory at N=12K..1M+
+```
+
+詳細指令見 [training.txt §6](training.txt) 與 [inference.txt §J](inference.txt)。
 
 ---
 
@@ -642,52 +821,123 @@ $PY -m diagnosis_model.cause_inference.case_study_viz \
 
 ---
 
-## 完整結果 Summary
+## Cascade architecture & final results
 
-### Retrieval（v3 hybrid γ=0.75，1573 valid，LLM 466 cluster）
+FaCE-R 採用 **coarse-to-fine 二階段 cascade**——retrieval 端用 zero-shot frozen SigLIP2，attribution 端用 fine-tuned VLM-Fusion，兩階段 contribution 完全不重疊。
 
-| 評估層級 | R@1 | R@5 | R@10 | R@20 | MRR | coverage |
-|---|---|---|---|---|---|---|
-| **Semantic（cos≥0.95）** | 22.4% | 36.1% | **45.3%** | 57.9% | **0.302** | 93.1% |
-| **Cluster（LLM 466）** | 18.2% | 29.3% | **37.0%** | 46.6% | **0.245** | 72.7% |
+```
+[Coarse retrieval, ZERO-SHOT]                    [Fine rerank, FINE-TUNED]
+   raw SigLIP2 (frozen pretrained)                  VLM-Fusion + CEAH
+        ↓                                                  ↓
+   Phase 1 / Phase 3 / Phase 4                       on top-K cases only
+        ↓                                                  ↓
+   top-K cases  (12K→20 在 0.6 ms)                   candidate cause + α
+   "frozen pretrained alignment"                    "lesion-grounded attribution"
+```
 
-### Attribution（cause type × α 分佈）
+之前 paper 預設的 hybrid γ=0.75 scoring 是 retrieval-score + CEAH-score 線性混合。Cascade 框架下 coarse stage 只負責挑 top-K cases，不再貢獻 cause-level score（等於 γ=0），fine stage 100% 用 CEAH。**γ=0 在 γ-scan 中本來就是 sem R@10 跟 cluster R@10 最好的點**（46.8% / 39.8% vs γ=0.75 的 45.3% / 37.0%），所以 cascade 同時改善結構清晰度跟 headline 數字。
 
-| 病因類型 | global α | text α | lesion sum | l/g ratio |
+### Stage 1 — Coarse retrieval（zero-shot, raw SigLIP2）
+
+Production 走 `case_db_raw/` + `encoder_raw/` + `rvq_rerank_raw/`。1573 valid queries，top_k_cases=20，candidate-pool aggregation：
+
+| Component | sem R@10 | sem MRR | per-q latency | Index memory @ 12K |
+|---|---|---|---|---|
+| Phase 1 hungarian (teacher) | 45.6% | 0.300 | 15.2 ms | 200 MB (multi-vec) |
+| Phase 3 DeepSets dual-target | **45.6%** | **0.303** | **1.1 ms** (14×) | 39 MB |
+| Phase 4 RVQ-only M=4 K=256 | 45.1% | 0.302 | 0.10 ms (152×) | **0.05 MB** (384× compression) |
+| Phase 4 + Light reranker | 45.1% | 0.300 | 0.56 ms (27×) | 13 MB (90× compression) |
+| Phase 4 + Full analytic | **45.6%** | 0.301 | 0.22 ms (69×) | 1.5 GB (z bank needed) |
+
+→ Coarse stage 所有變體 R@10 都在 dense (45.6%) ±0.6 pp 內，**production aggregation buffer 對 RVQ 壓縮免疫**。
+
+**Regime B stress benchmark**（top_k_cases=1，無 aggregation buffer，純 ANN-style）。Pareto 對照 raw（production cascade Stage 1）vs fine-tuned（ablation）兩條曲線：
+
+| Compression × | Method | **raw R@10** | **fine-tuned R@10** | 哪個贏 |
+|---|---|---|---|---|
+| 1× (dense fp32) | baseline | 51.7% | 53.7% | fine-tuned +2.0 pp |
+| 768× (M=4 K=256) | RVQ-only | 48.4% | 50.6% | fine-tuned +2.2 pp |
+|  | **+ Light reranker** | **51.0%** | 51.8% | fine-tuned +0.8 pp |
+|  | + Full analytic | 51.6% | 53.7% | fine-tuned +2.1 pp |
+| 2048× (M=2 K=64) | RVQ-only | 44.6% | 46.3% | fine-tuned +1.7 pp |
+|  | **+ Light reranker** | 46.2% | **50.0%** | **fine-tuned +3.8 pp** |
+|  | + Full analytic | 50.5% | 51.5% | fine-tuned +1.0 pp |
+| 6144× (M=1 K=16) | RVQ-only | 36.8% | 37.2% | tied |
+|  | **+ Light reranker** | 39.7% | **46.2%** | **fine-tuned +6.5 pp** |
+|  | + Full analytic | 44.6% | 45.8% | fine-tuned +1.2 pp |
+
+Gap recovered (Light vs RVQ-only) 隨壓縮率變化的不對稱：
+
+| Compression × | Raw recovery | Fine-tuned recovery |
+|---|---|---|
+| 768× (M=4 K=256) | **79%** | 39% ← raw 勝 |
+| 2048× (M=2 K=64) | 22% | **56%** ← fine-tuned 勝 |
+| 6144× (M=1 K=16) | 19% | **54%** ← fine-tuned 勝 |
+
+**詮釋**：raw features 在中度壓縮（M=4 K=256, 768×）下殘差結構乾淨、reranker 學得很好（79% recovery）；但壓到極端時 raw 比 fine-tuned 更早 degrade（fine-tune 的 in-domain training 隱含把 features 推到更 quantize-friendly 的空間）。Production 用 **raw M=4 K=256**（cascade Stage 1 sweet spot）；極端壓縮的 deployment 場景需要 fine-tuned encoder。完整 Pareto plot 見 [`outputs/rvq_rerank/pareto_compression_vs_R10.png`](outputs/rvq_rerank/pareto_compression_vs_R10.png)。
+
+**Scale-up benchmark @ N=1M**（合成 z bank、無 recall 報告）：
+
+| Method | latency (bs=1) | memory | compression |
+|---|---|---|---|
+| Phase 3 DeepSets dense | 5.15 ms | 1.5 GB | 1× |
+| Phase 4 RVQ-only | 0.19 ms (27× faster) | 4 MB | **384×** |
+| Phase 4 + Light reranker | 0.59 ms (9× faster) | 17 MB | 90× |
+
+Coarse stage 在 1M case bank 維持 sub-ms / sub-20MB——cascade 第一階段的 scalability 主軸。
+
+### Stage 2 — Fine rerank（fine-tuned, VLM-Fusion + CEAH）
+
+Production 走 `case_db/`（fine-tuned VLM-Global + VLM-Lesion + LocalGlobalFusionWrapper）。對 Stage 1 取的 top-20 cases 的 candidate cause pool（~87 unique causes）做 attribution-aware 重排。
+
+| Setting | sem R@1 | sem R@10 | sem MRR | cluster R@10 | cluster MRR |
+|---|---|---|---|---|---|
+| Coarse only (cause-pool aggregation) | 22.3% | 44.4% | 0.298 | 35.8% | 0.235 |
+| **+ Fine rerank (CEAH, γ=0)** | **24.0%** | **46.8%** | **0.301** | **39.8%** | **0.271** |
+| **Δ fine-stage contribution** | **+1.7 pp** | **+2.4 pp** | +0.003 | **+4.0 pp** | **+0.036** |
+
+**Faithfulness**（lesion masking 反事實實驗）：
+
+| Bucket | Lesion-mask drop | Random-mask drop | Ratio |
+|---|---|---|---|
+| All | +0.036 | +0.005 | 7.2× |
+| Lesion-type causes | +0.040 | +0.006 | 6.7× |
+| **N≥3 lesions** | +0.055 | +0.003 | **18×** |
+
+→ 遮 lesion 對 multi-lesion case 的分數影響是隨機遮的 **18 倍**——α 是 load-bearing 不是裝飾。
+
+**Cause-type-aware α 分佈**（softmax over evidence tokens）：
+
+| Cause type | global α | text α | lesion sum α | l/g ratio |
 |---|---|---|---|---|
 | global-type（水質/緊迫） | 0.51 | 0.18 | 0.31 | 0.44 |
-| lesion-type（細菌/寄生蟲） | **0.25** | 0.28 | **0.47** | **1.39** ← 反轉 |
+| **lesion-type（細菌/寄生蟲）** | 0.25 | 0.28 | **0.47** | **1.39 (反轉)** |
 | mixed | 0.39 | 0.20 | 0.40 | 0.72 |
 
-### Faithfulness（masking experiment, lesion vs random drop ratio）
+### Asymmetric VLM dependency（cascade 的結構依據）
 
-| 桶 | 比例 |
-|---|---|
-| 全部 | 7.4× |
-| N=1 | 5.0× |
-| N=2 | 10× |
-| **N≥3** | **18×** |
+| Stage | VLM 依賴 | Ablation 結果 |
+|---|---|---|
+| **Coarse retrieval** | **不要 fine-tune** | Phase 1 raw +1.2 pp R@10 vs fine-tuned；Phase 3 raw student R@10 相同 (45.6%)；supervised projection MLP probe Δ MRR −0.001 |
+| **Fine rerank** | **必須 fine-tune (VLM-Fusion)** | raw case_db 上重訓 CEAH：retrieval 持平 (sem R@10 46.4%)，**faithfulness 反轉** (lesion drop +0.040 → **−0.031**) |
+
+→ Retrieval-side fine-tune 全部沒測到改善（zero-shot 飽和）；attribution-side fine-tune 是 architecturally required（LocalGlobalFusionWrapper 提供 lesion-specialized 視覺特徵）。Cascade 把這兩種不對稱的依賴乾淨分開。
 
 ---
 
-## 論文敘事建議
+## 論文敘事建議（cascade framing）
 
-> **FaCE-R 由三個元件組成：**
+> **FaCE-R is a coarse-to-fine cascade for case-based fish disease cause prediction with lesion-grounded explainability.**
 >
-> **C¹ (Phase 1, frozen-teacher retrieval)**: Hungarian-matched lesion-set similarity 做 zero-training 案例檢索。在 1,573 個 valid query 上達到 **semantic R@10 = 44.4%、coverage = 93.1%、MRR = 0.298；cluster R@10 = 35.8%**。Hyperparameter sweep 顯示 K=20, α=0.25 是最佳配置。**VLM ablation**：將 fine-tune 過的 VLM 替換為 raw `google/siglip2-base-patch16-224`，retrieval 持平甚至略勝（sem R@10 45.6%, MRR 0.300），確認 Phase 1 是 zero-shot vision-language retrieval 範式，**不依賴 in-domain 微調**。
+> **Coarse stage — zero-shot case retrieval at scale.** Three components progressively accelerate retrieval over a frozen pretrained SigLIP2 backbone on a 12,780-case database (production runs against `case_db_raw/`): **Phase 1** multi-vector Hungarian lesion-set matching reaches sem R@10 = 45.6% / MRR = 0.300 at 15.2 ms / query; **Phase 3** DeepSets dual-target distillation (listwise KL on the Phase 1 score matrix + case-to-cause SupCon InfoNCE on 56k cause text embeddings) collapses retrieval to a single-vector cosine, preserving quality (R@10 = 45.6%, MRR = 0.303 — slightly better than teacher) at 1.1 ms / query (14× faster); **Phase 4 CRR-DeepRVQ** applies Residual Vector Quantization to the frozen Phase 3 embeddings and trains a query-to-candidate cross-attention reranker to recover the compression residual Δ ≈ qᵀe. At M=4 K=256 (768× theoretical compression), RVQ-only retrieval matches dense within 0.6 pp R@10 in the production aggregation regime; scale-up benchmarks at N=1M show 90× memory compression at 17 MB and 0.59 ms / query while dense degrades to 5.15 ms / query at 1.5 GB. A no-aggregation stress regime (top_k_cases=1) reveals a 3.25 pp R@10 RVQ damage at the production point (M=4 K=256, raw) that the Light reranker **recovers 79% of** to 51.0% — within 0.7 pp of dense (51.7%). A full compression sweep (M ∈ {4,2,1}, K ∈ {256,64,16}) on both raw and fine-tuned encoders surfaces an asymmetry: at mild compression (768×) raw features recover better (79% vs 39%), but at aggressive compression (≥2048×) fine-tuned features quantize more gracefully (54–56% recovery vs 19–22% on raw), suggesting in-domain fine-tuning implicitly produces quantize-friendlier embedding clusters. The production cascade pins to the mild-compression sweet spot (raw + M=4 K=256), where the residual reranker mechanism is most effective. **Cross-ablation** (Phase 1 raw vs fine-tuned VLMs; supervised projection MLP probe on frozen VLM-Lesion; Phase 3 raw distillation; Phase 4 raw RVQ + reranker) consistently shows in-domain VLM fine-tuning provides no measurable retrieval improvement, confirming the coarse stage operates in a **zero-shot vision-language regime**.
 >
-> **C² (Phase 2 ablation)**: Cause-overlap supervised projection learning 在 frozen VLM 上提供不到 0.001 的 MRR 改進，作為 negative result 報告——VLM 表徵已飽和。
+> **Fine stage — lesion-grounded attribution rerank.** On the coarse stage's top-20 retrieved cases (candidate cause pool ≈ 87 unique causes), **CEAH** consumes fine-tuned VLM-Fusion lesion features (per-bbox SigLIP2 + LocalGlobalFusionWrapper) along with VLM-Global features and a candidate cause text embedding. It outputs a softmax α distribution over (global, text, lesion_1..N) evidence tokens plus a multiplicative score head (sigmoid global × sigmoid local) that architecturally forces local-evidence faithfulness — sigmoid α and additive scoring both collapse to α-saturation in v1 / v2 ablations. The fine stage delivers **+2.4 pp sem R@10 (44.4% → 46.8%)** and **+4.0 pp cluster R@10 (35.8% → 39.8%)** over coarse-only retrieval on 1,573 valid queries. Faithfulness is verified by counterfactual lesion masking: drop magnitude on multi-lesion cases (N ≥ 3) is **18× the random-mask baseline**, and the lesion / global α ratio inverts 3.2× across cause types (0.44 for global-type → 1.39 for lesion-type), showing the model preserves cause-type-aware behavior end-to-end. Replacing the fine-tuned case_db with raw SigLIP2 features preserves retrieval but **reverses** faithfulness (lesion drop +0.040 → −0.031), confirming VLM-Fusion is an architectural prerequisite for the fine stage.
 >
-> **C⁴ (Phase 4, Case Encoder)**: DeepSets pooling 加上 dual-target loss(listwise KL distillation + case-to-cause SupCon InfoNCE)蒸餾 Phase 1 的 multi-vector hungarian 比對成單一 cosine。**Retrieval 階段加速 14×(15.4 ms → 1.1 ms / query),端到端 hybrid 加速 5.4×(18.2 ms → 3.4 ms),且 R@10 微幅超越老師(44.7% vs 44.4%)。** 架構 ablation(Mamba / MeanPool / DeepSets)顯示此任務序列過短(avg 1.73 lesion),三種 encoder 等價;訓練 ablation 顯示 cause-side InfoNCE 是 dual-target 設計的關鍵 regularizer;negative result 顯示 candidate-pool 設計不是 bottleneck 而是有效的搜尋空間縮減(1-stage 全 vocab retrieval 比 2-stage 差 3.5×)。**VLM ablation**：把 dual-target distillation 跑在 raw SigLIP2 case_db 上，學生 R@10 = 45.6%（持平老師、MRR +0.003）、per-query 1.1 ms 不變，與 Phase 1 ablation 同步證明 retrieval-side 貢獻 ground truth 是 zero-shot vision-language。Mining 顯示 case_db 約 7% 結構性死角是 ~44.5% 物理上限的來源。
+> **Asymmetric VLM dependency** is the cascade's structural claim. Retrieval-side fine-tuning is consistently a no-op (Phase 1 raw vs fine-tuned, Phase 3 raw distillation, Phase 4 raw RVQ, plus the supervised projection MLP probe); attribution-side fine-tuning is architecturally load-bearing (LocalGlobalFusionWrapper). The cascade enforces this split by routing coarse retrieval through raw `case_db_raw/` and fine rerank through fine-tuned `case_db/`, turning the previously parameter-sensitive hybrid γ scoring (γ=0.75 default) into a principled two-stage pipeline (cascade ≡ γ=0, which is the strongest point of the γ-scan on **both** sem and cluster recall).
 >
-> **C³ (Phase 3, CEAH)**: 設計 softmax + multiplicative scoring 的 attribution head：
-> - **VLM-Lesion fine-tune（含 LocalGlobalFusion）為必要前提**：raw SigLIP2 case_db 上重訓 CEAH 顯示 retrieval 持平但 faithfulness 反轉（lesion drop +0.040 → −0.031），架構強制的 lesion-grounded explainability 需要 lesion-specialized 視覺特徵
-> - **架構強制 faithfulness**：α 透過 gated pooling 直接門控 evidence 對分數的貢獻
-> - **CEAH 提升 cluster recall**：γ=0 cl_R@10 = 39.8% vs γ=1 (Phase 1 only) 35.8%，+4pp；semantic 端 γ=0.5 達 sem_MRR=0.303 最佳
-> - **Cause-type-aware attribution**：global-type 病因 lesion/global α ratio = 0.44, lesion-type ratio = 1.39（3.2× 反轉）
-> - **Faithfulness 驗證**：遮 lesion 對 N≥3 的 case 影響是隨機遮的 **18 倍**
-> - **Multi-lesion 整合行為**：N=3+ 時 attribution 平均分散到所有 lesion（concentration = 1/N），證明模型採「集體視覺證據」策略
-> - **Vision-only deployment 可行**：medical/colloquial/none 三種推論模式 retrieval 差 ≤ 0.003 MRR；text 缺席時 attention 自動補位給 lesion，cause-type-aware 行為 preserved
+> **Robustness & deployment**: medical / colloquial / none 三種推論模式 retrieval 差 ≤ 0.003 MRR — vision-only deployment 完全可行，text 缺席時 attention 自動補位給 lesion，cause-type-aware 行為 preserved. Multi-lesion attribution at N≥3 spreads evenly across all lesions (concentration ≈ 1/N), demonstrating a **collective visual evidence** strategy rather than a single dominant-lesion heuristic.
+>
+> **Negative results**: supervised projection MLP on frozen lesion features (no measurable lift, ablation reinforces zero-shot framing); 1-stage full-vocab cause retrieval bypassing the case-pool aggregation (3.5× worse than 2-stage cascade); leave-one-out mining showing 0.4% of train cases (~53 / 12,780) have all GT causes outside retrieval reach, defining a structural R@K ceiling near 44.5% for retrieval-only metrics that the fine stage then pushes past.
 
 ---
 

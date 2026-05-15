@@ -1,10 +1,11 @@
-"""Projection heads for FaCE-R Phase 2.
+"""Projection heads for FaCE-R retrieval-side ablation probe (see train_projection.py).
 
 Lightweight MLPs that project frozen VLM embeddings into a space where
 case-to-case similarity (computed from projected lesion + raw global) better
-correlates with cause-set similarity.
+correlates with cause-set similarity. Used by the supervised projection MLP
+ablation only — not a pipeline phase, not loaded by CEAH / Phase 3 / Phase 4.
 
-Phase 2 default: train lesion head only, leave global frozen.
+Default: train lesion head only, leave global frozen.
 """
 
 from __future__ import annotations

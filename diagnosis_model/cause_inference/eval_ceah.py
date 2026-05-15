@@ -1,4 +1,4 @@
-"""Phase 3 evaluation: hybrid Phase-1 + CEAH scoring on valid set.
+"""Phase 2 evaluation: hybrid Phase-1 + CEAH scoring on valid set.
 
 Mirrors the Phase-1 contract from phase1_baseline.py:
   - All global / lesion / cause embeddings are L2-normalized before dot products.

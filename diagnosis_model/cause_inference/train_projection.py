@@ -1,4 +1,10 @@
-"""Phase 2: train a lesion projection head with cause-overlap supervision.
+"""Retrieval-side ablation probe: train a lesion projection MLP with cause-overlap supervision.
+
+This script is *not* a pipeline phase. The trained `best_lesion_head.pt` is never
+loaded by Phase 2 (CEAH has its own attribution MLPs), Phase 3 (DeepSets' per-lesion
+phi subsumes this projection with a stronger objective: listwise KL + SupCon InfoNCE),
+or Phase 4. Kept as a retrieval-side fine-tune ablation showing Δ sem MRR = −0.001 —
+one of several ablations supporting the zero-shot-saturation framing of the coarse stage.
 
 Pipeline (per training step):
   1. Sample a batch of B train cases.
@@ -202,7 +208,7 @@ def eval_valid(
 ) -> Dict[str, float]:
     """Run Phase-1-compatible valid eval using projected lesions.
 
-    Contract matched to phase1_baseline.py / Phase 3 eval:
+    Contract matched to phase1_baseline.py / Phase 2 eval:
       - L2-normalize embeddings before cosine dot products.
       - Retain only positive-similarity retrieved train cases.
       - Normalize retained positive case similarities before candidate scoring.
@@ -240,7 +246,7 @@ def eval_valid(
             alpha, beta, lesion_match="hungarian",
         )
 
-        # Phase 1 / Phase 3 contract: positive-similarity cases only, normalized weights.
+        # Phase 1 / Phase 2 contract: positive-similarity cases only, normalized weights.
         top_k_idx, top_k_w, _ = select_positive_top_cases(sims, top_k_cases)
         candidate_indices = build_candidate_pool(top_k_idx, train_cases)
         pool_size = len(candidate_indices)

@@ -1,4 +1,4 @@
-"""Train the Phase 4 case encoder via Phase 1 distillation.
+"""Train the Phase 3 case encoder via Phase 1 distillation.
 
 Listwise-KL distillation against the precomputed Phase 1 hungarian teacher
 score table (teacher_train_train.pt). For each batch of B train cases, the
@@ -8,7 +8,7 @@ The encoder consumes (global_emb, lesion_embs sorted by area DESC) and emits
 one L2-normed h_final ∈ R^768 per case so that retrieval becomes a single
 case-to-case cosine.
 
-Production choice is `--encoder_type deepsets` (see README Phase 4). The
+Production choice is `--encoder_type deepsets` (see README Phase 3). The
 'mean' baseline is also pure PyTorch and runs in the SDM env. The 'mamba'
 choice lives under diagnosis_model.cause_inference.mamba_ablation and
 requires the mamba3 conda env + CC=/usr/bin/gcc-12; build_encoder() lazy-
