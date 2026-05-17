@@ -18,6 +18,9 @@ export type TaskDocument = {
   is_healthy?: boolean;
   image_width: number;
   image_height: number;
+  // Optimistic concurrency token — read from /tasks/* responses,
+  // echo back on submit/save; server returns 409 if it doesn't match.
+  version?: number;
   last_modified_at: string;
   general_editor?: string[];
   expert_editor?: string[];
@@ -48,6 +51,7 @@ export type SubmitTaskRequest = {
 
 export type SubmitTaskResponse = {
   ok: boolean;
+  version?: number;
 };
 
 export type DatasetStats = {
@@ -89,6 +93,7 @@ export type SaveTaskRequest = {
 
 export type SaveTaskResponse = {
   ok: boolean;
+  version?: number;
 };
 
 export type AnnotatedItem = {

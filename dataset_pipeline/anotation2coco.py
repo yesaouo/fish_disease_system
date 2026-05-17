@@ -1,10 +1,31 @@
 import os
+import sys
 import json
 import argparse
 import shutil
-import random
+import hashlib
 import datetime
+from pathlib import Path
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _bbox import bbox_contains  # noqa: E402
+
+
+def assign_split(image_filename: str, ratios: list[float], names: list[str]) -> str:
+    """Stable per-image split assignment via md5(image_filename).
+
+    Adding new images leaves the split of every existing image unchanged,
+    so paper-time train/valid/test stays reproducible across re-runs.
+    """
+    h = hashlib.md5(image_filename.encode("utf-8")).hexdigest()
+    bucket = (int(h[:8], 16) % 10_000) / 10_000.0
+    cum = 0.0
+    for name, r in zip(names, ratios):
+        cum += r
+        if bucket < cum:
+            return name
+    return names[-1]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert custom dataset to COCO format.")
@@ -12,17 +33,6 @@ def parse_args():
     parser.add_argument("--output", required=True, help="Output directory.")
     parser.add_argument("--split", type=float, nargs=3, default=[8, 1, 1], help="Split ratio for train/valid/test (e.g., 8 1 1).")
     return parser.parse_args()
-
-def is_box_inside(inner_box, outer_box):
-    """
-    Check if inner_box is 100% inside outer_box.
-    Format: [xmin, ymin, xmax, ymax]
-    """
-    ix_min, iy_min, ix_max, iy_max = inner_box
-    ox_min, oy_min, ox_max, oy_max = outer_box
-
-    return (ix_min >= ox_min and iy_min >= oy_min and 
-            ix_max <= ox_max and iy_max <= oy_max)
 
 def load_symptoms_map(symptoms_path):
     with open(symptoms_path, 'r', encoding='utf-8') as f:
@@ -114,7 +124,7 @@ def process_single_pair(json_path, img_dir, global_img_id, str_to_id):
         
         # Check if ANY wound box is inside this healthy box
         for w_box in wound_boxes:
-            if is_box_inside(w_box, h_box):
+            if bbox_contains(w_box, h_box, fmt="xyxy"):
                 indices_to_remove.add(h_idx)
                 break
     
@@ -197,7 +207,7 @@ def main():
     ann_dir = os.path.join(args.input, "annotations")
     img_dir = os.path.join(args.input, "images")
     if os.path.exists(ann_dir) and os.path.exists(img_dir):
-        for f in os.listdir(ann_dir):
+        for f in sorted(os.listdir(ann_dir)):
             if f.endswith(".json"):
                 pairs.append((os.path.join(ann_dir, f), img_dir))
 
@@ -205,7 +215,7 @@ def main():
     h_ann_dir = os.path.join(args.input, "healthy_annotations")
     h_img_dir = os.path.join(args.input, "healthy_images")
     if os.path.exists(h_ann_dir) and os.path.exists(h_img_dir):
-        for f in os.listdir(h_ann_dir):
+        for f in sorted(os.listdir(h_ann_dir)):
             if f.endswith(".json"):
                 pairs.append((os.path.join(h_ann_dir, f), h_img_dir))
 
@@ -225,19 +235,17 @@ def main():
             })
             global_img_id += 1
 
-    # Shuffle
-    random.seed(42)
-    random.shuffle(all_data)
+    # Stable per-image split: hash(image_filename). Adding new images leaves
+    # existing splits unchanged. Approximate ratios; exact counts depend on hash.
+    split_names = ["train", "valid", "test"]
+    buckets: dict[str, list] = {name: [] for name in split_names}
+    for item in all_data:
+        split = assign_split(item["image"]["file_name"], split_ratios, split_names)
+        buckets[split].append(item)
 
-    # Calculate splits
-    n_total = len(all_data)
-    n_train = int(n_total * split_ratios[0])
-    n_valid = int(n_total * split_ratios[1])
-    # n_test is remainder
-
-    train_data = all_data[:n_train]
-    valid_data = all_data[n_train:n_train+n_valid]
-    test_data = all_data[n_train+n_valid:]
+    train_data = buckets["train"]
+    valid_data = buckets["valid"]
+    test_data = buckets["test"]
 
     sets = [
         ("train", train_data),

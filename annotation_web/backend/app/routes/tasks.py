@@ -37,7 +37,7 @@ def submit_task(
 ) -> SubmitTaskResponse:
     editor_name = request.editor_name
     dataset = request.full_json.dataset
-    tasks_service.submit_task(
+    new_version = tasks_service.submit_task(
         dataset=dataset,
         task_id=task_id,
         incoming=request.full_json,
@@ -45,7 +45,7 @@ def submit_task(
         is_expert=request.is_expert,
         settings=settings,
     )
-    return SubmitTaskResponse(ok=True)
+    return SubmitTaskResponse(ok=True, version=new_version)
 
 
 @router.post("/tasks/by_index", response_model=NextTaskResponse)
@@ -75,7 +75,7 @@ def save_task(
 ) -> SaveTaskResponse:
     editor_name = request.editor_name
     dataset = request.full_json.dataset
-    tasks_service.save_task(
+    new_version = tasks_service.save_task(
         dataset=dataset,
         task_id=task_id,
         incoming=request.full_json,
@@ -83,4 +83,4 @@ def save_task(
         is_expert=request.is_expert,
         settings=settings,
     )
-    return SaveTaskResponse(ok=True)
+    return SaveTaskResponse(ok=True, version=new_version)

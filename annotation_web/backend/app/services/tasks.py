@@ -4,7 +4,7 @@ import json
 import random
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List
+from typing import List
 
 from fastapi import HTTPException, status
 
@@ -26,66 +26,11 @@ def _now_iso() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _is_blank(value: Any) -> bool:
-    return not str(value or "").strip()
-
-
-def _is_healthy_from_raw(raw: dict[str, Any]) -> bool:
-    dets = raw.get("detections", [])
-    if not isinstance(dets, list) or len(dets) == 0:
-        return True
-    for d in dets:
-        if not isinstance(d, dict):
-            return False
-        if str(d.get("label") or "").strip() != HEALTHY_LABEL:
-            return False
-    return True
-
-
-def _required_fields_ok(raw: dict[str, Any]) -> bool:
-    # Healthy: no required fields.
-    if _is_healthy_from_raw(raw):
-        return True
-
-    overall = raw.get("overall") if isinstance(raw.get("overall"), dict) else {}
-    if _is_blank(overall.get("colloquial_zh")):
-        return False
-    if _is_blank(overall.get("medical_zh")):
-        return False
-
-    dets = raw.get("detections")
-    if not isinstance(dets, list) or len(dets) == 0:
-        return False
-
-    for d in dets:
-        if not isinstance(d, dict):
-            return False
-        label = str(d.get("label") or "").strip()
-        if _is_blank(label):
-            return False
-        if label != HEALTHY_LABEL and d.get("evidence_index") in (None, ""):
-            return False
-
-    causes = raw.get("global_causes_zh")
-    if not isinstance(causes, list) or len(causes) == 0:
-        return False
-
-    treatments = raw.get("global_treatments_zh")
-    if not isinstance(treatments, list) or len(treatments) == 0:
-        return False
-
-    return True
-
-
-def _is_expert_complete(
-    *,
-    expert_editors: list[str],
-    has_comments: bool,
-    required_fields_ok: bool,
-) -> bool:
-    # Completion is not based on "has expert editor" alone:
-    # expert must have submitted AND required fields are filled (or there are comments to justify omissions).
-    return bool(expert_editors) and (required_fields_ok or has_comments)
+# Re-export storage's helpers so callers within this module stay terse and
+# the completion-state logic lives in one place (it has to live in storage.py
+# because the dispatch backfill and upsert path both compute it without a
+# Pydantic model in hand).
+_is_blank = storage_service.is_blank
 
 
 def select_next_task(
@@ -110,42 +55,36 @@ def select_next_task(
         ordered_task_ids.append(task_id)
         index_map[task_id] = (i, fn)
 
-    rows = storage_service.list_task_rows(dataset, settings)
-    row_by_task_id = {str(r["task_id"]): r for r in rows if str(r["task_id"]) in index_map}
-
-    candidates: list[str] = []
-    for task_id in ordered_task_ids:
-        row = row_by_task_id.get(task_id)
-        if row is None:
-            candidates.append(task_id)
+    # Fetch only the columns dispatch needs — `doc_json` is intentionally NOT
+    # selected, so we never pay for parsing the per-task payload here.
+    # `expert_complete` is materialized at write time by upsert_task.
+    rows = storage_service.list_dispatch_state(dataset, settings)
+    skip: set[str] = set()
+    for r in rows:
+        task_id = str(r["task_id"])
+        if task_id not in index_map:
             continue
+        if int(r["expert_complete"] or 0) == 1:
+            skip.add(task_id)
+            continue
+        # Editor lists are short (≤ a few names) — JSON-parsing them is cheap.
         try:
-            has_comments = int(row["comments_count"] or 0) > 0
-            general_editors = json.loads(row["general_editors_json"] or "[]")
-            expert_editors = json.loads(row["expert_editors_json"] or "[]")
-            if not isinstance(general_editors, list):
-                general_editors = []
-            if not isinstance(expert_editors, list):
-                expert_editors = []
-            general_editors = [str(x).strip() for x in general_editors if str(x).strip()]
-            expert_editors = [str(x).strip() for x in expert_editors if str(x).strip()]
-
-            if editor_name in set(general_editors) or editor_name in set(expert_editors):
-                continue
-
-            raw = json.loads(row["doc_json"])
-            required_ok = _required_fields_ok(raw)
-            expert_complete = _is_expert_complete(
-                expert_editors=expert_editors,
-                has_comments=has_comments,
-                required_fields_ok=required_ok,
-            )
-            if expert_complete:
-                continue
-            candidates.append(task_id)
+            general = json.loads(r["general_editors_json"] or "[]")
+            expert = json.loads(r["expert_editors_json"] or "[]")
         except Exception:
-            candidates.append(task_id)
+            # Malformed editor JSON: be permissive (treat as dispatchable),
+            # matching the pre-existing fallback behaviour.
+            continue
+        if not isinstance(general, list):
+            general = []
+        if not isinstance(expert, list):
+            expert = []
+        already_edited = editor_name in {str(x).strip() for x in general if str(x).strip()} \
+            or editor_name in {str(x).strip() for x in expert if str(x).strip()}
+        if already_edited:
+            skip.add(task_id)
 
+    candidates = [t for t in ordered_task_ids if t not in skip]
     if not candidates:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="沒有可用任務")
 
@@ -220,7 +159,7 @@ def submit_task(
     editor_name: str,
     is_expert: bool,
     settings: Settings | None = None,
-) -> None:
+) -> int:
     settings = _ensure_settings(settings)
     current = storage_service.load_task(dataset, task_id, settings)
 
@@ -270,13 +209,14 @@ def submit_task(
         if editor_name not in updated.general_editor:
             updated.general_editor.append(editor_name)
 
-    storage_service.upsert_task(
+    new_version = storage_service.upsert_task(
         dataset,
         task_id,
         sort_index=None,
         document=updated,
         updated_by=editor_name,
         action="submit",
+        expected_version=int(getattr(incoming, "version", 0) or 0),
         settings=settings,
     )
     storage_service.append_audit_log(
@@ -290,6 +230,7 @@ def submit_task(
         },
         settings,
     )
+    return new_version
 
 
 def get_task_by_index(
@@ -364,7 +305,7 @@ def save_task(
     editor_name: str,
     is_expert: bool,
     settings: Settings | None = None,
-) -> None:
+) -> int:
     settings = _ensure_settings(settings)
     current = storage_service.load_task(dataset, task_id, settings)
     classes = datasets_service.load_classes(dataset, settings)
@@ -384,13 +325,14 @@ def save_task(
     updated.general_editor = list(getattr(current, "general_editor", []) or [])
     updated.expert_editor = list(getattr(current, "expert_editor", []) or [])
 
-    storage_service.upsert_task(
+    new_version = storage_service.upsert_task(
         dataset,
         task_id,
         sort_index=None,
         document=updated,
         updated_by=editor_name,
         action="save",
+        expected_version=int(getattr(incoming, "version", 0) or 0),
         settings=settings,
     )
     storage_service.append_audit_log(
@@ -404,3 +346,4 @@ def save_task(
         },
         settings,
     )
+    return new_version

@@ -1,6 +1,5 @@
 import React, {
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useReducer,
@@ -9,7 +8,6 @@ import React, {
 } from "react";
 import { AxiosError } from "axios";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { UNSAFE_NavigationContext as NavigationContext } from "react-router";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -19,7 +17,6 @@ import {
   SquarePlus,
   Trash2,
   Undo2,
-  XCircle,
 } from "lucide-react";
 
 import {
@@ -36,250 +33,26 @@ import { useAuth } from "../../context/AuthContext";
 import { useDataset } from "../../context/DatasetContext";
 import AnnotationCanvas from "../annotation/components/AnnotationCanvas";
 import {
-  ValidationError,
   cloneTaskDocument,
   defaultDetection,
   documentsEqual,
   normalizeBox,
 } from "../../lib/taskUtils";
+import {
+  annotationReducer,
+  initialAnnotationState,
+} from "../annotation/shared/annotationReducer";
+import {
+  Kbd,
+  IconButton,
+  Separator,
+  Banner,
+  withBase,
+} from "../annotation/shared/ui";
+import { useNavBlocker } from "../annotation/shared/useNavBlocker";
 
 const HEALTHY_LABEL = "healthy_region";
 const HEALTHY_LABEL_DISPLAY = "健康特徵";
-
-const baseUrl = import.meta.env.BASE_URL || "/";
-
-// --------- Helpers for reducer-based history ---------
-const HISTORY_LIMIT = 100;
-
-function clampHistory(hist: TaskDocument[]) {
-  return hist.length > HISTORY_LIMIT
-    ? hist.slice(hist.length - HISTORY_LIMIT)
-    : hist;
-}
-
-function normalizeSelection(sel: number | null, detections: unknown[]) {
-  if (!detections || detections.length === 0) return null;
-  return sel == null ? null : Math.min(sel, detections.length - 1);
-}
-
-type State = {
-  doc: TaskDocument | null;
-  history: TaskDocument[];
-  future: TaskDocument[];
-  selectedIndex: number | null;
-  validationErrors: ValidationError[];
-};
-
-type Action =
-  | { type: "UNDO" }
-  | { type: "REDO" }
-  | { type: "APPLY_DOC"; next: TaskDocument; nextSelected?: number | null }
-  | { type: "LOAD_DOC"; doc: TaskDocument }
-  | { type: "SET_SELECTED"; index: number | null }
-  | { type: "SET_ERRORS"; errors: ValidationError[] }
-  | { type: "RESET_ERRORS" };
-
-function reducer(state: State, action: Action): State {
-  switch (action.type) {
-    case "UNDO": {
-      const { doc, history } = state;
-      if (!doc || history.length === 0) return state;
-
-      const prev = history[history.length - 1];
-      const nextDoc = cloneTaskDocument(prev);
-
-      return {
-        ...state,
-        doc: nextDoc,
-        history: history.slice(0, -1),
-        future: [cloneTaskDocument(doc), ...state.future],
-        selectedIndex: normalizeSelection(
-          state.selectedIndex,
-          nextDoc.detections
-        ),
-        validationErrors: [],
-      };
-    }
-
-    case "REDO": {
-      const { doc, future } = state;
-      if (!doc || future.length === 0) return state;
-
-      const [next, ...rest] = future;
-      const nextDoc = cloneTaskDocument(next);
-
-      return {
-        ...state,
-        doc: nextDoc,
-        history: clampHistory([...state.history, cloneTaskDocument(doc)]),
-        future: rest,
-        selectedIndex: normalizeSelection(
-          state.selectedIndex,
-          nextDoc.detections
-        ),
-        validationErrors: [],
-      };
-    }
-
-    case "APPLY_DOC": {
-      const nextDoc = cloneTaskDocument(action.next);
-      return {
-        ...state,
-        doc: nextDoc,
-        history: state.doc
-          ? clampHistory([...state.history, cloneTaskDocument(state.doc)])
-          : state.history,
-        future: [],
-        selectedIndex:
-          action.nextSelected !== undefined
-            ? action.nextSelected
-            : normalizeSelection(state.selectedIndex, nextDoc.detections),
-        validationErrors: [],
-      };
-    }
-
-    case "LOAD_DOC": {
-      return {
-        doc: cloneTaskDocument(action.doc),
-        history: [],
-        future: [],
-        selectedIndex: null,
-        validationErrors: [],
-      };
-    }
-
-    case "SET_SELECTED":
-      return { ...state, selectedIndex: action.index };
-
-    case "SET_ERRORS":
-      return { ...state, validationErrors: action.errors };
-
-    case "RESET_ERRORS":
-      return { ...state, validationErrors: [] };
-
-    default:
-      return state;
-  }
-}
-
-// ===== UI helpers =====
-const Kbd: React.FC<React.PropsWithChildren> = ({ children }) => (
-  <kbd className="rounded border border-slate-300 bg-white px-1.5 text-[10px] font-medium text-slate-700 shadow-sm">
-    {children}
-  </kbd>
-);
-
-interface IconButtonProps
-  extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  label: string;
-  shortcut?: string;
-}
-const IconButton: React.FC<IconButtonProps> = ({
-  label,
-  shortcut,
-  className = "",
-  children,
-  ...rest
-}) => (
-  <button
-    type="button"
-    aria-label={shortcut ? `${label}（${shortcut}）` : label}
-    title={shortcut ? `${label}（${shortcut}）` : label}
-    className={[
-      "inline-flex h-9 w-9 items-center justify-center rounded-md",
-      "border border-slate-200 bg-white/90 hover:bg-white",
-      "shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500",
-      "disabled:pointer-events-none disabled:opacity-50",
-      className,
-    ].join(" ")}
-    {...rest}
-  >
-    {children}
-    <span className="sr-only">
-      {label}
-      {shortcut ? `（${shortcut}）` : ""}
-    </span>
-  </button>
-);
-
-const Separator: React.FC<{ vertical?: boolean; className?: string }> = ({
-  vertical,
-  className,
-}) => (
-  <div
-    className={[
-      vertical ? "h-6 w-px" : "h-px w-full",
-      "bg-slate-200",
-      className || "",
-    ].join(" ")}
-  />
-);
-
-const Banner: React.FC<{
-  kind: "error" | "warning";
-  children: React.ReactNode;
-  onClose?: () => void;
-}> = ({ kind, children, onClose }) => {
-  const tone =
-    kind === "error"
-      ? "border-red-200 bg-red-50 text-red-700"
-      : "border-amber-200 bg-amber-50 text-amber-800";
-  const Icon = kind === "error" ? XCircle : AlertTriangle;
-
-  return (
-    <div
-      role="alert"
-      aria-live="assertive"
-      className={`mt-2 rounded border px-3 py-2 text-sm ${tone} flex items-start justify-between`}
-    >
-      <div className="flex items-start gap-2">
-        <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-        <div>{children}</div>
-      </div>
-      {onClose && (
-        <button
-          type="button"
-          onClick={onClose}
-          className="ml-3 rounded px-2 py-1 text-xs hover:bg-white/60"
-        >
-          關閉
-        </button>
-      )}
-    </div>
-  );
-};
-
-// ===== Navigation guard =====
-const useNavBlocker = (
-  when: boolean,
-  bypass?: (nextLocation: any) => boolean
-) => {
-  const { navigator } = useContext(NavigationContext) as any;
-  useEffect(() => {
-    if (!when || !navigator?.block) return;
-    const unblock = navigator.block((tx: any) => {
-      if (bypass?.(tx.location)) {
-        unblock();
-        tx.retry();
-        return;
-      }
-      const ok = window.confirm(
-        "目前有未儲存的變更，離開將放棄這些變更。確定要離開嗎？"
-      );
-      if (ok) {
-        unblock();
-        tx.retry();
-      }
-    });
-    return unblock;
-  }, [when, navigator, bypass]);
-};
-
-const withBase = (path: string) => {
-  const base = import.meta.env.BASE_URL || "/";
-  if (!path) return path;
-  return path.startsWith("/") ? `${base.replace(/\/$/, "")}${path}` : path;
-};
 
 const HealthyAnnotationPage: React.FC = () => {
   const navigate = useNavigate();
@@ -292,13 +65,7 @@ const HealthyAnnotationPage: React.FC = () => {
 
   const [task, setTask] = useState<NextTaskResponse | null>(null);
   const [{ doc, history, future, selectedIndex, validationErrors }, dispatch] =
-    useReducer(reducer, {
-      doc: null,
-      history: [],
-      future: [],
-      selectedIndex: null,
-      validationErrors: [],
-    } as State);
+    useReducer(annotationReducer, initialAnnotationState);
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -569,17 +336,22 @@ const HealthyAnnotationPage: React.FC = () => {
     setSaving(true);
     dispatch({ type: "RESET_ERRORS" });
     try {
-      await saveTask(task.task_id, {
+      const resp = await saveTask(task.task_id, {
         full_json: doc,
         editor_name: name,
         is_expert: isExpert,
       });
-      setTask((prev) =>
-        prev ? { ...prev, task: cloneTaskDocument(doc) } : prev
-      );
+      const nextVersion = resp.version ?? ((doc.version ?? 0) + 1);
+      dispatch({ type: "SET_VERSION", version: nextVersion });
+      const savedDoc: TaskDocument = { ...cloneTaskDocument(doc), version: nextVersion };
+      setTask((prev) => (prev ? { ...prev, task: savedDoc } : prev));
     } catch (err) {
       const axiosErr = err as AxiosError<{ detail?: string }>;
-      setError(axiosErr.response?.data?.detail || "保存失敗，請稍後再試。");
+      if (axiosErr.response?.status === 409) {
+        setError(axiosErr.response.data?.detail || "此任務已被更新，請重新載入後再儲存。");
+      } else {
+        setError(axiosErr.response?.data?.detail || "保存失敗，請稍後再試。");
+      }
     } finally {
       setSaving(false);
     }
@@ -678,8 +450,7 @@ const HealthyAnnotationPage: React.FC = () => {
   const imageUrl = useMemo(() => {
     const url = task?.image_url ?? "";
     if (!url) return "";
-    if (url.startsWith("/")) return `${baseUrl.replace(/\/$/, "")}${url}`;
-    return url;
+    return withBase(url);
   }, [task]);
 
   return (

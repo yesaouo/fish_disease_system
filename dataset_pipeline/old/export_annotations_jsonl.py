@@ -15,12 +15,15 @@ def _iter_datasets(input_dir: Path, dataset: Optional[str]) -> Iterable[Tuple[st
     Yield (dataset_name, dataset_dir) pairs.
 
     If `dataset` is provided, only that one is returned.
-    Otherwise, every subdirectory of `input_dir` that contains an `annotations` directory
-    is considered a dataset.
+    Otherwise, every subdirectory of `input_dir` that contains an `annotations`
+    OR `healthy_annotations` directory is considered a dataset.
     """
+    def _has_annotations(ds_dir: Path) -> bool:
+        return (ds_dir / "annotations").is_dir() or (ds_dir / "healthy_annotations").is_dir()
+
     if dataset:
         ds_dir = input_dir / dataset
-        if ds_dir.is_dir() and (ds_dir / "annotations").is_dir():
+        if ds_dir.is_dir() and _has_annotations(ds_dir):
             yield dataset, ds_dir
         return
 
@@ -30,7 +33,7 @@ def _iter_datasets(input_dir: Path, dataset: Optional[str]) -> Iterable[Tuple[st
     for child in sorted(input_dir.iterdir()):
         if not child.is_dir():
             continue
-        if (child / "annotations").is_dir():
+        if _has_annotations(child):
             yield child.name, child
 
 

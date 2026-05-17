@@ -104,6 +104,9 @@ class TaskDocument(BaseModel):
     is_healthy: bool = False
     image_width: int = Field(default=1000)
     image_height: int = Field(default=1000)
+    # Optimistic concurrency: server bumps this on every update; clients
+    # echo back the version they read, and writes 409 if it doesn't match.
+    version: int = 0
     last_modified_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     # Editors per role (append-only at submit time)
     general_editor: List[str] = Field(default_factory=list)
@@ -288,6 +291,7 @@ class SubmitTaskRequest(BaseModel):
 
 class SubmitTaskResponse(BaseModel):
     ok: bool
+    version: int = 0
 
 class StatsResponse(BaseModel):
     dataset: str
@@ -332,6 +336,7 @@ class SaveTaskRequest(BaseModel):
 
 class SaveTaskResponse(BaseModel):
     ok: bool
+    version: int = 0
 
 
 class AnnotatedItem(BaseModel):

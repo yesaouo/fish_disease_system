@@ -23,6 +23,73 @@ def _ensure_settings(settings: Settings | None) -> Settings:
     return settings or _settings
 
 
+# ---- Completion-state helpers (also used by tasks.py via re-export) ----
+# These run against the raw payload dict (mode="json" form of TaskDocument),
+# not the Pydantic model, so they're cheap enough to call during migration
+# backfill and on every upsert.
+
+
+def is_blank(value: Any) -> bool:
+    return not str(value or "").strip()
+
+
+def is_healthy_from_raw(raw: Dict) -> bool:
+    dets = raw.get("detections", [])
+    if not isinstance(dets, list) or len(dets) == 0:
+        return True
+    for d in dets:
+        if not isinstance(d, dict):
+            return False
+        if str(d.get("label") or "").strip() != HEALTHY_LABEL:
+            return False
+    return True
+
+
+def required_fields_ok(raw: Dict) -> bool:
+    if is_healthy_from_raw(raw):
+        return True
+    overall = raw.get("overall") if isinstance(raw.get("overall"), dict) else {}
+    if is_blank(overall.get("colloquial_zh")):
+        return False
+    if is_blank(overall.get("medical_zh")):
+        return False
+    dets = raw.get("detections")
+    if not isinstance(dets, list) or len(dets) == 0:
+        return False
+    for d in dets:
+        if not isinstance(d, dict):
+            return False
+        label = str(d.get("label") or "").strip()
+        if is_blank(label):
+            return False
+        if label != HEALTHY_LABEL and d.get("evidence_index") in (None, ""):
+            return False
+    causes = raw.get("global_causes_zh")
+    if not isinstance(causes, list) or len(causes) == 0:
+        return False
+    treatments = raw.get("global_treatments_zh")
+    if not isinstance(treatments, list) or len(treatments) == 0:
+        return False
+    return True
+
+
+def compute_expert_complete(payload: Dict) -> bool:
+    """Materialized form of the dispatch filter.
+
+    A task is "done from dispatch's perspective" when an expert has submitted
+    AND either the required fields are filled or there's a comment to justify
+    omissions. Pre-computed at write time so `select_next_task` doesn't have
+    to re-parse `doc_json` on every request.
+    """
+    expert_editors = payload.get("expert_editor") or []
+    if not isinstance(expert_editors, list) or not expert_editors:
+        return False
+    comments = payload.get("comments") or []
+    if isinstance(comments, list) and len(comments) > 0:
+        return True
+    return required_fields_ok(payload)
+
+
 def get_annotations_dir(dataset_dir: Path) -> Path:
     # Legacy JSON dir (kept for migration scripts)
     return dataset_dir / "annotations"
@@ -262,12 +329,35 @@ def ensure_db(dataset_dir: Path, settings: Settings | None = None) -> Path:
                   general_editors_json TEXT NOT NULL DEFAULT '[]',
                   expert_editors_json  TEXT NOT NULL DEFAULT '[]',
                   comments_count      INTEGER NOT NULL DEFAULT 0,
+                  version             INTEGER NOT NULL DEFAULT 0,
+                  expert_complete     INTEGER NOT NULL DEFAULT 0,
                   doc_json            TEXT NOT NULL
                 );
                 """
             )
+            # Migrate pre-version DBs.
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks);").fetchall()}
+            if "version" not in cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0;")
+            if "expert_complete" not in cols:
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN expert_complete INTEGER NOT NULL DEFAULT 0;"
+                )
+                # One-shot backfill from existing doc_json so dispatch immediately
+                # respects existing completion state.
+                for r in conn.execute("SELECT task_id, doc_json FROM tasks;").fetchall():
+                    try:
+                        payload = json.loads(r["doc_json"])
+                    except Exception:
+                        continue
+                    if compute_expert_complete(payload):
+                        conn.execute(
+                            "UPDATE tasks SET expert_complete = 1 WHERE task_id = ?;",
+                            (r["task_id"],),
+                        )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_last_modified_at ON tasks(last_modified_at);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_is_healthy ON tasks(is_healthy);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_expert_complete ON tasks(expert_complete);")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS history (
@@ -502,12 +592,14 @@ def load_task(
     conn = _connect(db_path)
     try:
         row = conn.execute(
-            "SELECT task_id, image_filename, doc_json FROM tasks WHERE task_id = ?;",
+            "SELECT task_id, image_filename, doc_json, version FROM tasks WHERE task_id = ?;",
             (stem,),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task 不存在")
         raw = json.loads(row["doc_json"])
+        # version is authoritative from the DB column, not from doc_json.
+        raw["version"] = int(row["version"] or 0)
         image_filename = str(row["image_filename"])
         return _normalize_task(raw, dataset, str(row["task_id"]), image_filename, dataset_dir, settings)
     finally:
@@ -526,17 +618,43 @@ def load_all_tasks(
     conn = _connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT task_id, image_filename, doc_json FROM tasks ORDER BY sort_index ASC;"
+            "SELECT task_id, image_filename, doc_json, version FROM tasks ORDER BY sort_index ASC;"
         ).fetchall()
         for row in rows:
             stem = str(row["task_id"])
             try:
                 raw = json.loads(row["doc_json"])
+                raw["version"] = int(row["version"] or 0)
                 image_filename = str(row["image_filename"])
                 doc = _normalize_task(raw, dataset, stem, image_filename, dataset_dir, settings)
                 yield stem, doc
             except Exception:
                 continue
+    finally:
+        conn.close()
+
+
+def list_dispatch_state(
+    dataset: str,
+    settings: Settings | None = None,
+) -> list[sqlite3.Row]:
+    """Lightweight scan for /api/tasks/next: returns only the columns the
+    dispatcher actually needs. Avoids reading `doc_json`, which is the
+    expensive field on a per-task basis.
+    """
+    settings = _ensure_settings(settings)
+    dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
+    db_path = get_db_path(dataset_dir, settings)
+    if not db_path.exists():
+        return []
+    conn = _connect(db_path)
+    try:
+        return conn.execute(
+            """
+            SELECT task_id, general_editors_json, expert_editors_json, expert_complete
+            FROM tasks;
+            """
+        ).fetchall()
     finally:
         conn.close()
 
@@ -601,9 +719,15 @@ def upsert_task(
     *,
     updated_by: str | None,
     action: str,
+    expected_version: int | None = None,
     settings: Settings | None = None,
-) -> None:
-    """Insert/update a task row and record a history entry on updates."""
+) -> int:
+    """Insert/update a task row and record a history entry on updates.
+
+    If `expected_version` is given on an update, the DB row's version must
+    match or 409 is raised (optimistic concurrency). Version is bumped by 1
+    on every successful update. Returns the new version after the write.
+    """
     settings = _ensure_settings(settings)
     dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
     db_path = ensure_db(dataset_dir, settings)
@@ -616,30 +740,35 @@ def upsert_task(
     else:
         derived = True
     payload["is_healthy"] = bool(derived)
-    new_json = json.dumps(payload, ensure_ascii=False)
     now_iso = datetime.now(timezone.utc).isoformat()
     general_json = json.dumps(getattr(document, "general_editor", []) or [], ensure_ascii=False)
     expert_json = json.dumps(getattr(document, "expert_editor", []) or [], ensure_ascii=False)
     comments_count = int(len(getattr(document, "comments", []) or []))
     is_healthy = 1 if bool(derived) else 0
+    # Pre-compute the dispatch filter so /api/tasks/next stays cheap.
+    expert_complete = 1 if compute_expert_complete(payload) else 0
 
     conn = _connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE;")
         existing = conn.execute(
-            "SELECT doc_json, sort_index FROM tasks WHERE task_id = ?;",
+            "SELECT doc_json, sort_index, version FROM tasks WHERE task_id = ?;",
             (task_id,),
         ).fetchone()
 
         if existing is None:
             if sort_index is None:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="sort_index required for insert")
+            new_version = 0
+            payload["version"] = new_version
+            new_json = json.dumps(payload, ensure_ascii=False)
             conn.execute(
                 """
                 INSERT INTO tasks(
                   task_id, sort_index, image_filename, is_healthy, last_modified_at,
-                  general_editors_json, expert_editors_json, comments_count, doc_json
-                ) VALUES(?,?,?,?,?,?,?,?,?);
+                  general_editors_json, expert_editors_json, comments_count, version,
+                  expert_complete, doc_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?);
                 """,
                 (
                     task_id,
@@ -650,13 +779,25 @@ def upsert_task(
                     general_json,
                     expert_json,
                     comments_count,
+                    new_version,
+                    expert_complete,
                     new_json,
                 ),
             )
         else:
+            current_version = int(existing["version"] or 0)
+            if expected_version is not None and expected_version != current_version:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="此任務已被其他編輯者更新，請重新載入後再試。",
+                )
             # Keep existing ordering for updates.
             sort_index = int(existing["sort_index"])
             old_json = str(existing["doc_json"])
+            new_version = current_version + 1
+            payload["version"] = new_version
+            new_json = json.dumps(payload, ensure_ascii=False)
             conn.execute(
                 """
                 INSERT INTO history(task_id, updated_at, updated_by, action, old_json, new_json)
@@ -673,6 +814,8 @@ def upsert_task(
                     general_editors_json=?,
                     expert_editors_json=?,
                     comments_count=?,
+                    version=?,
+                    expert_complete=?,
                     doc_json=?
                 WHERE task_id=?;
                 """,
@@ -683,11 +826,16 @@ def upsert_task(
                     general_json,
                     expert_json,
                     comments_count,
+                    new_version,
+                    expert_complete,
                     new_json,
                     task_id,
                 ),
             )
         conn.commit()
+        return new_version
+    except HTTPException:
+        raise
     except sqlite3.IntegrityError as exc:
         conn.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="資料庫寫入衝突") from exc

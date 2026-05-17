@@ -1,17 +1,17 @@
-import os
 import sys
 import json
 import argparse
-import time
-import random
 import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 
-from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gemini import fetch_or_generate_json  # noqa: E402
+from _bbox import bbox_contains  # noqa: E402
 
 DEFAULT_OTHER_LABEL = "healthy_region"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -27,84 +27,6 @@ def ensure_dir(p: str | Path) -> Path:
 
 def read_text(path: str | Path) -> str:
     return Path(path).read_text(encoding="utf-8")
-
-
-# --------------- Gemini --------------- #
-
-def _retry(func, times: int = 3, base: float = 1.0):
-    for i in range(times):
-        try:
-            return func()
-        except Exception:
-            if i == times - 1:
-                raise
-            time.sleep(base * (2 ** i) + random.random() * 0.2)
-
-
-def call_gemini(image_path: str, prompt: str, model: str) -> str:
-    from google import genai
-    from google.genai import types as genai_types
-
-    load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("請設定 GEMINI_API_KEY 或 GOOGLE_API_KEY")
-
-    client = genai.Client(api_key=api_key)
-
-    with Image.open(image_path) as raw_im:
-        im = ImageOps.exif_transpose(raw_im).copy()
-    im.thumbnail([1280, 1280])
-
-    def _do_req():
-        resp = client.models.generate_content(
-            model=model,
-            contents=[prompt, im],
-            config=genai_types.GenerateContentConfig(
-                system_instruction="你是專精觀賞魚疾病的視覺助理，請輸出嚴格 JSON。",
-                temperature=0.2,
-            ),
-        )
-        out = getattr(resp, "text", None) or getattr(resp, "output_text", None)
-        if not out:
-            raise RuntimeError("模型沒有回傳文字內容")
-        return out
-
-    return _retry(_do_req, times=3, base=1.0)
-
-
-def parse_json_strict(text: str) -> Dict[str, Any]:
-    import re
-
-    s = text.strip()
-    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.I | re.M)
-    m = re.search(r"\{.*\}", s, flags=re.S)
-    if not m:
-        raise ValueError("回應缺少 JSON 物件：\n" + text)
-    return json.loads(m.group(0))
-
-
-def validate_gemini_payload(data: Any) -> Dict[str, Any]:
-    if not isinstance(data, dict):
-        raise ValueError("Gemini 回傳不是 JSON 物件")
-
-    overall = data.get("overall")
-    if not isinstance(overall, dict):
-        raise ValueError("缺少 overall")
-    for k in ("colloquial_zh", "medical_zh"):
-        v = overall.get(k)
-        if not isinstance(v, str) or not v.strip():
-            raise ValueError(f"overall.{k} 需為非空字串")
-
-    for key in ("global_causes_zh", "global_treatments_zh"):
-        arr = data.get(key)
-        if not (isinstance(arr, list) and all(isinstance(x, str) for x in arr)):
-            raise ValueError(f"{key} 需為 List[str]")
-
-    if not isinstance(data.get("generated_by"), str):
-        raise ValueError("缺少 generated_by")
-
-    return data
 
 
 # -------------- COCO + YAML -------------- #
@@ -198,20 +120,6 @@ def process_segmentation(coco: dict) -> None:
     print(f"[INFO] 有 {seg_count} 個 annotation 含 segmentation，其中 {conv_count} 個成功轉成 bbox。")
 
 
-def bbox_contains(inner, outer) -> bool:
-    """
-    檢查 inner bbox 是否完全在 outer bbox 之內
-    bbox 格式為 [x, y, w, h]
-    """
-    ix, iy, iw, ih = inner
-    ox, oy, ow, oh = outer
-
-    ix1, iy1, ix2, iy2 = ix, iy, ix + iw, iy + ih
-    ox1, oy1, ox2, oy2 = ox, oy, ox + ow, oy + oh
-
-    return (ix1 >= ox1 and iy1 >= oy1 and ix2 <= ox2 and iy2 <= oy2)
-
-
 def remove_healthy_region_if_other_inside(
     coco: dict,
     yaml_map: Dict[int, str],
@@ -267,7 +175,7 @@ def remove_healthy_region_if_other_inside(
                 if not (isinstance(obbox, (list, tuple)) and len(obbox) == 4):
                     continue
                 try:
-                    if bbox_contains(obbox, hbbox):
+                    if bbox_contains(obbox, hbbox, fmt="xywh"):
                         removed_ids.add(h["id"])
                         removed_here += 1
                         break
@@ -416,65 +324,6 @@ def _is_valid_box_xyxy(box: Any) -> bool:
         return False
     x1, y1, x2, y2 = box
     return all(isinstance(v, (int, float)) for v in (x1, y1, x2, y2))
-
-
-def fetch_or_generate_json(
-    image_path: str,
-    prompt: str,
-    model: str,
-    json_path: Path,
-    cache_only: bool,
-    overwrite_cache: bool,
-    reuse_annotations_dir: Path | None = None,
-) -> Dict[str, Any]:
-    """
-    先試著從 reuse_annotations_dir 讀舊 JSON（如果有給）：
-      - 若同名 JSON 有 overall / global_causes_zh / global_treatments_zh 就直接沿用
-    否則走原本快取 + Gemini 流程
-    """
-    stem = Path(image_path).stem
-
-    # ==== 暫時復用舊 annotations（之後可以整段移除） ====
-    if reuse_annotations_dir is not None:
-        legacy_path = reuse_annotations_dir / f"{stem}.json"
-        if legacy_path.is_file():
-            try:
-                legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
-                if all(k in legacy for k in ("overall", "global_causes_zh", "global_treatments_zh")):
-                    data = {
-                        "overall": legacy["overall"],
-                        "global_causes_zh": legacy["global_causes_zh"],
-                        "global_treatments_zh": legacy["global_treatments_zh"],
-                        "generated_by": legacy.get("generated_by", "legacy_import"),
-                    }
-                    return validate_gemini_payload(data)
-            except Exception as e:
-                print(f"[WARN] 復用舊 annotations 失敗 ({legacy_path}): {e}", file=sys.stderr)
-    # ==== 暫時復用邏輯結束 ====
-
-    if overwrite_cache:
-        text = call_gemini(image_path, prompt, model=model)
-        data = parse_json_strict(text)
-        data.setdefault("generated_by", model)
-        return validate_gemini_payload(data)
-
-    if json_path.exists():
-        try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
-            if "generated_by" not in data:
-                data["generated_by"] = model
-            return validate_gemini_payload(data)
-        except Exception:
-            if cache_only:
-                raise
-
-    if cache_only:
-        raise FileNotFoundError(f"找不到快取 JSON：{json_path}")
-
-    text = call_gemini(image_path, prompt, model=model)
-    data = parse_json_strict(text)
-    data.setdefault("generated_by", model)
-    return validate_gemini_payload(data)
 
 
 def process_one_image(

@@ -2,7 +2,6 @@ import os
 import json
 import csv
 import argparse
-import itertools
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
@@ -52,24 +51,22 @@ def get_square_context_crop(img_pil, bbox, square_scale=1.5):
     else:
         return valid_crop
 
-# ===== 核心邏輯：載入 Caption 並建立輪詢器 =====
-def create_caption_iterators(json_path):
+# ===== 核心邏輯：載入 Caption 列表 =====
+def load_caption_lists(json_path):
     """
-    讀取 symptoms.json，並為每個 label ID 建立一個無限循環的 iterator (Round-Robin)。
+    讀取 symptoms.json，回傳 {label_id_str: list[captions_en]}。
+    Caption 選擇改用 `captions[ann_id % len(captions)]`，與迭代順序無關，
+    重跑可重現。
     """
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
-    data_content = data['data']
-    iterators = {}
-    
-    for label_id, content in data_content.items():
-        captions = content.get('captions_en', [])
 
-        # itertools.cycle 會建立一個無限循環的產生器 ['A', 'B'] -> A, B, A, B...
-        iterators[str(label_id)] = itertools.cycle(captions)
-        
-    return iterators
+    caption_lists = {}
+    for label_id, content in data.get('data', {}).items():
+        captions = content.get('captions_en', []) or []
+        caption_lists[str(label_id)] = list(captions)
+
+    return caption_lists
 
 # ===== 處理單一 Split (Train/Valid/Test) =====
 def process_single_split(split_name, input_split_dir, output_split_dir, symptoms_json_path, square_scale=1.5):
@@ -91,8 +88,8 @@ def process_single_split(split_name, input_split_dir, output_split_dir, symptoms
     # 2. 建立輸出資料夾
     os.makedirs(output_split_dir, exist_ok=True)
     
-    # 3. 準備 Caption Iterators
-    caption_iters = create_caption_iterators(symptoms_json_path)
+    # 3. 準備 Caption 列表
+    caption_lists = load_caption_lists(symptoms_json_path)
     
     # 4. 載入 COCO JSON
     coco_json_path = input_split_dir / "_annotations.coco.json"
@@ -141,11 +138,12 @@ def process_single_split(split_name, input_split_dir, output_split_dir, symptoms
             ann_id = ann['id']
             bbox = ann['bbox'] # [x, y, w, h]
             
-            # (A) 取得 Caption (輪流取出)
-            if category_id in caption_iters:
-                caption_text = next(caption_iters[category_id])
+            # (A) 取得 Caption：依 annotation id 對 captions 取模
+            captions = caption_lists.get(category_id)
+            if captions:
+                caption_text = captions[int(ann_id) % len(captions)]
             else:
-                caption_text = "a photo of a medical symptom" 
+                caption_text = "a photo of a medical symptom"
             
             # (B) 執行 Square Crop
             crop_img = get_square_context_crop(pil_img, bbox, square_scale=square_scale)

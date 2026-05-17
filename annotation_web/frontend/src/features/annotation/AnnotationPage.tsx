@@ -1,8 +1,7 @@
 import React from "react";
 import { AxiosError } from "axios";
-import { useCallback, useContext, useEffect, useMemo, useReducer, useState, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useState, useRef } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
-import { UNSAFE_NavigationContext as NavigationContext } from "react-router";
 import { fetchNextTask, submitTask, fetchClasses, fetchLabelMapZh, fetchEvidenceOptionsZh, fetchTaskByIndex, saveTask, moveImageToHealthyImages } from "../../api/client";
 import type {
   NextTaskResponse,
@@ -21,6 +20,12 @@ import {
 } from "../../lib/taskUtils";
 import AnnotationCanvas from "./components/AnnotationCanvas";
 import type { Comment as TaskComment } from "../../api/types";
+import {
+  annotationReducer,
+  initialAnnotationState,
+} from "./shared/annotationReducer";
+import { Kbd, IconButton, Separator, Banner, SubmissionCapsules } from "./shared/ui";
+import { useNavBlocker } from "./shared/useNavBlocker";
 
 // Icons
 import {
@@ -33,259 +38,7 @@ import {
   MessageSquareQuote,
   CheckCheck,
   Images,
-  AlertTriangle,
-  XCircle
 } from "lucide-react";
-
-// --------- Helpers for reducer-based history ---------
-const HISTORY_LIMIT = 100;
-
-function clampHistory(hist: TaskDocument[]) {
-  return hist.length > HISTORY_LIMIT ? hist.slice(hist.length - HISTORY_LIMIT) : hist;
-}
-
-function normalizeSelection(sel: number | null, detections: unknown[]) {
-  if (!detections || detections.length === 0) return null;
-  return sel == null ? null : Math.min(sel, detections.length - 1);
-}
-
-type State = {
-  doc: TaskDocument | null;
-  history: TaskDocument[];
-  future: TaskDocument[];
-  selectedIndex: number | null;
-  validationErrors: ValidationError[];
-};
-
-type Action =
-  | { type: "UNDO" }
-  | { type: "REDO" }
-  | { type: "APPLY_DOC"; next: TaskDocument; nextSelected?: number | null }
-  | { type: "LOAD_DOC"; doc: TaskDocument }
-  | { type: "SET_SELECTED"; index: number | null }
-  | { type: "SET_ERRORS"; errors: ValidationError[] }
-  | { type: "RESET_ERRORS" };
-
-function reducer(state: State, action: Action): State {
-  switch (action.type) {
-    case "UNDO": {
-      const { doc, history } = state;
-      if (!doc || history.length === 0) return state;
-
-      const prev = history[history.length - 1];
-      const nextDoc = cloneTaskDocument(prev);
-
-      return {
-        ...state,
-        doc: nextDoc,
-        history: history.slice(0, -1),
-        future: [cloneTaskDocument(doc), ...state.future],
-        selectedIndex: normalizeSelection(state.selectedIndex, nextDoc.detections),
-        validationErrors: [],
-      };
-    }
-
-    case "REDO": {
-      const { doc, future } = state;
-      if (!doc || future.length === 0) return state;
-
-      const [next, ...rest] = future;
-      const nextDoc = cloneTaskDocument(next);
-
-      return {
-        ...state,
-        doc: nextDoc,
-        history: clampHistory([...state.history, cloneTaskDocument(doc)]),
-        future: rest,
-        selectedIndex: normalizeSelection(state.selectedIndex, nextDoc.detections),
-        validationErrors: [],
-      };
-    }
-
-    case "APPLY_DOC": {
-      const nextDoc = cloneTaskDocument(action.next);
-      return {
-        ...state,
-        doc: nextDoc,
-        history: state.doc ? clampHistory([...state.history, cloneTaskDocument(state.doc)]) : state.history,
-        future: [],
-        selectedIndex:
-          action.nextSelected !== undefined
-            ? action.nextSelected
-            : normalizeSelection(state.selectedIndex, nextDoc.detections),
-        validationErrors: [],
-      };
-    }
-
-    case "LOAD_DOC": {
-      return {
-        doc: cloneTaskDocument(action.doc),
-        history: [],
-        future: [],
-        selectedIndex: null,
-        validationErrors: [],
-      };
-    }
-
-    case "SET_SELECTED":
-      return { ...state, selectedIndex: action.index };
-
-    case "SET_ERRORS":
-      return { ...state, validationErrors: action.errors };
-
-    case "RESET_ERRORS":
-      return { ...state, validationErrors: [] };
-
-    default:
-      return state;
-  }
-}
-
-// ===== 小元件：Kbd / IconButton / Separator =====
-const Kbd: React.FC<React.PropsWithChildren> = ({ children }) => (
-  <kbd className="rounded border border-slate-300 bg-white px-1.5 text-[10px] font-medium text-slate-700 shadow-sm">
-    {children}
-  </kbd>
-);
-
-interface IconButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  label: string;
-  shortcut?: string;
-}
-const IconButton: React.FC<IconButtonProps> = ({ label, shortcut, className = "", children, ...rest }) => (
-  <button
-    type="button"
-    aria-label={shortcut ? `${label}（${shortcut}）` : label}
-    title={shortcut ? `${label}（${shortcut}）` : label}
-    className={[
-      "inline-flex h-9 w-9 items-center justify-center rounded-md",
-      "border border-slate-200 bg-white/90 hover:bg-white",
-      "shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500",
-      "disabled:opacity-50 disabled:pointer-events-none",
-      className,
-    ].join(" ")}
-    {...rest}
-  >
-    {children}
-    <span className="sr-only">{label}{shortcut ? `（${shortcut}）` : ""}</span>
-  </button>
-);
-
-const Separator: React.FC<{ vertical?: boolean; className?: string }> = ({ vertical, className }) => (
-  <div className={[vertical ? "h-6 w-px" : "h-px w-full", "bg-slate-200", className || ""].join(" ")}/>
-);
-
-// ===== 自訂路由阻擋 Hook（避免依賴未導出的 unstable_useBlocker） =====
-const useNavBlocker = (when: boolean, bypass?: (nextLocation: any) => boolean) => {
-  const { navigator } = useContext(NavigationContext) as any;
-  useEffect(() => {
-    if (!when || !navigator?.block) return;
-    const unblock = navigator.block((tx: any) => {
-      if (bypass?.(tx.location)) {
-        unblock();
-        tx.retry();
-        return;
-      }
-      const ok = window.confirm("目前有未儲存的變更，離開將放棄這些變更。確定要離開嗎？");
-      if (ok) {
-        unblock();
-        tx.retry();
-      }
-    });
-    return unblock;
-  }, [when, navigator, bypass]);
-};
-
-const Banner: React.FC<{
-  kind: "error" | "warning";
-  children: React.ReactNode;
-  onClose?: () => void;
-}> = ({ kind, children, onClose }) => {
-  const tone = kind === "error"
-    ? "border-red-200 bg-red-50 text-red-700"
-    : "border-amber-200 bg-amber-50 text-amber-800";
-  const Icon = kind === "error" ? XCircle : AlertTriangle;
-
-  return (
-    <div
-      role="alert"
-      aria-live="assertive"
-      className={`mt-2 rounded border px-3 py-2 text-sm ${tone} flex items-start justify-between`}
-    >
-      <div className="flex items-start gap-2">
-        <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-        <div>{children}</div>
-      </div>
-      {onClose && (
-        <button
-          type="button"
-          onClick={onClose}
-          className="ml-3 inline-flex items-center rounded px-2 py-0.5 text-xs hover:bg-white/50"
-          aria-label="關閉"
-        >
-          關閉
-        </button>
-      )}
-    </div>
-  );
-};
-
-/**
- * 🆕 SubmissionCapsules
- * 顯示「用戶已提交 / 專家已提交」膠囊。
- * - 當 generalEditor / expertEditor 是非空字串才顯示。
- * - 會把名稱一併顯示，方便稽核。
- *
- * Tailwind 設計：
- * 用戶：綠色語意 (成功/完成感)
- * 專家    : 藍色語意 (高可信/權威感)
- */
-const SubmissionCapsules: React.FC<{
-  generalEditor?: string[];
-  expertEditor?: string[];
-}> = ({ generalEditor, expertEditor }) => {
-  const general = (generalEditor ?? []).map((s) => String(s).trim()).filter(Boolean);
-  const expert = (expertEditor ?? []).map((s) => String(s).trim()).filter(Boolean);
-  const hasGeneral = general.length > 0;
-  const hasExpert = expert.length > 0;
-
-  if (!hasGeneral && !hasExpert) return null;
-
-  return (
-    <div className="flex flex-wrap items-center gap-2 text-xs leading-tight">
-      {hasGeneral && (
-        <span
-          className={`
-            inline-flex items-center rounded-full
-            bg-emerald-50 text-emerald-700
-            ring-1 ring-inset ring-emerald-200
-            px-2 py-1 font-medium
-          `}
-        >
-          <span>用戶已提交</span>
-          <span className="ml-1 text-[10px] text-emerald-600/80 font-normal">
-            ({general[general.length - 1]}{general.length > 1 ? ` +${general.length - 1}` : ""})
-          </span>
-        </span>
-      )}
-      {hasExpert && (
-        <span
-          className={`
-            inline-flex items-center rounded-full
-            bg-sky-50 text-sky-700
-            ring-1 ring-inset ring-sky-200
-            px-2 py-1 font-medium
-          `}
-        >
-          <span>專家已提交</span>
-          <span className="ml-1 text-[10px] text-sky-600/80 font-normal">
-            ({expert[expert.length - 1]}{expert.length > 1 ? ` +${expert.length - 1}` : ""})
-          </span>
-        </span>
-      )}
-    </div>
-  );
-};
 
 const AnnotationPage: React.FC = () => {
   const navigate = useNavigate();
@@ -306,13 +59,7 @@ const AnnotationPage: React.FC = () => {
   const { name, isExpert } = useAuth();
 
   // reducer state
-  const [state, dispatch] = useReducer(reducer, {
-    doc: null,
-    history: [],
-    future: [],
-    selectedIndex: null,
-    validationErrors: [],
-  });
+  const [state, dispatch] = useReducer(annotationReducer, initialAnnotationState);
 
   const { doc, history, future, selectedIndex, validationErrors } = state;
 
@@ -706,13 +453,8 @@ const AnnotationPage: React.FC = () => {
     } catch (err) {
       const axiosErr = err as AxiosError<{ detail?: string }>;
       if (axiosErr.response?.status === 409) {
-        setError("此任務已被更新，請再試一次。");
-        // 原本邏輯：發派下一張
-        // await runWithBypass(() => goNext());
-        // 新邏輯：改為下一個編號
-        const currentIdx = routeIndex != null ? routeIndex : task.index;
-        const nextIdx = (currentIdx ?? 0) + 1;
-        await runWithBypass(() => navigate(`/annotate/${nextIdx}`, { replace: true }));
+        // 樂觀並發衝突：留在原地，由使用者決定是否重新載入。
+        setError(axiosErr.response.data?.detail || "此任務已被更新，請重新載入後再送出。");
       } else if (axiosErr.response?.data?.detail) {
         setError(axiosErr.response.data.detail);
       } else {
@@ -762,17 +504,23 @@ const AnnotationPage: React.FC = () => {
     setSaving(true);
     dispatch({ type: "RESET_ERRORS" });
     try {
-      await saveTask(task.task_id, {
+      const resp = await saveTask(task.task_id, {
         full_json: doc,
         editor_name: name,
         is_expert: isExpert
       });
 
-      // ✅ 更新 baseline（不清空 history/future）
-      setTask((prev) => (prev ? { ...prev, task: cloneTaskDocument(doc) } : prev));
+      // ✅ 把伺服器新發的 version 寫回 doc 與 baseline，
+      // 下一次儲存才會用對的 version 做樂觀並發檢查（不清空 history/future）。
+      const nextVersion = resp.version ?? ((doc.version ?? 0) + 1);
+      dispatch({ type: "SET_VERSION", version: nextVersion });
+      const savedDoc: TaskDocument = { ...cloneTaskDocument(doc), version: nextVersion };
+      setTask((prev) => (prev ? { ...prev, task: savedDoc } : prev));
     } catch (err) {
       const axiosErr = err as AxiosError<{ detail?: string }>;
-      if (axiosErr.response?.data?.detail) {
+      if (axiosErr.response?.status === 409) {
+        setError(axiosErr.response.data?.detail || "此任務已被更新，請重新載入後再儲存。");
+      } else if (axiosErr.response?.data?.detail) {
         setError(axiosErr.response.data.detail);
       } else {
         setError("保存失敗，請稍後再試。");
