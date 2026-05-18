@@ -554,3 +554,55 @@ Step 8  [Output]
     paper 的 zero-shot vision-language retrieval claim.
   - Fine stage 對 VLM-Fusion 是 architecturally required：raw case_db 上重訓
     CEAH 會 faithfulness 反轉（[C-ablation]）.
+
+================================================================================
+[K] Phase 4 method extensions: aggregation absorption surface + importance-RVQ
+================================================================================
+
+跟 [J] 的 eval_final 一樣是 eval-time 工具，不影響 production 推論路徑。
+
+[K-1] 對單一 encoder + case_db 跑 absorption surface（top_k × RVQ-config sweep）:
+
+  $PY -m diagnosis_model.cause_inference.rvq_rerank.eval_absorption_surface \
+    --encoder_ckpt diagnosis_model/cause_inference/outputs/encoder_final/best_encoder.pt \
+    --case_db_dir  diagnosis_model/cause_inference/outputs/case_db \
+    --rvq_root     diagnosis_model/cause_inference/outputs/rvq_rerank
+
+  → 5 個 (M,K) × 10 個 top_k = 50 個 rvq_only eval，加上 10 個 dense baseline。
+    輸出 absorption_surface.json。本地 5-config × 10-K 跑 ~3 分鐘。
+
+  從 ΔR@10(top_k, ε) 表面 fit power law D ≈ c·ε^p/K^q（p ≈ 1, q ≈ 0.84），
+  推導 operating-point selector K* = (c·ε/D_target)^{1/0.84}.
+
+[K-2] 比較 vanilla / ranking / agg / agg_inv 4 個 codebook variant:
+
+  # 先依 [training.txt §7] step (2) + (3) 把 4 個 variant fit 好，然後對每個 variant
+  # 跑 eval_absorption_surface（指向各自的 variants/{tag}/ 目錄）:
+  for v in vanilla ranking agg agg_inv; do
+    $PY -m diagnosis_model.cause_inference.rvq_rerank.eval_absorption_surface \
+      --rvq_root diagnosis_model/cause_inference/outputs/rvq_rerank/variants/$v \
+      --out      diagnosis_model/cause_inference/outputs/rvq_rerank/variants/$v/absorption_surface.json
+  done
+
+  K* shift 主表（damage ≤ 1pp 的最小 top_k_cases，越小越好）:
+
+    Config       Comp×   vanilla  ranking   agg(iso)  agg_inv(density)
+    M=8 K=256    384×       2        2         2         2
+    M=4 K=256    768×       8        3         3         3
+    M=2 K=64     2048×     15       10        20⚠       20⚠
+    M=1 K=16     6144×     20       15        15        20⚠
+    M=1 K=4      24576×    20       15        15        15
+
+  Production claim：ranking variant 在 4/5 configs 把 K\* 降 5（25–33%），
+  drop-in 替換 vanilla codebook。agg/agg_inv 兩個方向都在中度壓縮退步，
+  isolation/density 不是好的 aggregation-aware proxy → flag co-retrieval
+  graph clustering 為 future work（[K] 收尾備註）.
+
+注意：
+  - 新 codebook 跟 vanilla codebook schema 完全相同（[M,K,D] tensor + fitted flag），
+    所以 eval_sanity.py / eval_harder.py / eval_final.py / benchmark_scale.py /
+    train_reranker.py 不需要任何修改，只要把 --rvq_dir 指到 variants/{tag}/rvq_M{M}_K{K}
+    就會用新 codebook。
+  - 不要在 production 推論替換 codebook 後 reuse 既有 reranker_*/best.pt——它們是
+    在 vanilla codebook 上訓的，replace codebook 後需要重訓 reranker（或者只用
+    rvq_only / full_analytic scoring，跳過 trained reranker）.

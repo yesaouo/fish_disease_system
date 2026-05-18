@@ -81,6 +81,10 @@ cause_inference/
 │   ├── fit_rvq.py / build_rvq_index.py / run_sweep.py
 │   ├── eval_sanity.py / eval_harder.py / eval_final.py
 │   ├── train_reranker.py / benchmark_scale.py
+│   ├── weighted_rvq.py            ← WeightedRVQCodebook（importance-weighted k-means）
+│   ├── compute_rvq_weights.py     ← per-case w_ranking / w_agg / w_agg_inv
+│   ├── fit_rvq_variants.py        ← fit 4 variants × 多 (M,K) 的 codebook
+│   ├── eval_absorption_surface.py ← top_k × RVQ-config 吸收曲面 sweep
 │   └── outputs/                    ← codebooks、index、reranker checkpoints
 └── outputs/                       ← 所有產出
     ├── case_db/                   ← Phase 0（含 train_candidate_pool.pt）
@@ -774,6 +778,98 @@ Memory @ N=1M（M=4 K=256 codes = uint8）：
 > **CRR-DeepRVQ 把 case-based retrieval 推到 1M+ 規模的 deployment 範圍。** 後接在 Phase 3 DeepSets case encoder 之後，凍結 z_i，用 Residual Vector Quantization 壓成 M-byte codes（768× memory compression at M=4 K=256），再用 query-to-candidate cross-attention reranker 學 compression residual Δ ≈ qᵀe_i 修補 RVQ 引入的 ranking 誤差。
 >
 > 評估顯示**雙 regime 的不對稱**：在 production setting（Phase 1 top_k_cases=20 + cause-aggregation buffer），即使把 12,780 cases 壓成 16 個 prototype（6,144× compression）R@10 都不掉，是 cause-aggregation pool 充當 coarse clustering buffer 的副效應；但在 stress regime（top_k_cases=1, no aggregation），RVQ 損害 3–16 pp R@10，**Light reranker 穩定回收 39–54% 的 gap**，Full analytic 在輕度壓縮下完全回補到 dense。1M case bank latency benchmark 顯示 dense 退化到 5.15 ms/q，但 rvq_light 維持 0.59 ms/q + 17 MB（90× 壓縮、9× 加速），證明 case-based retrieval framework 在數據集規模成長下仍可實時部署。
+
+#### Aggregation-buffer 吸收 scaling law + importance-weighted codebook（method-level 擴展）
+
+前面「雙 regime」框架是**定性**觀察（aggregation buffer 吸收 RVQ noise）。這個 subsection 把它**定量化**，並基於 scaling law 推導出一個 drop-in codebook 改造，把 K* 降低 25–33% 而不動 RVQ 數據結構。
+
+##### Scaling law
+
+對 5 個 RVQ config（壓縮率 384× → 24576×，relMSE ε 從 0.025 到 0.50）× 10 個 `top_k_cases` (1→50) 做雙 sweep，發現 dense vs RVQ-only 的 R@10 damage `D` 服從 closed-form：
+
+> **D ≈ c · ε^p / K^q**，其中 **p ≈ 1.00, q ≈ 0.84**
+
+擬合證據（[eval_absorption_surface.py](rvq_rerank/eval_absorption_surface.py)）：
+
+| Encoder | c | p (ε exp) | q (K exp) | R² | jackknife q std |
+|---|---|---|---|---|---|
+| Fine-tuned (case_db) | 59.9 | 0.93 | 0.88 | 0.90 | 0.088 |
+| Raw SigLIP2 (case_db_raw) | 156.0 | 1.11 | 0.78 | 0.79 | 0.080 |
+
+**Encoder-invariance 測試**（fixed-effect：兩個 encoder 共用 (p, q)，各自有 intercept c）：
+
+| Model | params | pooled R² |
+|---|---|---|
+| 3-param fully shared (c, p, q) | 3 | 0.757 |
+| **4-param 共用 exponents** | 4 | **0.828** |
+| 6-param fully separate | 6 | 0.834 |
+
+從 6-param → 4-param 只損失 ΔR²=0.006，意思是**指數 (p, q) 在兩個 encoder 之間無實質差異**——absorption 的*形狀*是 representation-agnostic，**只有 intercept c 隨 encoder 變**。
+
+**Encoder-specific intercept 的物理解讀**：c_raw / c_fine ≈ 2.06——同樣的 ε 下，raw embeddings 的 ranking damage 是 fine-tuned 的兩倍。fine-tuned encoder 把 ranking 訊號塞進更窄 subspace，量化噪聲只要不正好打在那個 subspace 就影響有限；raw 的 ranking 訊號分散在 768 維，對 isotropic noise 更敏感。**fine-tuning 不只改善 retrieval，也提供 2× quantization robustness**。
+
+##### Operating-point selector
+
+從擬合反推 damage ≤ 1pp 所需的最小 `top_k_cases`（用 fine-tuned encoder fit）：
+
+| ε (relMSE) | 對應 (M,K) | top_k* （預測） | top_k* 觀察 |
+|---|---|---|---|
+| 0.027 | M=8 K=256 | 2 | 2 |
+| 0.046 | M=4 K=256 | 4 | 5 |
+| 0.131 | M=2 K=64 | 12 | 15 |
+| 0.273 | M=1 K=16 | 26 | 20–30 |
+| 0.496 | M=1 K=4 | 49 | 50 |
+
+> **K\* = (c · ε / D_target)^{1/q}**
+
+直接告訴部署：「想要 6144× compression？aggregation top-K 要設 ≥26 才 free lunch」。
+
+##### Importance-weighted RVQ（method-level 演算法貢獻）
+
+Scaling law 告訴我們 damage 跟 ε 線性。但**ε 是 12780 個 case 的 mean**——如果重新分配 codebook capacity，讓「常被 retrieve 的 case」 ε 變小、「從來不被 retrieve 的 case」 ε 變大，**mean ε 可以不變但 downstream 看到的 effective ε 變小**。
+
+具體：把 vanilla `_kmeans` 換成 weighted k-means（[weighted_rvq.py](rvq_rerank/weighted_rvq.py)）：
+
+```
+標準: c_k = mean of cases assigned to k
+加權: c_k = weighted_mean of cases assigned to k,  weights = w_i
+```
+
+其中 `w_i = retrieval_frequency(i)` = case `i` 在 train query top-20 中出現次數（[compute_rvq_weights.py](rvq_rerank/compute_rvq_weights.py)）。Assignment step 不變、encode/decode/LUT 完全不變——**只是 codebook tensor 那 `[M, K, D]` 個數字算法不同**。
+
+**結果（K\* shift：damage ≤ 1pp 所需的最小 `top_k_cases`，越小越好）：**
+
+| Config | Compression × | vanilla K* | **ranking K*** | Δ |
+|---|---|---|---|---|
+| M=8 K=256 | 384× | 2 | 2 | 0 |
+| M=4 K=256 | 768× | 8 | **3** | **−5** |
+| M=2 K=64 | 2048× | 15 | **10** | **−5** |
+| M=1 K=16 | 6144× | 20 | **15** | **−5** |
+| M=1 K=4 | 24576× | 20 | **15** | **−5** |
+
+4/5 configs K* 下降 5 個位置（25–33% relative reduction）。Production regime（top_k=15–30）平均 R@10 lift **+0.2 到 +1.2 pp**。
+
+##### Aggregation-aware (isolation / density)：negative result
+
+進一步試 `w_agg = retrieval_frequency × isolation`（isolation = 1 − mean cosine to 50 NN，up-weight 孤立 case 因為它們沒 peer 提供 cause backup）以及反向 `w_agg_inv = retrieval_frequency × density`：
+
+| Config | vanilla K* | ranking K* | agg (iso) K* | agg_inv (density) K* |
+|---|---|---|---|---|
+| M=4 K=256 | 8 | 3 | 3 | 3 |
+| **M=2 K=64** | 15 | **10** | **20 ⚠️** | **20 ⚠️** |
+| M=1 K=16 | 20 | 15 | 15 | 20 ⚠️ |
+| M=1 K=4 | 20 | 15 | 15 | 15 |
+
+兩個方向都在中度壓縮（M=2 K=64）退步到 K\*=20，比 vanilla 還差。Isolation/density 是 **first-order scalar 鄰域統計**，把 co-retrieval graph structure 壓縮成單一數字——丟掉太多訊息。**未來方向**：co-retrieval spectral clustering / 學習 gradient-influence weight 等 graph-structured aggregation-aware codebook 信號。
+
+##### Method 總結
+
+最終 Phase 4 兩條 method-level claim：
+
+1. **Scaling law `D ≈ c · ε / K^{0.84}`**（R² = 0.83 pooled，encoder-invariant exponents），fine encoder 抗量化 2× raw encoder
+2. **Importance-weighted codebook**（drop-in 替換 vanilla codebook 的 fit 程序，runtime path 完全不變），K\* 在 4/5 configs 降 ≈33%
+
+這兩條把 Phase 4 從「ColBERTv2 + light reranker 的應用」拉到「characterizing & exploiting structured-prediction retrieval under quantization」的 method-level contribution。
 
 #### 子套件結構
 

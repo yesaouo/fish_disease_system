@@ -362,5 +362,69 @@ M=1 K=16 訓練常在 epoch 1 達 best 隨後 degrade，這是極端壓縮下 re
 飽和的標誌；若要更穩可用 `--lr 5e-5 --warmup_steps 1000`（paper 預設不變）。
 
 ================================================================================
+§7 — Phase 4 method-level extensions: scaling law + importance-weighted RVQ
+================================================================================
+
+新增的 codebook fitting workflow，runtime path 完全不變（codebook tensor 形狀
+跟編碼/解碼/LUT scoring 都不動）。三步：(1) 算 absorption surface 拿 scaling
+law，(2) 從 dense top-K 推導 per-case weight，(3) 用 weighted k-means 重 fit
+codebook。
+
+--- (1) Absorption surface（fit scaling law 用的 sweep）---
+
+$PY -m diagnosis_model.cause_inference.rvq_rerank.eval_absorption_surface \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/encoder_final/best_encoder.pt \
+  --case_db_dir  diagnosis_model/cause_inference/outputs/case_db \
+  --rvq_root     diagnosis_model/cause_inference/outputs/rvq_rerank \
+  --rvq_configs  8,256 4,256 2,64 1,16 1,4 \
+  --top_ks       1 2 3 5 8 10 15 20 30 50 \
+  --out          diagnosis_model/cause_inference/outputs/rvq_rerank/absorption_surface.json
+
+# 再對 raw encoder 跑一次以做 encoder-invariance 測試：
+$PY -m diagnosis_model.cause_inference.rvq_rerank.eval_absorption_surface \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/encoder_raw/best_encoder.pt \
+  --case_db_dir  diagnosis_model/cause_inference/outputs/case_db_raw \
+  --rvq_root     diagnosis_model/cause_inference/outputs/rvq_rerank_raw \
+  --out          diagnosis_model/cause_inference/outputs/rvq_rerank_raw/absorption_surface.json
+
+Power-law fit 用 numpy log-linear regression + jackknife CI（fit script 未
+入庫，重做時用 /tmp/fit_absorption.py 模式即可）。fine encoder 得到
+D ≈ 59.9 · ε^{0.93} / K^{0.88}，R²=0.90；fixed-effect 共用 (p, q) 後仍 R²=0.83
+（ΔR² 從 fully-separate 只損失 0.006），c_raw ≈ 2 × c_fine。
+
+--- (2) Per-case weights（drives importance-weighted codebook）---
+
+$PY -m diagnosis_model.cause_inference.rvq_rerank.compute_rvq_weights \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/encoder_final/best_encoder.pt \
+  --case_db_dir  diagnosis_model/cause_inference/outputs/case_db \
+  --top_k 20 \
+  --out  diagnosis_model/cause_inference/outputs/rvq_rerank/case_weights.pt
+
+產出四個 weight vector（mean=1）:
+  - w_vanilla = 1（baseline）
+  - w_ranking = retrieval frequency in top-20 of train queries（main contribution）
+  - w_agg     = w_ranking × isolation（up-weight 孤立 case，ablation）
+  - w_agg_inv = w_ranking × density（反向 ablation，negative result）
+
+--- (3) Fit 4 variants × 5 (M,K) ---
+
+$PY -m diagnosis_model.cause_inference.rvq_rerank.fit_rvq_variants \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/encoder_final/best_encoder.pt \
+  --case_db_dir  diagnosis_model/cause_inference/outputs/case_db \
+  --weights_pkg  diagnosis_model/cause_inference/outputs/rvq_rerank/case_weights.pt \
+  --out_root     diagnosis_model/cause_inference/outputs/rvq_rerank/variants \
+  --configs 8,256 4,256 2,64 1,16 1,4 \
+  --variants vanilla ranking agg agg_inv
+
+執行完 outputs/rvq_rerank/variants/{tag}/rvq_M{M}_K{K}/codebooks.pt 即為
+新 codebook，跟 vanilla 同 schema（tensor shape `[M, K, D]` + fitted flag），
+可直接被 build_rvq_index.py / eval_final.py / benchmark_scale.py 載入。
+
+論文 main claim：ranking variant 在 4/5 configs 把 K\* (damage ≤ 1pp 的最小
+`top_k_cases`) 從 8/15/20/20 降到 3/10/15/15（≈33% reduction），prod regime
+R@10 lift +0.2–1.2 pp。agg / agg_inv 變體 unstable，flag 為 future work
+（co-retrieval graph clustering 才是 aggregation-aware 的正確結構）。
+
+================================================================================
 END
 ================================================================================

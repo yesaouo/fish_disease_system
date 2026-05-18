@@ -228,7 +228,9 @@ def main():
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--warmup_steps", type=int, default=500)
-    ap.add_argument("--early_stop_patience", type=int, default=5)
+    ap.add_argument("--early_stop_patience", type=int, default=5,
+                    help="Stop if sem_R@10 doesn't improve for N consecutive evals. "
+                         "Set <=0 to disable and let training run the full --epochs.")
     ap.add_argument("--eval_every_epochs", type=int, default=1)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
@@ -438,7 +440,7 @@ def main():
         log_f.write(json.dumps(log_row) + "\n")
         log_f.flush()
 
-        if patience >= args.early_stop_patience:
+        if args.early_stop_patience > 0 and patience >= args.early_stop_patience:
             print(f"Early stop at epoch {epoch + 1} (patience hit).")
             break
 
