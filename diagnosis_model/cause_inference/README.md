@@ -508,6 +508,159 @@ done
 
 ---
 
+### Faithfulness 強化：CLSC（cross-lesion supervised contrastive，VLM-Lesion 訓練 auxiliary）
+
+CEAH 的 architectural faithfulness（softmax α、multiplicative scoring）保證**結構上**評分必須走 lesion evidence，但**實質 faithfulness** 還受限於 lesion features 本身的品質。若 VLM-Lesion 訓練時可以靠 background context shortcut 分對 caption，CEAH 的 α 就會落在 features 不可靠的維度上。CLSC 是針對這個 shortcut 開的 auxiliary loss。
+
+#### 動機：消除 background shortcut
+
+baseline VLM-Lesion 用 SigLIP-style sigmoid loss + 全 batch caption bank（B=128 對 190 條 captions）訓練，negatives 都來自跨 image：
+
+```
+positive caption ←→ this lesion crop (cat A)
+negative captions ←→ other batch images (cat B/C/D...) — 全部來自不同魚、不同光線、不同背景
+```
+
+模型可以靠 background features（魚體姿勢、底色、拍攝距離）分對 captions，**完全不用看 lesion content**。對 Phase 1 retrieval 無傷（目標只是分得開），對 CEAH attribution 是致命傷 — features 不 lesion-grounded → α 歸因失去意義。LocalGlobalFusion 雖把 global context concat 進 lesion features 作 representational regularization，但**沒提供「不能 shortcut」的明確訓練訊號**。
+
+#### Formulation
+
+只在 batch 內**同圖 ≥2 個不同類別 lesion** 時觸發。對每張這樣的圖，取它所有 lesion features $\{f_1, ..., f_N\}$（Path A fused output）跟對應 caption embeddings（從 bank 拉出每樣本所屬類別的 caption 平均後 L2-norm）$\{t_1, ..., t_N\}$，做雙向 supervised contrastive softmax：
+
+$$
+\mathcal{L}^{i2t}_i = -\log \frac{\sum_{k: y_k = y_i} \exp(\tau f_i^\top t_k)}{\sum_{k=1}^{N} \exp(\tau f_i^\top t_k)},\quad
+\mathcal{L}^{t2i}_j = -\log \frac{\sum_{k: y_k = y_j} \exp(\tau t_j^\top f_k)}{\sum_{k=1}^{N} \exp(\tau t_j^\top f_k)}
+$$
+
+對稱兩方向平均並對 batch 內合格圖取 mean，加進主 multipos sigmoid loss：
+
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{multipos sigmoid}} + \alpha_{\text{clsc}} \cdot \mathcal{L}_{\text{clsc}}
+$$
+
+**設計關鍵**：negatives 來自**同一張圖** — 背景、光照、魚體、距離完全一樣。模型唯一能用來區辨同類 vs 不同類 lesion 的訊號就是 **lesion 像素本身**。把「不能 shortcut」的訊號**結構性地塞進訓練資料**而不是靠額外 augmentation。
+
+#### Trigger 條件
+
+|  | count | ratio |
+|---|---|---|
+| 訓練圖總數 | 18077 | 100% |
+| 多類別合格圖（≥2 lesion 類別） | **3814** | **21.1%** |
+| → 內含 lesion crops（合格 pool）| 9849 | 31.5% of crops |
+
+隨機抽 B=128 batches 下，每 batch 平均 0.57 個同圖 dup pair，**約 13% 的 batch** 真正命中合格條件。觸發稀疏，但**每次 fire 時 loss 量級 ~0.86**（≈ ln 2，2-way 區辨的 chance loss 之上）— 訊號強度足以推動 features，但不會排擠主 sigmoid loss 在其它 87% batches 的訓練。
+
+#### 訓練命令
+
+```bash
+cd diagnosis_model/vl_classifier
+python train.py \
+    --multipos --fusion --freeze_text_encoder \
+    --cross_lesion --cross_alpha 1.5 --cross_tau 0.1 \
+    --output_dir outputs/siglip2_base_patch16_224_multipos_fusion_xL1.5_en_zh \
+    --eval_test_after_train
+```
+
+CLSC ckpt 用於 `build_case_database.py` 的 `--vlm_lesion` 重建 `case_db_xL1.5/`，下游 CEAH / faithfulness eval 流程不變。執行時間 ~50 min（B=128, 8 epochs）。
+
+#### 結果（vs baseline VLM-Lesion，1573 valid queries，γ=0.5）
+
+**Faithfulness 按 cause-type 分桶：**
+
+| 條件 | baseline | **+CLSC** | Δ | 相對改善 |
+|---|---|---|---|---|
+| no_lesion · global-type | +0.034 | +0.0366 | +0.003 | +8% |
+| no_lesion · **lesion-type** | +0.040 | **+0.0467** | +0.007 | **+17%** |
+| no_lesion · **mixed** | +0.036 | **+0.0603** | +0.024 | **+67%** |
+| no_random（噪音 sanity） | +0.005 | +0.0025 | −0.003 | 維持 ≈ 0 ✓ |
+
+**N-lesion 分桶：**
+
+| Bucket | n | baseline | **+CLSC** | Δ | 相對改善 |
+|---|---|---|---|---|---|
+| N=1 | 886 | 0.025 | 0.0330 | +0.008 | +32% |
+| **N=2** | 456 | 0.051 | **0.0648** | +0.014 | **+27%** |
+| **N≥3** | 231 | 0.055 | 0.0633 | +0.008 | +15% |
+
+**Retrieval γ-scan（驗證 retrieval 不退化）：**
+
+| γ | sem R@10 baseline | sem R@10 **+CLSC** | Δ |
+|---|---|---|---|
+| 0.00 (CEAH only) | 46.8% | 47.18% | +0.4 |
+| 0.50 | 45.9% | 46.28% | +0.4 |
+| 0.75 | 45.3% | 45.55% | +0.3 |
+| 1.00 (Phase 1) | 44.4% | 44.69% | +0.3 |
+
+全 γ 在 ±0.5 pp 噪音內 — **CLSC 對 retrieval 無感**。對應 cascade 設計：CLSC 是專為 Phase 2 fine 階段的 attribution head 服務的 VLM-Lesion 強化，並不影響 Phase 1 / 3 / 4 走的 zero-shot retrieval（仍由 raw SigLIP2 case_db_raw 主導）。
+
+→ **CLSC 結果讀法**：retrieval 無感、no_random 維持 ≈ 0（沒對任意擾動變敏感），但 lesion-type / mixed / N=2+ 的 attribution drop magnitude 全面上升 — 改善是 **selective 且 mechanism-aligned**，不是模型對 perturbation 普遍變敏感。
+
+#### Sparse firing 是 design feature，不是 limitation
+
+提高 cross loss 的「訊號強度」有兩條軸：(a) 加大 α 權重；(b) 加大 firing rate（換 grouped sampler）。我們驗證兩條軸**都不會線性放大效益**，反而推過甜蜜點都會回退。
+
+| 設定 | firing rate | α | val main loss (i2t+0.5·t2i, ep 6) | lesion-type drop | mixed drop |
+|---|---|---|---|---|---|
+| baseline (no CLSC) | — | — | 0.298 | 0.040 | 0.036 |
+| α=0.3 random (smoke) | 13% | 0.3 | 0.298 | ≈ baseline | ≈ baseline |
+| **α=1.5 random (CLSC)** | **13%** | **1.5** | **0.298** | **0.0467** | **0.0603** |
+| α=3.0 random | 13% | 3.0 | 0.304 | 0.0387 (back to baseline) | 0.0343 (back to baseline) |
+| α=1.5 + grouped sampler (50/50) | ~100% | 1.5 | 0.425 (退化 +43%) | 0.0542 (winner!) | 0.0357 (loser) |
+
+**讀法**：
+- 軸 (a) α scaling：α=0.3 訊號太弱、α=1.5 甜蜜點、α=3.0 cross loss 在 13% 觸發 batches 上 gradient 量級壓過主 sigmoid loss，features 被拉去 in-image 區辨方向但離 caption alignment 太遠，下游 CEAH 拿到的 features 回退到 baseline 水準
+- 軸 (b) firing-rate scaling：grouped sampler 100% 觸發 + α=1.5 → batch 內 ~30 個同圖 dup pairs，主 sigmoid loss 的 negatives 變得太難（同 image 共享 background）→ main task 在 8 epochs 內沒收斂到 baseline 水準 → CEAH features 雖然 lesion-type 端更銳化（+0.008 vs xL1.5）但 mixed 端因主任務 underfitting 退化（−0.025）
+
+**Design principle**：multi-task fine-tune 上的 auxiliary loss，**保持 sparse triggering + 中等 weight** 比 dense triggering 或大 weight 更穩。auxiliary 只在「主任務無法處理的 hard case」（這裡是「同圖多 lesion 區辨」）發力，**不搶主任務的 gradient budget**。CLSC 的 13% firing + α=1.5 是這條 principle 在 fish disease 場景的具體實作點。
+
+論文 ablation 用上面這張表呈現，**α-scan 跟 firing-rate ablation 一起講**，故事比單軸 α-scan 強。
+
+---
+
+### CLSC 對照組：LSCFT（lesion-selective counterfactual faithfulness training，negative result）
+
+CLSC 用「**自然存在於 dataset 中的多 lesion 同圖**」當 hard negatives。一個合理的對照組問法：**如果用 augmentation 製造 counterfactual（mask 掉 lesion 中心區域），訓練模型對「lesion 拿掉」變敏感，是不是也可以做到 CEAH attribution faithfulness？**
+
+LSCFT 是我們做的這個對照組，**negative result**：訓練目標達成了但**不 transfer 到 CEAH attribution**。
+
+#### LSCFT 設計（雙臂 ranking）
+
+每個 lesion crop 並行做兩個干預，比較 caption similarity drop：
+
+- **Positive arm**（拿掉 lesion 內容）：中心 P×P 區域置換為 mean / cutmix / noise 之一（隨機抽 multi-intervention bank）
+- **Negative arm**（保留 lesion）：peripheral mask / color jitter / hflip 之一（隨機抽）
+
+Loss：
+$$
+\mathcal{L}_{\text{lscft}} = \text{softplus}(m - (\text{drop}_+ - \text{drop}_-))
+$$
+
+其中 $\text{drop}_+ = \cos(f, t) - \cos(f^+, t)$（positive 應該大）、$\text{drop}_- = \cos(f, t) - \cos(f^-, t)$（negative 應該小）。Ranking 公式抵銷 $f$ 對 $t$ 的絕對 alignment，只要求**相對排序** — 訓練不跟主 sigmoid loss 搶 orig feature 的監督。
+
+訓練 trick：global feature 算一次共用，positive / negative 各做一次 local encoder forward（總 3 次 local + 1 次 global）。記憶體上需要 B=96。
+
+#### 結果：訓練目標達成、faithfulness 沒 transfer
+
+| 設定 | val lscft (ep 4 best) | lesion-type drop | mixed drop | N=2 drop | N≥3 drop |
+|---|---|---|---|---|---|
+| baseline | — | 0.040 | 0.036 | 0.051 | 0.055 |
+| **+CLSC (xL1.5)** | — | **0.0467** | **0.0603** | **0.0648** | **0.0633** |
+| LSCFT P=80 | 0.243（從 0.500 降）| 0.0406 | 0.0348 | 0.0499 | 0.0565 |
+| LSCFT P=180（對齊 eval intervention magnitude）| 0.241 | **0.0090 ↓↓** | 0.0593 | 0.0327 ↓ | 0.0293 ↓ |
+
+- **LSCFT P=80**：valid lscft 收斂（0.50 → 0.24，訓練目標達成）但下游 faithfulness 跟 baseline 持平、**比 CLSC 明顯弱**
+- **LSCFT P=180**（加大 mask 對齊 eval-time 完整 bbox masking）：**反而把 lesion-type drop 砍到 0.0090**（baseline 的 22%）— 強行對齊 mask magnitude 反而把 features 拉去錯方向
+
+#### 為什麼不 work：訓練目標跟 CEAH evaluation 不在同一 vector space
+
+- **LSCFT 訓練的是**：image-text cosine similarity 對 lesion 像素遮蔽的敏感度
+- **CEAH faithfulness 量的是**：attribution α 引導下的最終 ranking score 對 lesion 像素遮蔽的敏感度
+- 兩個 quantity **經過 CEAH MLP 後不是同一個量**。LSCFT 把 features 推到「caption-similarity 對 lesion 敏感」的方向，但 CEAH 的 α 機制需要的是「lesion features 之間相互區辨」的方向（這正是 CLSC 直接訓的）
+
+**CLSC vs LSCFT 的對比**告訴我們：在 fine 階段的 attribution head 上，**discriminative signal**（lesion 之間相互區辨）比 **counterfactual signal**（lesion 拿掉變不像 caption）更直接、更可 transfer。論文 narrative 上可以用這個對比強化 method 章節的合理性 — 我們不是只試了一個 idea，我們試了顯而易見的 counterfactual augmentation 對照組並證明它不 work。
+
+---
+
 ### Phase 3：Case encoder（單向量檢索，加速貢獻）
 
 **動機**：Phase 1 每 query 對 case_db 跑 multi-vector + Hungarian 比對（~15 ms/q）。隨著 case_db 規模成長,這個成本是 retrieval 階段的主要 bottleneck。把 (global, lesion 1..N) 蒸餾成 **單一 case 向量** 後,檢索退化為單一 cosine,大幅加速。

@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -68,6 +68,28 @@ DEFAULT_CONFIG = {
     "t2i_skip_no_positive": True,
     "t2i_label_level_mean": True,
     "t2i_lambda": 0.5,
+
+    # within-image cross-lesion supervised contrastive (B-fallback prototype)
+    "cross_lesion": False,
+    "cross_alpha": 0.3,
+    "cross_tau": 0.1,
+
+    # Grouped batch sampler — pairs with cross_lesion to push firing rate
+    # from ~13% (random) to ~100% (every batch contains multi-category image groups).
+    "grouped_sampler": False,
+    "grouped_ratio": 0.5,
+
+    # LSCFT — Lesion-Selective Counterfactual Faithfulness Training
+    # Requires --multipos --fusion --target lesion.
+    # Adds 3 vision-encoder forwards per batch (orig + positive + negative
+    # interventions), sharing the precomputed global feature.
+    "lscft": False,
+    "lscft_alpha": 0.5,        # weight on LSCFT loss
+    "lscft_margin": 0.1,       # ranking margin in cosine space
+    "lscft_pos_size": 80,      # center mask size for positive (lesion-removed) arm
+    "lscft_neg_keep": 140,     # center keep size for peripheral-mask negative arm
+    "lscft_mask_jitter": 10,   # random spatial jitter (pixels) for mask center
+    "lscft_jitter": 0.05,      # color-jitter strength (negative arm)
 
     # splits
     "train_split": "train",
@@ -248,6 +270,7 @@ class CocoSample:
     text: Optional[str] = None
     label_id: Optional[int] = None
     evidence_index: int = -1
+    image_id: int = -1
 
 
 class CocoCropDataset(Dataset):
@@ -340,6 +363,7 @@ class CocoCropDataset(Dataset):
                         bbox_xywh=(x, y, w, h),
                         label_id=category_id,
                         evidence_index=ei,
+                        image_id=int(image_id),
                     )
                 )
             else:
@@ -368,6 +392,7 @@ class CocoCropDataset(Dataset):
                         img_path=img_path,
                         bbox_xywh=(x, y, w, h),
                         text=text,
+                        image_id=int(image_id),
                     )
                 )
 
@@ -406,6 +431,7 @@ class CocoCropDataset(Dataset):
         else:
             out["text"] = str(s.text)
 
+        out["image_id"] = int(s.image_id)
         return out
 
 
@@ -492,6 +518,134 @@ class CocoOverallDataset(Dataset):
         # baseline: deterministic alternation by sample index keeps valid loss reproducible
         text = s["colloquial"] if (idx % 2 == 0) else s["medical"]
         return {"image": image, "text": text}
+
+
+# =========================
+# Grouped batch sampler (hybrid: multi-category image groups + random singletons)
+# =========================
+
+class MultiCategoryGroupedBatchSampler(Sampler):
+    """Hybrid batch sampler that guarantees each batch contains lesion crops
+    from at least one multi-category image, so the cross-lesion loss fires
+    every step instead of ~13% under random sampling.
+
+    Each batch is composed of two halves:
+      - grouped half (size ≈ grouped_ratio * batch_size):
+          Pack lesion crops from multi-category images (≥2 distinct labels)
+          group-by-group, never splitting an image across batches.
+      - random half:
+          Random crops from single-category images, filling the remainder.
+
+    The two pools cycle independently when exhausted, so num_batches is
+    determined upstream (defaults to ceil(total_crops / batch_size) to match
+    the random-sampler training schedule).
+
+    Yields lists of dataset indices; intended for use as `batch_sampler`.
+    """
+
+    def __init__(
+        self,
+        samples,
+        batch_size: int,
+        grouped_ratio: float = 0.5,
+        num_batches: Optional[int] = None,
+        seed: int = 0,
+    ):
+        if not (0.0 < grouped_ratio <= 1.0):
+            raise ValueError("grouped_ratio must be in (0, 1]")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+
+        self.batch_size = int(batch_size)
+        self.grouped_ratio = float(grouped_ratio)
+        self.grouped_target = max(1, int(round(self.batch_size * self.grouped_ratio)))
+        self._rng = random.Random(int(seed))
+
+        from collections import defaultdict
+        img2idx: Dict[int, List[int]] = defaultdict(list)
+        img2labels: Dict[int, set] = defaultdict(set)
+        for i, s in enumerate(samples):
+            img2idx[int(s.image_id)].append(i)
+            if s.label_id is not None:
+                img2labels[int(s.image_id)].add(int(s.label_id))
+
+        self.eligible_groups: List[List[int]] = []
+        self.singletons: List[int] = []
+        for img_id, indices in img2idx.items():
+            if len(img2labels[img_id]) >= 2:
+                self.eligible_groups.append(indices)
+            else:
+                self.singletons.extend(indices)
+
+        if not self.eligible_groups:
+            raise ValueError(
+                "grouped sampler enabled but no multi-category images found; "
+                "either disable --grouped_sampler or check dataset labels."
+            )
+
+        total = len(samples)
+        self._num_batches = (
+            int(num_batches) if num_batches is not None else max(1, total // self.batch_size)
+        )
+
+        elig_crops = sum(len(g) for g in self.eligible_groups)
+        print(
+            f"[GroupedSampler] eligible_imgs={len(self.eligible_groups)} "
+            f"({elig_crops} crops), singletons={len(self.singletons)}, "
+            f"batches/epoch={self._num_batches}, grouped_target={self.grouped_target}/{self.batch_size}"
+        )
+
+    def __len__(self) -> int:
+        return self._num_batches
+
+    def _iter_groups(self):
+        order = list(range(len(self.eligible_groups)))
+        while True:
+            self._rng.shuffle(order)
+            for i in order:
+                yield self.eligible_groups[i]
+
+    def _iter_singletons(self):
+        if not self.singletons:
+            while True:
+                yield None  # sentinel — should never be consumed
+        pool = list(self.singletons)
+        while True:
+            self._rng.shuffle(pool)
+            for i in pool:
+                yield i
+
+    def __iter__(self):
+        group_gen = self._iter_groups()
+        single_gen = self._iter_singletons()
+
+        for _ in range(self._num_batches):
+            batch: List[int] = []
+            # Pack image groups until we hit (or would exceed) the grouped target.
+            attempts = 0
+            while len(batch) < self.grouped_target and attempts < 32:
+                grp = next(group_gen)
+                if len(batch) + len(grp) > self.batch_size:
+                    # Single huge image group bigger than batch_size: take first batch_size crops
+                    if len(batch) == 0 and len(grp) > self.batch_size:
+                        batch.extend(grp[: self.batch_size])
+                    attempts += 1
+                    continue
+                batch.extend(grp)
+                attempts = 0
+            # Fill remainder with singletons (with cycle).
+            need = self.batch_size - len(batch)
+            if need > 0:
+                if self.singletons:
+                    for _ in range(need):
+                        batch.append(next(single_gen))
+                else:
+                    # No singletons available — pull extra image groups instead.
+                    while len(batch) < self.batch_size:
+                        grp = next(group_gen)
+                        room = self.batch_size - len(batch)
+                        batch.extend(grp[:room])
+            yield batch[: self.batch_size]
 
 
 # =========================
@@ -609,6 +763,77 @@ def compute_symmetric_multipos_sigmoid_loss(
 
 
 
+def compute_cross_lesion_loss(
+    img_feats: torch.Tensor,
+    txt_bank_feats: torch.Tensor,
+    img_labels: torch.Tensor,
+    image_ids: torch.Tensor,
+    cat2bank_indices: Dict[int, List[int]],
+    temperature: float,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, int]:
+    """Within-image supervised contrastive loss for VLM-Lesion.
+
+    For each image containing >=2 lesions of >=2 distinct categories, push
+    each lesion's image feature toward captions of its own category and
+    away from captions of other in-image categories. Per-sample text
+    representation = mean of the sample's category caption-bank embeddings
+    (then L2-renormalized).
+
+    Returns (loss, num_eligible_groups). When no eligible group exists in
+    the batch, returns (0-tensor, 0).
+    """
+    device = img_feats.device
+    dtype = img_feats.dtype
+    B = img_feats.size(0)
+    zero = torch.zeros((), device=device, dtype=dtype)
+    if B < 2:
+        return zero, 0
+
+    sample_txt = torch.zeros_like(img_feats)
+    for i, y in enumerate(img_labels.tolist()):
+        idxs = cat2bank_indices.get(int(y))
+        if not idxs:
+            continue
+        sel = torch.as_tensor(idxs, device=device, dtype=torch.long)
+        sample_txt[i] = txt_bank_feats.index_select(0, sel).mean(dim=0)
+    sample_txt = F.normalize(sample_txt, dim=-1)
+
+    unique_ids, inverse = torch.unique(image_ids, return_inverse=True)
+    inv_temp = 1.0 / max(float(temperature), eps)
+    losses: List[torch.Tensor] = []
+
+    for g in range(int(unique_ids.size(0))):
+        idx = (inverse == g).nonzero(as_tuple=True)[0]
+        if idx.numel() < 2:
+            continue
+        y_g = img_labels[idx]
+        if torch.unique(y_g).numel() < 2:
+            continue
+
+        f = img_feats[idx]
+        t = sample_txt[idx]
+        sim = (f @ t.t()) * inv_temp                          # [N, N]
+
+        pos_mask = (y_g.unsqueeze(0) == y_g.unsqueeze(1)).to(dtype)
+        pos_count_row = pos_mask.sum(dim=1).clamp_min(eps)
+        pos_count_col = pos_mask.sum(dim=0).clamp_min(eps)
+
+        logp_i2t = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+        l_i2t = -(logp_i2t * pos_mask).sum(dim=1) / pos_count_row
+
+        sim_T = sim.t()
+        logp_t2i = sim_T - torch.logsumexp(sim_T, dim=1, keepdim=True)
+        l_t2i = -(logp_t2i * pos_mask).sum(dim=1) / pos_count_col
+
+        losses.append(0.5 * (l_i2t + l_t2i).mean())
+
+    if not losses:
+        return zero, 0
+    return torch.stack(losses).mean(), len(losses)
+
+
+
 def compute_paired_sigmoid_loss(
     logits: torch.Tensor,
     label_smoothing: float,
@@ -637,6 +862,135 @@ def compute_paired_sigmoid_loss(
 
     total = 0.5 * (i2t + t2i)
     return total, i2t, t2i
+
+
+# =========================
+# LSCFT — Lesion-Selective Counterfactual Faithfulness Training
+# =========================
+
+def _lscft_center_bbox(H: int, W: int, size: int, jitter_px: int) -> Tuple[int, int, int, int]:
+    """Return (y0, y1, x0, x1) for a size×size region centered (with random jitter)."""
+    cy = H // 2 + random.randint(-jitter_px, jitter_px)
+    cx = W // 2 + random.randint(-jitter_px, jitter_px)
+    y0 = max(0, cy - size // 2)
+    y1 = min(H, y0 + size)
+    y0 = max(0, y1 - size)
+    x0 = max(0, cx - size // 2)
+    x1 = min(W, x0 + size)
+    x0 = max(0, x1 - size)
+    return y0, y1, x0, x1
+
+
+def lscft_mask_mean(pv: torch.Tensor, mask_size: int, jitter_px: int) -> torch.Tensor:
+    """Replace center with per-image mean pixel value (lesion content removed)."""
+    B, C, H, W = pv.shape
+    out = pv.clone()
+    mean_per_img = pv.mean(dim=(2, 3), keepdim=True)
+    y0, y1, x0, x1 = _lscft_center_bbox(H, W, mask_size, jitter_px)
+    out[:, :, y0:y1, x0:x1] = mean_per_img.expand(-1, -1, y1 - y0, x1 - x0)
+    return out
+
+
+def lscft_mask_cutmix(pv: torch.Tensor, mask_size: int, jitter_px: int) -> torch.Tensor:
+    """Replace center with a periphery patch from another image in the batch.
+
+    Source patch comes from the top-left corner of a permuted sample, which is
+    typically background/healthy tissue (lesion is centered in the crop).
+    """
+    B, C, H, W = pv.shape
+    out = pv.clone()
+    y0, y1, x0, x1 = _lscft_center_bbox(H, W, mask_size, jitter_px)
+    sy = min(H, y1 - y0)
+    sx = min(W, x1 - x0)
+    perm = torch.randperm(B, device=pv.device)
+    src = pv[perm, :, :sy, :sx]
+    out[:, :, y0:y1, x0:x1] = src
+    return out
+
+
+def lscft_mask_noise(pv: torch.Tensor, mask_size: int, jitter_px: int) -> torch.Tensor:
+    """Replace center with N(0, 1) noise (matches normalized image statistics)."""
+    B, C, H, W = pv.shape
+    out = pv.clone()
+    y0, y1, x0, x1 = _lscft_center_bbox(H, W, mask_size, jitter_px)
+    noise = torch.randn(B, C, y1 - y0, x1 - x0, device=pv.device, dtype=pv.dtype)
+    out[:, :, y0:y1, x0:x1] = noise
+    return out
+
+
+def lscft_peripheral_mask(pv: torch.Tensor, keep_size: int) -> torch.Tensor:
+    """Keep center keep_size×keep_size; fill periphery with per-image mean."""
+    B, C, H, W = pv.shape
+    mean_per_img = pv.mean(dim=(2, 3), keepdim=True)
+    out = mean_per_img.expand_as(pv).clone()
+    cy, cx = H // 2, W // 2
+    y0 = max(0, cy - keep_size // 2)
+    y1 = min(H, y0 + keep_size)
+    x0 = max(0, cx - keep_size // 2)
+    x1 = min(W, x0 + keep_size)
+    out[:, :, y0:y1, x0:x1] = pv[:, :, y0:y1, x0:x1]
+    return out
+
+
+def lscft_color_jitter(pv: torch.Tensor, strength: float) -> torch.Tensor:
+    """Per-channel multiplicative jitter (approximates hue/saturation in
+    normalized tensor space). Whole-image perturbation — lesion content
+    structurally preserved, only color shifted."""
+    B, C, _, _ = pv.shape
+    scale = 1.0 + (torch.rand(B, C, 1, 1, device=pv.device, dtype=pv.dtype) - 0.5) * 2.0 * float(strength)
+    return pv * scale
+
+
+def lscft_hflip(pv: torch.Tensor) -> torch.Tensor:
+    return torch.flip(pv, dims=[-1])
+
+
+_LSCFT_POSITIVE_BANK = ("mean", "cutmix", "noise")
+_LSCFT_NEGATIVE_BANK = ("peripheral", "jitter", "hflip")
+
+
+def lscft_apply_positive(pv: torch.Tensor, mask_size: int, jitter_px: int) -> Tuple[torch.Tensor, str]:
+    kind = random.choice(_LSCFT_POSITIVE_BANK)
+    if kind == "mean":
+        return lscft_mask_mean(pv, mask_size, jitter_px), kind
+    if kind == "cutmix":
+        return lscft_mask_cutmix(pv, mask_size, jitter_px), kind
+    return lscft_mask_noise(pv, mask_size, jitter_px), kind
+
+
+def lscft_apply_negative(pv: torch.Tensor, keep_size: int, jitter_strength: float) -> Tuple[torch.Tensor, str]:
+    kind = random.choice(_LSCFT_NEGATIVE_BANK)
+    if kind == "peripheral":
+        return lscft_peripheral_mask(pv, keep_size), kind
+    if kind == "jitter":
+        return lscft_color_jitter(pv, jitter_strength), kind
+    return lscft_hflip(pv), kind
+
+
+def compute_lscft_loss(
+    feat_orig: torch.Tensor,
+    feat_pos: torch.Tensor,
+    feat_neg: torch.Tensor,
+    txt_feat: torch.Tensor,
+    margin: float,
+) -> torch.Tensor:
+    """Ranking softplus loss.
+
+    All inputs must be L2-normalized rows. Computes:
+
+        drop_pos = cos(orig, t) - cos(pos, t)   (should be LARGE — lesion absent)
+        drop_neg = cos(orig, t) - cos(neg, t)   (should be SMALL — only periphery)
+        L = softplus(margin - (drop_pos - drop_neg))
+
+    Margin in cosine space (e.g., 0.1). softplus over hinge avoids dead
+    gradients near the margin.
+    """
+    sim_orig = (feat_orig * txt_feat).sum(dim=-1)
+    sim_pos = (feat_pos * txt_feat).sum(dim=-1)
+    sim_neg = (feat_neg * txt_feat).sum(dim=-1)
+    drop_pos = sim_orig - sim_pos
+    drop_neg = sim_orig - sim_neg
+    return F.softplus(float(margin) - (drop_pos - drop_neg)).mean()
 
 
 # =========================
@@ -679,6 +1033,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--multipos", action="store_true", help="use multi-positive caption-bank training")
     parser.add_argument("--fusion", action="store_true", help="use local-global image fusion")
     parser.add_argument("--freeze_text_encoder", action="store_true", help="freeze the text encoder/text projection during training")
+    parser.add_argument(
+        "--cross_lesion",
+        action="store_true",
+        help="enable within-image cross-lesion supervised contrastive aux loss (multipos+target=lesion)",
+    )
+    parser.add_argument("--cross_alpha", type=float, default=None, help="weight on cross-lesion aux loss")
+    parser.add_argument("--cross_tau", type=float, default=None, help="softmax temperature for cross-lesion loss")
+    parser.add_argument(
+        "--grouped_sampler",
+        action="store_true",
+        help="enable hybrid grouped batch sampler (raises cross-lesion firing rate to ~100%)",
+    )
+    parser.add_argument(
+        "--grouped_ratio",
+        type=float,
+        default=None,
+        help="fraction of each batch filled by multi-category image groups (default 0.5)",
+    )
+    parser.add_argument(
+        "--lscft",
+        action="store_true",
+        help="enable Lesion-Selective Counterfactual Faithfulness Training (multipos+fusion+target=lesion)",
+    )
+    parser.add_argument("--lscft_alpha", type=float, default=None, help="weight on LSCFT ranking loss")
+    parser.add_argument("--lscft_margin", type=float, default=None, help="LSCFT ranking margin (cosine space)")
+    parser.add_argument("--lscft_pos_size", type=int, default=None, help="positive-arm center mask size (pixels)")
+    parser.add_argument("--lscft_neg_keep", type=int, default=None, help="negative-arm center-keep size (pixels)")
+    parser.add_argument("--lscft_mask_jitter", type=int, default=None, help="spatial jitter for mask center (pixels)")
+    parser.add_argument("--lscft_jitter", type=float, default=None, help="negative-arm color jitter strength")
 
     parser.add_argument("--model_name", type=str, default=None)
     parser.add_argument("--data_root", type=str, default=None)
@@ -774,6 +1157,44 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         config["eval_test_after_train"] = True
     if args.freeze_text_encoder:
         config["freeze_text_encoder"] = True
+
+    if args.cross_lesion:
+        config["cross_lesion"] = True
+    for key in ("cross_alpha", "cross_tau"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+
+    if config.get("cross_lesion", False):
+        if config["target"] != "lesion" or not config["multipos"]:
+            raise ValueError("--cross_lesion requires --target lesion and --multipos")
+
+    if args.grouped_sampler:
+        config["grouped_sampler"] = True
+    if getattr(args, "grouped_ratio", None) is not None:
+        config["grouped_ratio"] = args.grouped_ratio
+
+    if config.get("grouped_sampler", False):
+        if config["target"] != "lesion" or not config["multipos"]:
+            raise ValueError("--grouped_sampler requires --target lesion and --multipos")
+
+    if args.lscft:
+        config["lscft"] = True
+    for key in (
+        "lscft_alpha",
+        "lscft_margin",
+        "lscft_pos_size",
+        "lscft_neg_keep",
+        "lscft_mask_jitter",
+        "lscft_jitter",
+    ):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+
+    if config.get("lscft", False):
+        if config["target"] != "lesion" or not config["multipos"] or not config["fusion"]:
+            raise ValueError("--lscft requires --target lesion, --multipos, and --fusion")
 
     if config["weight_decay"] is None:
         config["weight_decay"] = 0.01 if (config["multipos"] or config["fusion"]) else 0.0
@@ -987,6 +1408,10 @@ def build_collate_fn(
                 for j, pos in enumerate(positions[:L]):
                     evidence_bank_idx[i, j] = int(pos)
 
+            image_ids = torch.tensor(
+                [int(x.get("image_id", -1)) for x in items], dtype=torch.long
+            )
+
             if use_fusion:
                 images_local = [x["image_local"] for x in items]
                 images_global = [x["image_global"] for x in items]
@@ -997,6 +1422,7 @@ def build_collate_fn(
                     "pixel_values_global": batch_global["pixel_values"],
                     "labels": labels,
                     "evidence_bank_idx": evidence_bank_idx,
+                    "image_ids": image_ids,
                 }
             else:
                 images = [x["image"] for x in items]
@@ -1007,6 +1433,7 @@ def build_collate_fn(
                     "pixel_values": img_batch["pixel_values"],
                     "labels": labels,
                     "evidence_bank_idx": evidence_bank_idx,
+                    "image_ids": image_ids,
                 }
 
         # baseline paired text supervision
@@ -1369,13 +1796,26 @@ def compute_custom_batch_loss(
     config: Dict[str, Any],
     bank_tokens_device: Optional[Dict[str, torch.Tensor]],
     bank_labels_t: Optional[torch.Tensor],
+    cat2bank_indices: Optional[Dict[int, List[int]]] = None,
 ):
     device = config["device"]
+    zero_cross = torch.zeros((), device=device, dtype=torch.float32)
+    zero_lscft = torch.zeros((), device=device, dtype=torch.float32)
+
+    target = config.get("target", "lesion")
+    lscft_enabled = bool(config.get("lscft", False)) and target == "lesion" and config["fusion"]
+    global_feat_cached: Optional[torch.Tensor] = None
+    pixel_values_local: Optional[torch.Tensor] = None
 
     if config["fusion"]:
         pixel_values_local = batch["pixel_values_local"].to(device, non_blocking=True)
         pixel_values_global = batch["pixel_values_global"].to(device, non_blocking=True)
-        img_feats = model.forward_image(pixel_values_local, pixel_values_global)
+        if lscft_enabled:
+            img_feats, _local_feat_cached, global_feat_cached, _fused_cached = model.forward_image(
+                pixel_values_local, pixel_values_global, return_parts=True
+            )
+        else:
+            img_feats = model.forward_image(pixel_values_local, pixel_values_global)
         batch_size = int(pixel_values_local.size(0))
     else:
         pixel_values = batch["pixel_values"].to(device, non_blocking=True)
@@ -1386,7 +1826,6 @@ def compute_custom_batch_loss(
         img_labels = batch["labels"].to(device, non_blocking=True)
         evidence_bank_idx = batch["evidence_bank_idx"].to(device, non_blocking=True)
 
-        target = config.get("target", "lesion")
         if target == "overall":
             # in-batch bank: text features come from this batch's input_ids
             input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -1430,7 +1869,70 @@ def compute_custom_batch_loss(
             t2i_label_level_mean=bool(config["t2i_label_level_mean"]),
             label_smoothing=float(config["label_smoothing"]),
         )
-        return loss, li2t, lt2i, batch_size
+
+        lcross = zero_cross.to(loss.dtype)
+        if (
+            bool(config.get("cross_lesion", False))
+            and target == "lesion"
+            and cat2bank_indices is not None
+            and "image_ids" in batch
+        ):
+            image_ids = batch["image_ids"].to(device, non_blocking=True)
+            lcross_val, _ = compute_cross_lesion_loss(
+                img_feats=img_feats,
+                txt_bank_feats=txt_feats,
+                img_labels=img_labels,
+                image_ids=image_ids,
+                cat2bank_indices=cat2bank_indices,
+                temperature=float(config.get("cross_tau", 0.1)),
+            )
+            lcross = lcross_val
+            loss = loss + float(config.get("cross_alpha", 0.3)) * lcross
+
+        llscft = zero_lscft.to(loss.dtype)
+        if (
+            lscft_enabled
+            and cat2bank_indices is not None
+            and global_feat_cached is not None
+            and pixel_values_local is not None
+        ):
+            sample_txt = torch.zeros_like(img_feats)
+            for i, y in enumerate(img_labels.tolist()):
+                idxs = cat2bank_indices.get(int(y))
+                if not idxs:
+                    continue
+                sel = torch.as_tensor(idxs, device=device, dtype=torch.long)
+                sample_txt[i] = txt_feats.index_select(0, sel).mean(dim=0)
+            sample_txt = F.normalize(sample_txt, dim=-1)
+
+            pos_size = int(config.get("lscft_pos_size", 80))
+            neg_keep = int(config.get("lscft_neg_keep", 140))
+            jitter_px = int(config.get("lscft_mask_jitter", 10))
+            jitter_str = float(config.get("lscft_jitter", 0.05))
+            margin = float(config.get("lscft_margin", 0.1))
+
+            pv_pos, _pos_kind = lscft_apply_positive(pixel_values_local, pos_size, jitter_px)
+            pv_neg, _neg_kind = lscft_apply_negative(pixel_values_local, neg_keep, jitter_str)
+
+            local_pos = F.normalize(get_image_features(model.base_model, pv_pos), dim=-1)
+            local_neg = F.normalize(get_image_features(model.base_model, pv_neg), dim=-1)
+            feat_pos = F.normalize(
+                model.fuse_local_with_global_feat(local_pos, global_feat_cached), dim=-1
+            )
+            feat_neg = F.normalize(
+                model.fuse_local_with_global_feat(local_neg, global_feat_cached), dim=-1
+            )
+
+            llscft = compute_lscft_loss(
+                feat_orig=img_feats,
+                feat_pos=feat_pos,
+                feat_neg=feat_neg,
+                txt_feat=sample_txt,
+                margin=margin,
+            )
+            loss = loss + float(config.get("lscft_alpha", 0.5)) * llscft
+
+        return loss, li2t, lt2i, lcross, llscft, batch_size
 
     input_ids = batch["input_ids"].to(device, non_blocking=True)
     attention_mask = batch.get("attention_mask", None)
@@ -1451,7 +1953,14 @@ def compute_custom_batch_loss(
         logits=logits,
         label_smoothing=float(config["label_smoothing"]),
     )
-    return loss, li2t, lt2i, batch_size
+    return (
+        loss,
+        li2t,
+        lt2i,
+        zero_cross.to(loss.dtype),
+        zero_lscft.to(loss.dtype),
+        batch_size,
+    )
 
 
 
@@ -1461,26 +1970,32 @@ def run_eval_custom(
     config: Dict[str, Any],
     bank_tokens_device: Optional[Dict[str, torch.Tensor]],
     bank_labels_t: Optional[torch.Tensor],
+    cat2bank_indices: Optional[Dict[int, List[int]]] = None,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_i2t = 0.0
     total_t2i = 0.0
+    total_cross = 0.0
+    total_lscft = 0.0
     n = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Eval", leave=False):
             with torch.cuda.amp.autocast(enabled=(bool(config["use_amp"]) and config["device"] == "cuda")):
-                loss, li2t, lt2i, bs = compute_custom_batch_loss(
+                loss, li2t, lt2i, lcross, llscft, bs = compute_custom_batch_loss(
                     model=model,
                     batch=batch,
                     config=config,
                     bank_tokens_device=bank_tokens_device,
                     bank_labels_t=bank_labels_t,
+                    cat2bank_indices=cat2bank_indices,
                 )
             total_loss += float(loss.item()) * bs
             total_i2t += float(li2t.item()) * bs
             total_t2i += float(lt2i.item()) * bs
+            total_cross += float(lcross.item()) * bs
+            total_lscft += float(llscft.item()) * bs
             n += bs
 
     denom = max(1, n)
@@ -1488,6 +2003,8 @@ def run_eval_custom(
         "loss": total_loss / denom,
         "i2t": total_i2t / denom,
         "t2i": total_t2i / denom,
+        "cross": total_cross / denom,
+        "lscft": total_lscft / denom,
     }
 
 
@@ -1558,14 +2075,36 @@ def train_custom(config: Dict[str, Any]):
         target=target,
     )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=int(config["batch_size"]),
-        shuffle=True,
-        num_workers=int(config["num_workers"]),
-        pin_memory=bool(config["pin_memory"]) and device == "cuda",
-        collate_fn=collate_fn,
+    use_grouped = (
+        bool(config.get("grouped_sampler", False))
+        and target == "lesion"
+        and bool(config["multipos"])
     )
+    if use_grouped:
+        if not isinstance(train_ds, CocoCropDataset):
+            raise ValueError("--grouped_sampler requires CocoCropDataset (lesion target).")
+        train_batch_sampler = MultiCategoryGroupedBatchSampler(
+            samples=train_ds.samples,
+            batch_size=int(config["batch_size"]),
+            grouped_ratio=float(config.get("grouped_ratio", 0.5)),
+            seed=int(config["seed"]),
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=train_batch_sampler,
+            num_workers=int(config["num_workers"]),
+            pin_memory=bool(config["pin_memory"]) and device == "cuda",
+            collate_fn=collate_fn,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=int(config["batch_size"]),
+            shuffle=True,
+            num_workers=int(config["num_workers"]),
+            pin_memory=bool(config["pin_memory"]) and device == "cuda",
+            collate_fn=collate_fn,
+        )
     valid_loader = DataLoader(
         valid_ds,
         batch_size=int(config["batch_size"]),
@@ -1593,18 +2132,21 @@ def train_custom(config: Dict[str, Any]):
         running = 0.0
         running_i2t = 0.0
         running_t2i = 0.0
+        running_cross = 0.0
+        running_lscft = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']} [Train]")
         for batch in pbar:
             optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=(bool(config["use_amp"]) and device == "cuda")):
-                loss, li2t, lt2i, _ = compute_custom_batch_loss(
+                loss, li2t, lt2i, lcross, llscft, _ = compute_custom_batch_loss(
                     model=model,
                     batch=batch,
                     config=config,
                     bank_tokens_device=bank_tokens_device,
                     bank_labels_t=bank_labels_t,
+                    cat2bank_indices=cat2bank_indices,
                 )
 
             scaler.scale(loss).backward()
@@ -1619,15 +2161,21 @@ def train_custom(config: Dict[str, Any]):
             running += float(loss.item())
             running_i2t += float(li2t.item())
             running_t2i += float(lt2i.item())
+            running_cross += float(lcross.item())
+            running_lscft += float(llscft.item())
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "i2t": f"{li2t.item():.4f}",
                 "t2i": f"{lt2i.item():.4f}",
+                "cross": f"{lcross.item():.4f}",
+                "lscft": f"{llscft.item():.4f}",
             })
 
         train_loss = running / max(1, len(train_loader))
         train_i2t = running_i2t / max(1, len(train_loader))
         train_t2i = running_t2i / max(1, len(train_loader))
+        train_cross = running_cross / max(1, len(train_loader))
+        train_lscft = running_lscft / max(1, len(train_loader))
 
         val = run_eval_custom(
             model=model,
@@ -1635,6 +2183,7 @@ def train_custom(config: Dict[str, Any]):
             config=config,
             bank_tokens_device=bank_tokens_device,
             bank_labels_t=bank_labels_t,
+            cat2bank_indices=cat2bank_indices,
         )
 
         train_losses.append(train_loss)
@@ -1644,8 +2193,10 @@ def train_custom(config: Dict[str, Any]):
             inspect_fusion_state(model, valid_loader, device)
 
         print(
-            f"Epoch {epoch+1}: train(loss={train_loss:.4f}, i2t={train_i2t:.4f}, t2i={train_t2i:.4f}) | "
-            f"valid(loss={val['loss']:.4f}, i2t={val['i2t']:.4f}, t2i={val['t2i']:.4f})"
+            f"Epoch {epoch+1}: train(loss={train_loss:.4f}, i2t={train_i2t:.4f}, t2i={train_t2i:.4f}, "
+            f"cross={train_cross:.4f}, lscft={train_lscft:.4f}) | "
+            f"valid(loss={val['loss']:.4f}, i2t={val['i2t']:.4f}, t2i={val['t2i']:.4f}, "
+            f"cross={val['cross']:.4f}, lscft={val['lscft']:.4f})"
         )
 
         if val["loss"] < best_val:
@@ -1684,8 +2235,12 @@ def train_custom(config: Dict[str, Any]):
             config=config,
             bank_tokens_device=bank_tokens_device,
             bank_labels_t=bank_labels_t,
+            cat2bank_indices=cat2bank_indices,
         )
-        print(f"Test: loss={test['loss']:.4f}, i2t={test['i2t']:.4f}, t2i={test['t2i']:.4f}")
+        print(
+            f"Test: loss={test['loss']:.4f}, i2t={test['i2t']:.4f}, t2i={test['t2i']:.4f}, "
+            f"cross={test['cross']:.4f}, lscft={test['lscft']:.4f}"
+        )
 
 
 # =========================

@@ -143,6 +143,20 @@ class LocalGlobalFusionWrapper(nn.Module):
             return out, local_feat, global_feat, fused
         return out
 
+    def fuse_local_with_global_feat(self, local_feat_normalized: torch.Tensor, global_feat_normalized: torch.Tensor) -> torch.Tensor:
+        """Reuse fusion module on a new local feature with a precomputed global.
+
+        Both inputs must already be L2-normalized (caller's responsibility).
+        Output is NOT renormalized — the caller normalizes after gathering all
+        branches, matching the existing forward_image -> external F.normalize
+        flow in compute_custom_batch_loss.
+        """
+        fused = torch.cat([local_feat_normalized, global_feat_normalized], dim=-1)
+        fused = self.fusion_linear(fused)
+        fused = self.gelu(fused)
+        fused = self.dropout(fused)
+        return local_feat_normalized + self.gate * fused
+
     def get_text_features(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         return get_text_features(self.base_model, input_ids, attention_mask)
 
