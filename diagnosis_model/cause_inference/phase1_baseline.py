@@ -1,4 +1,4 @@
-"""Phase 1 baseline: zero-training C²R + candidate-restricted cause scoring.
+"""Phase 1 baseline: zero-training case-based cause retrieval + candidate-restricted cause scoring.
 
 Pipeline per query (valid case):
   1. Combined case similarity vs every train case
@@ -51,12 +51,16 @@ from scipy.optimize import linear_sum_assignment
 # Loading
 # ---------------------------------------------------------------------------
 
-def load_case_db(case_db_dir: Path):
+def load_case_db(case_db_dir: Path, query_split: str = "valid"):
+    """Load train + query split cases. `query_split` selects which `<split>_cases.pt`
+    is returned in the 2nd slot (default `valid` preserves prior behavior)."""
+    if query_split not in ("valid", "test"):
+        raise ValueError(f"query_split must be 'valid' or 'test', got {query_split!r}")
     train = torch.load(case_db_dir / "train_cases.pt", weights_only=False)
-    valid = torch.load(case_db_dir / "valid_cases.pt", weights_only=False)
+    queries = torch.load(case_db_dir / f"{query_split}_cases.pt", weights_only=False)
     cause = torch.load(case_db_dir / "cause_text_embs.pt", weights_only=False)
     meta = json.load((case_db_dir / "meta.json").open())
-    return train, valid, cause, meta
+    return train, queries, cause, meta
 
 
 def stack_train_lesions(train_cases) -> Tuple[torch.Tensor, List[int]]:
@@ -322,6 +326,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--case_db_dir", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
+    ap.add_argument("--query_split", type=str, default="valid",
+                    choices=["valid", "test"],
+                    help="which split to use as the query set (default valid)")
     ap.add_argument("--top_k_cases", type=int, default=10)
     ap.add_argument("--top_n_causes", type=int, default=20)
     ap.add_argument("--alpha_global", type=float, default=0.25)
@@ -336,9 +343,11 @@ def main():
     ap.add_argument("--semantic_threshold", type=float, default=0.95,
                     help="cosine threshold for treating two cause strings as semantically equivalent")
     ap.add_argument("--cluster_json", type=str,
-                    default="diagnosis_model/cause_inference/outputs/cause_clusters_reassigned.json",
-                    help="HDBSCAN clustering JSON (raw_string -> cluster_id). "
-                         "Enables cluster-level metrics. Set to '' to disable.")
+                    default="diagnosis_model/cause_inference/outputs/cause_clusters_llm.json",
+                    help="Cluster taxonomy JSON (raw_string -> cluster_id). "
+                         "Paper main: cause_clusters_llm.json (LLM, 466 topics). "
+                         "Paper baseline: cause_clusters_hdbscan.json (HDBSCAN, 100). "
+                         "Set to '' to disable cluster-level metrics.")
     ap.add_argument("--diversify_threshold", type=float, default=0.95,
                     help="For predicted_top_n output only: suppress any candidate whose cosine "
                          "to a previously kept candidate exceeds this. "
@@ -349,13 +358,15 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     device = args.device
 
-    train_cases, valid_cases, cause_pack, meta = load_case_db(Path(args.case_db_dir))
+    train_cases, valid_cases, cause_pack, meta = load_case_db(
+        Path(args.case_db_dir), query_split=args.query_split,
+    )
 
     # Explicit normalization: all following dot products are cosine similarities.
     cause_table_embs = F.normalize(cause_pack["embeddings"].to(device), dim=-1)
     cause_texts = cause_pack["texts"]
 
-    print(f"[load] train={len(train_cases)}  valid={len(valid_cases)}  "
+    print(f"[load] train={len(train_cases)}  {args.query_split}={len(valid_cases)}  "
           f"unique_causes={len(cause_texts)}  dim={cause_table_embs.size(-1)}")
 
     # Optional: cluster-based evaluation.

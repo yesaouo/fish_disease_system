@@ -233,8 +233,13 @@ def main():
     ap.add_argument("--case_db_dir", type=str, required=True)
     ap.add_argument("--ceah_ckpt", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
+    ap.add_argument("--query_split", type=str, default="valid",
+                    choices=["valid", "test"],
+                    help="which split to use as the query set (default valid)")
     ap.add_argument("--cluster_json", type=str,
-                    default="diagnosis_model/cause_inference/outputs/cause_clusters_reassigned.json")
+                    default="diagnosis_model/cause_inference/outputs/cause_clusters_llm.json",
+                    help="Cluster taxonomy JSON. Paper main: cause_clusters_llm.json (466). "
+                         "Paper baseline: cause_clusters_hdbscan.json (100). Set '' to disable.")
 
     ap.add_argument("--gammas", type=float, nargs="+", default=[0.0, 0.25, 0.5, 0.75, 1.0])
     ap.add_argument("--dump_gamma", type=float, default=0.5,
@@ -272,12 +277,14 @@ def main():
     # Load data
     case_db_dir = Path(args.case_db_dir)
     train_cases = torch.load(case_db_dir / "train_cases.pt", weights_only=False)
-    valid_cases = torch.load(case_db_dir / "valid_cases.pt", weights_only=False)
+    valid_cases = torch.load(
+        case_db_dir / f"{args.query_split}_cases.pt", weights_only=False,
+    )
     cause_pack = torch.load(case_db_dir / "cause_text_embs.pt", weights_only=False)
     # Match phase1_baseline.py: L2-normalize so dot products are cosine.
     cause_table_embs = F.normalize(cause_pack["embeddings"].to(device), dim=-1)
     cause_texts = cause_pack["texts"]
-    print(f"[load] train={len(train_cases)} valid={len(valid_cases)} "
+    print(f"[load] train={len(train_cases)} {args.query_split}={len(valid_cases)} "
           f"causes={cause_table_embs.size(0)}")
 
     cluster_id_array = None

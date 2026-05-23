@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler, WeightedRandomSampler
 from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -60,6 +60,10 @@ DEFAULT_CONFIG = {
     "dropout_prob": 0.1,
     "fusion_base_lr": 5e-5,
     "fusion_head_lr": 1e-4,
+    # gate mixing the fusion branch back into the local feature:
+    #   "scalar" — single learnable scalar (production)
+    #   "film"   — input-conditioned per-channel gate (architecture lever, off by default)
+    "fusion_gate_mode": "scalar",
 
     # multi-positive / custom loss
     "evidence_alpha": 3.0,
@@ -73,6 +77,12 @@ DEFAULT_CONFIG = {
     "cross_lesion": False,
     "cross_alpha": 0.3,
     "cross_tau": 0.1,
+
+    # Class imbalance (goal: lift macro f1 on rare lesion categories).
+    # Two orthogonal, default-off levers; both require --multipos --target lesion.
+    "class_balanced_loss": False,   # weight per-sample i2t term by effective-number class weights
+    "cb_beta": 0.999,               # effective-number beta (Cui et al. 2019); w_c = (1-β)/(1-β^n_c)
+    "balanced_sampler": False,      # WeightedRandomSampler with inverse-frequency sample weights
 
     # Grouped batch sampler — pairs with cross_lesion to push firing rate
     # from ~13% (random) to ~100% (every batch contains multi-category image groups).
@@ -689,6 +699,7 @@ def compute_symmetric_multipos_sigmoid_loss(
     t2i_skip_no_positive: bool,
     t2i_label_level_mean: bool,
     label_smoothing: float,
+    class_weights: Optional[torch.Tensor] = None,  # [num_cat] indexed by cat_id; weights i2t per-sample term
     eps: float = 1e-8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, M = logits.shape
@@ -724,7 +735,16 @@ def compute_symmetric_multipos_sigmoid_loss(
 
     neg_den_i = neg_mask.sum(dim=1).to(dtype).clamp_min(1.0)
     neg_loss_i = (element * neg_mask.to(dtype)).sum(dim=1) / neg_den_i
-    i2t = (0.5 * (pos_loss_i + neg_loss_i)).mean()
+    per_sample_i2t = 0.5 * (pos_loss_i + neg_loss_i)
+    if class_weights is not None:
+        # Class-balanced weighted mean over the image->text direction (the
+        # classification direction the confusion matrix measures). t2i is left
+        # unweighted: its bank is fixed per batch and t2i_label_level_mean
+        # already removes per-caption-count imbalance.
+        w_i = class_weights[img_labels].to(dtype)
+        i2t = (per_sample_i2t * w_i).sum() / w_i.sum().clamp_min(eps)
+    else:
+        i2t = per_sample_i2t.mean()
 
     pos_den_j = pos_w.sum(dim=0)
     pos_loss_j = (element * pos_w).sum(dim=0) / pos_den_j.clamp_min(eps)
@@ -761,6 +781,35 @@ def compute_symmetric_multipos_sigmoid_loss(
     total = i2t + float(t2i_lambda) * t2i
     return total, i2t, t2i
 
+
+
+def compute_effective_number_weights(
+    labels: List[int],
+    beta: float,
+    device: str,
+) -> Tuple[torch.Tensor, Dict[int, int]]:
+    """Effective-number class weights (Cui et al. 2019), indexed by cat_id.
+
+    w_c = (1 - beta) / (1 - beta^n_c), normalized so the mean weight over present
+    classes is 1.0 (keeps overall i2t loss scale unchanged). Returns a tensor of
+    size (max_cat_id + 1) with weight 1.0 for absent cat_ids, plus the raw counts.
+    """
+    from collections import Counter
+
+    counts = Counter(int(l) for l in labels)
+    if not counts:
+        raise ValueError("compute_effective_number_weights: empty label list")
+
+    eff: Dict[int, float] = {
+        c: (1.0 - beta) / (1.0 - beta ** n) if n > 0 else 1.0
+        for c, n in counts.items()
+    }
+    mean_eff = sum(eff.values()) / len(eff)
+
+    w = torch.ones(max(counts) + 1, dtype=torch.float32)
+    for c, e in eff.items():
+        w[c] = e / mean_eff
+    return w.to(device), dict(counts)
 
 
 def compute_cross_lesion_loss(
@@ -1041,6 +1090,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cross_alpha", type=float, default=None, help="weight on cross-lesion aux loss")
     parser.add_argument("--cross_tau", type=float, default=None, help="softmax temperature for cross-lesion loss")
     parser.add_argument(
+        "--class_balanced_loss",
+        action="store_true",
+        help="weight the i2t loss term by effective-number class weights (lifts macro f1 on rare lesion categories)",
+    )
+    parser.add_argument("--cb_beta", type=float, default=None, help="effective-number beta for --class_balanced_loss (default 0.999)")
+    parser.add_argument(
+        "--balanced_sampler",
+        action="store_true",
+        help="oversample rare lesion categories via inverse-frequency WeightedRandomSampler (mutually exclusive with --grouped_sampler)",
+    )
+    parser.add_argument(
         "--grouped_sampler",
         action="store_true",
         help="enable hybrid grouped batch sampler (raises cross-lesion firing rate to ~100%)",
@@ -1083,6 +1143,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout_prob", type=float, default=None)
     parser.add_argument("--fusion_base_lr", type=float, default=None)
     parser.add_argument("--fusion_head_lr", type=float, default=None)
+    parser.add_argument("--fusion_gate_mode", type=str, choices=["scalar", "film", "xattn"], default=None,
+                        help="fusion gate: scalar (production), film (input-conditioned per-channel gate), "
+                             "or xattn (lesion cross-attends over whole-fish patch tokens)")
 
     parser.add_argument("--evidence_alpha", type=float, default=None)
     parser.add_argument("--temperature", type=float, default=None)
@@ -1169,6 +1232,17 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         if config["target"] != "lesion" or not config["multipos"]:
             raise ValueError("--cross_lesion requires --target lesion and --multipos")
 
+    if args.class_balanced_loss:
+        config["class_balanced_loss"] = True
+    if getattr(args, "cb_beta", None) is not None:
+        config["cb_beta"] = args.cb_beta
+    if args.balanced_sampler:
+        config["balanced_sampler"] = True
+
+    for key in ("class_balanced_loss", "balanced_sampler"):
+        if config.get(key, False) and (config["target"] != "lesion" or not config["multipos"]):
+            raise ValueError(f"--{key} requires --target lesion and --multipos")
+
     if args.grouped_sampler:
         config["grouped_sampler"] = True
     if getattr(args, "grouped_ratio", None) is not None:
@@ -1177,6 +1251,8 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     if config.get("grouped_sampler", False):
         if config["target"] != "lesion" or not config["multipos"]:
             raise ValueError("--grouped_sampler requires --target lesion and --multipos")
+        if config.get("balanced_sampler", False):
+            raise ValueError("--balanced_sampler and --grouped_sampler are mutually exclusive (both override the batch composition)")
 
     if args.lscft:
         config["lscft"] = True
@@ -1195,6 +1271,11 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     if config.get("lscft", False):
         if config["target"] != "lesion" or not config["multipos"] or not config["fusion"]:
             raise ValueError("--lscft requires --target lesion, --multipos, and --fusion")
+
+    if getattr(args, "fusion_gate_mode", None) is not None:
+        config["fusion_gate_mode"] = args.fusion_gate_mode
+    if config.get("fusion_gate_mode", "scalar") in ("film", "xattn") and not config["fusion"]:
+        raise ValueError(f"--fusion_gate_mode {config['fusion_gate_mode']} requires --fusion")
 
     if config["weight_decay"] is None:
         config["weight_decay"] = 0.01 if (config["multipos"] or config["fusion"]) else 0.0
@@ -1224,6 +1305,7 @@ def create_processor_and_model(config: Dict[str, Any]):
         base_model=base_model,
         hidden_size=hidden_size,
         dropout_prob=float(config["dropout_prob"]),
+        gate_mode=str(config.get("fusion_gate_mode", "scalar")),
     ).to(device)
     return processor, model
 
@@ -1482,11 +1564,18 @@ def build_optimizer(model, config: Dict[str, Any]):
             param_groups.append({"params": base_params, "lr": float(config["fusion_base_lr"])})
 
         fusion_head_params = trainable_parameters(model.fusion_linear)
+        if hasattr(model, "cross_attn"):
+            fusion_head_params += trainable_parameters(model.cross_attn)
         if fusion_head_params:
             param_groups.append({"params": fusion_head_params, "lr": float(config["fusion_head_lr"])})
 
-        if model.gate.requires_grad:
-            param_groups.append({"params": [model.gate], "lr": float(config["fusion_head_lr"])})
+        gate_params: List[torch.nn.Parameter] = []
+        if hasattr(model, "gate") and model.gate.requires_grad:
+            gate_params.append(model.gate)
+        if hasattr(model, "gate_net"):
+            gate_params += [p for p in model.gate_net.parameters() if p.requires_grad]
+        if gate_params:
+            param_groups.append({"params": gate_params, "lr": float(config["fusion_head_lr"])})
 
         if not param_groups:
             raise RuntimeError("No trainable parameters found. Check freeze settings.")
@@ -1559,11 +1648,16 @@ def inspect_fusion_state(model, valid_loader, device: str):
             pixel_values_global,
             return_parts=True,
         )
-        gate_value = float(model.gate.detach().cpu().item())
         local_norm = float(local_feat.norm(dim=-1).mean().item())
         global_norm = float(global_feat.norm(dim=-1).mean().item())
         fused_norm = float(fused.norm(dim=-1).mean().item())
-        effective_ratio = abs(gate_value) * fused_norm / (local_norm + 1e-8)
+        if getattr(model, "gate_mode", "scalar") == "film":
+            g = torch.sigmoid(model.gate_net(torch.cat([local_feat, global_feat], dim=-1)))  # [B, H]
+            gate_value = float(g.mean().item())  # mean per-channel gate
+            effective_ratio = float((g * fused).norm(dim=-1).mean().item() / (local_norm + 1e-8))
+        else:
+            gate_value = float(model.gate.detach().cpu().item())
+            effective_ratio = abs(gate_value) * fused_norm / (local_norm + 1e-8)
 
     print(
         f"[Inspect] gate={gate_value:.4f}, "
@@ -1797,6 +1891,7 @@ def compute_custom_batch_loss(
     bank_tokens_device: Optional[Dict[str, torch.Tensor]],
     bank_labels_t: Optional[torch.Tensor],
     cat2bank_indices: Optional[Dict[int, List[int]]] = None,
+    class_weights: Optional[torch.Tensor] = None,
 ):
     device = config["device"]
     zero_cross = torch.zeros((), device=device, dtype=torch.float32)
@@ -1868,6 +1963,7 @@ def compute_custom_batch_loss(
             t2i_skip_no_positive=bool(config["t2i_skip_no_positive"]),
             t2i_label_level_mean=bool(config["t2i_label_level_mean"]),
             label_smoothing=float(config["label_smoothing"]),
+            class_weights=class_weights if target != "overall" else None,
         )
 
         lcross = zero_cross.to(loss.dtype)
@@ -2075,6 +2171,15 @@ def train_custom(config: Dict[str, Any]):
         target=target,
     )
 
+    class_weights = None
+    if config.get("class_balanced_loss", False):
+        class_weights, counts = compute_effective_number_weights(
+            train_ds.labels, beta=float(config["cb_beta"]), device=device
+        )
+        print(f"[ClassBalanced] beta={config['cb_beta']} (cat_id: n -> weight)")
+        for c in sorted(counts):
+            print(f"  {c:>3}: n={counts[c]:<5d} w={class_weights[c].item():.3f}")
+
     use_grouped = (
         bool(config.get("grouped_sampler", False))
         and target == "lesion"
@@ -2092,6 +2197,22 @@ def train_custom(config: Dict[str, Any]):
         train_loader = DataLoader(
             train_ds,
             batch_sampler=train_batch_sampler,
+            num_workers=int(config["num_workers"]),
+            pin_memory=bool(config["pin_memory"]) and device == "cuda",
+            collate_fn=collate_fn,
+        )
+    elif bool(config.get("balanced_sampler", False)):
+        from collections import Counter
+        cnt = Counter(int(l) for l in train_ds.labels)
+        sample_weights = [1.0 / cnt[int(l)] for l in train_ds.labels]
+        balanced = WeightedRandomSampler(
+            weights=sample_weights, num_samples=len(train_ds), replacement=True
+        )
+        print(f"[BalancedSampler] inverse-frequency oversampling over {len(cnt)} categories")
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=int(config["batch_size"]),
+            sampler=balanced,
             num_workers=int(config["num_workers"]),
             pin_memory=bool(config["pin_memory"]) and device == "cuda",
             collate_fn=collate_fn,
@@ -2147,6 +2268,7 @@ def train_custom(config: Dict[str, Any]):
                     bank_tokens_device=bank_tokens_device,
                     bank_labels_t=bank_labels_t,
                     cat2bank_indices=cat2bank_indices,
+                    class_weights=class_weights,
                 )
 
             scaler.scale(loss).backward()

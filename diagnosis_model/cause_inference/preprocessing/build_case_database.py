@@ -9,6 +9,7 @@ For each non-healthy COCO image with non-empty `global_causes_zh`, extract:
 Outputs (under --output_dir):
   - train_cases.pt          list[dict], one per non-healthy training image
   - valid_cases.pt          list[dict], one per non-healthy valid image
+  - test_cases.pt           list[dict], one per non-healthy test image (if --coco_test)
   - cause_text_embs.pt      {"texts": List[str], "embeddings": Tensor[U, D]}
   - meta.json               config, model paths, dims, counts
 
@@ -16,7 +17,7 @@ Per-case dict schema:
   {
     "case_id":              int,                      # within-split running id
     "image_id":             int,                      # COCO image id
-    "split":                "train" | "valid",
+    "split":                "train" | "valid" | "test",
     "file_name":            str,
     "global_emb":           Tensor[D]                 # L2-normalized
     "text_colloquial_emb":  Optional[Tensor[D]]       # None if missing
@@ -70,8 +71,16 @@ def load_vlm(path: str, device: str, force_fusion: bool = False):
         px = processor(images=[dummy], return_tensors="pt")["pixel_values"].to(device)
         with torch.no_grad():
             d = get_image_features(base, px).shape[-1]
-        m = LocalGlobalFusionWrapper(base, hidden_size=d).to(device)
-        m.load_state_dict(torch.load(wrap_path, map_location=device))
+        state = torch.load(wrap_path, map_location=device)
+        # auto-detect gate mode: film has gate_net.*, xattn has cross_attn.*, scalar has gate
+        if any(k.startswith("gate_net.") for k in state):
+            gate_mode = "film"
+        elif any(k.startswith("cross_attn.") for k in state):
+            gate_mode = "xattn"
+        else:
+            gate_mode = "scalar"
+        m = LocalGlobalFusionWrapper(base, hidden_size=d, gate_mode=gate_mode).to(device)
+        m.load_state_dict(state)
         m.is_wrapper = True
     else:
         m = base
@@ -170,8 +179,13 @@ def _safe_str(x) -> str:
     return ""
 
 
-def collect_split_cases(coco_path: Path, image_root: Path) -> List[Dict]:
-    """Scan one COCO file, return per-image case info (filtered)."""
+def collect_split_cases(coco_path: Path, image_root: Path,
+                        min_causes: int = 3) -> List[Dict]:
+    """Scan one COCO file, return per-image case info (filtered).
+
+    Cases with fewer than `min_causes` non-empty `global_causes_zh` strings
+    are dropped.
+    """
     with coco_path.open("r", encoding="utf-8") as f:
         coco = json.load(f)
 
@@ -182,6 +196,7 @@ def collect_split_cases(coco_path: Path, image_root: Path) -> List[Dict]:
     out: List[Dict] = []
     n_skip_healthy = 0
     n_skip_no_cause = 0
+    n_skip_few_cause = 0
     n_skip_no_lesion = 0
     n_skip_missing_img = 0
 
@@ -195,6 +210,9 @@ def collect_split_cases(coco_path: Path, image_root: Path) -> List[Dict]:
         causes = [c for c in causes if c]
         if not causes:
             n_skip_no_cause += 1
+            continue
+        if len(causes) < min_causes:
+            n_skip_few_cause += 1
             continue
 
         anns = img_id_to_anns.get(img["id"], [])
@@ -223,6 +241,7 @@ def collect_split_cases(coco_path: Path, image_root: Path) -> List[Dict]:
     print(
         f"[collect] {coco_path.name}: kept={len(out)} "
         f"skip(healthy={n_skip_healthy}, no_cause={n_skip_no_cause}, "
+        f"few_cause(<{min_causes})={n_skip_few_cause}, "
         f"no_lesion={n_skip_no_lesion}, missing_img={n_skip_missing_img})"
     )
     return out
@@ -367,8 +386,10 @@ def main():
     ap = argparse.ArgumentParser(description="Build FaCE-R case database.")
     ap.add_argument("--coco_train", type=str, required=True)
     ap.add_argument("--coco_valid", type=str, default=None)
+    ap.add_argument("--coco_test", type=str, default=None)
     ap.add_argument("--image_root_train", type=str, required=True)
     ap.add_argument("--image_root_valid", type=str, default=None)
+    ap.add_argument("--image_root_test", type=str, default=None)
     ap.add_argument("--vlm_global", type=str, required=True)
     ap.add_argument("--vlm_lesion", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
@@ -383,6 +404,9 @@ def main():
     ap.add_argument("--lesion_scale", type=float, default=1.0)
     ap.add_argument("--max_cases", type=int, default=-1,
                     help="cap cases per split (smoke testing); -1 = all")
+    ap.add_argument("--min_causes", type=int, default=3,
+                    help="drop cases with fewer than this many non-empty "
+                         "global_causes_zh strings (default 3)")
     ap.add_argument("--raw_lesion", action="store_true",
                     help="Treat VLM-Lesion as a plain (un-fusion) image encoder. "
                          "Skips wrapper_state.pt requirement and encodes lesion crops "
@@ -396,7 +420,10 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Collect raw cases per split
-    train_cases_raw = collect_split_cases(Path(args.coco_train), Path(args.image_root_train))
+    train_cases_raw = collect_split_cases(
+        Path(args.coco_train), Path(args.image_root_train),
+        min_causes=args.min_causes,
+    )
     if args.max_cases > 0:
         train_cases_raw = train_cases_raw[: args.max_cases]
 
@@ -405,15 +432,28 @@ def main():
             raise ValueError("--image_root_valid required when --coco_valid is given")
         valid_cases_raw = collect_split_cases(
             Path(args.coco_valid), Path(args.image_root_valid),
+            min_causes=args.min_causes,
         )
         if args.max_cases > 0:
             valid_cases_raw = valid_cases_raw[: args.max_cases]
     else:
         valid_cases_raw = []
 
+    if args.coco_test:
+        if not args.image_root_test:
+            raise ValueError("--image_root_test required when --coco_test is given")
+        test_cases_raw = collect_split_cases(
+            Path(args.coco_test), Path(args.image_root_test),
+            min_causes=args.min_causes,
+        )
+        if args.max_cases > 0:
+            test_cases_raw = test_cases_raw[: args.max_cases]
+    else:
+        test_cases_raw = []
+
     # 2) Build deduplicated unique-cause string list (across all splits)
     all_causes_seen: Dict[str, int] = {}
-    for c in train_cases_raw + valid_cases_raw:
+    for c in train_cases_raw + valid_cases_raw + test_cases_raw:
         for s in c["causes"]:
             if s not in all_causes_seen:
                 all_causes_seen[s] = len(all_causes_seen)
@@ -474,6 +514,20 @@ def main():
     else:
         valid_cases = []
 
+    if test_cases_raw:
+        test_cases = process_split(
+            test_cases_raw, "test",
+            vlm_global, proc_global, vlm_lesion, proc_lesion,
+            cause_text_to_idx,
+            device=device, img_batch_size=args.img_batch_size,
+            text_batch_size=args.text_batch_size, max_length=args.max_length,
+            use_amp=use_amp, chunk_size=args.chunk_size,
+            lesion_scale=args.lesion_scale,
+            raw_lesion=args.raw_lesion,
+        )
+    else:
+        test_cases = []
+
     # 6) Save
     torch.save(train_cases, out_dir / "train_cases.pt")
     print(f"[save] train_cases.pt  n={len(train_cases)}  -> {out_dir}")
@@ -481,6 +535,10 @@ def main():
     if valid_cases:
         torch.save(valid_cases, out_dir / "valid_cases.pt")
         print(f"[save] valid_cases.pt  n={len(valid_cases)}  -> {out_dir}")
+
+    if test_cases:
+        torch.save(test_cases, out_dir / "test_cases.pt")
+        print(f"[save] test_cases.pt  n={len(test_cases)}  -> {out_dir}")
 
     torch.save(
         {"texts": cause_texts, "embeddings": cause_embs},
@@ -496,6 +554,7 @@ def main():
         "lesion_dim": int(train_cases[0]["lesion_embs"].size(-1)) if train_cases else None,
         "n_train_cases": len(train_cases),
         "n_valid_cases": len(valid_cases),
+        "n_test_cases": len(test_cases),
         "n_unique_causes": len(cause_texts),
         "lesion_scale": args.lesion_scale,
         "max_length": args.max_length,
@@ -503,8 +562,10 @@ def main():
         "text_batch_size": args.text_batch_size,
         "amp": use_amp,
         "max_cases": args.max_cases,
+        "min_causes": args.min_causes,
         "coco_train": str(args.coco_train),
         "coco_valid": str(args.coco_valid) if args.coco_valid else None,
+        "coco_test": str(args.coco_test) if args.coco_test else None,
     }
     with (out_dir / "meta.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)

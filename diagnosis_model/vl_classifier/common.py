@@ -1,6 +1,7 @@
 """Shared helpers used by train.py and eval.py."""
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -89,6 +90,23 @@ def get_image_features(model, pixel_values: torch.Tensor) -> torch.Tensor:
 
 
 
+def get_image_patch_tokens(model, pixel_values: torch.Tensor) -> torch.Tensor:
+    """Return the vision tower's per-patch tokens [B, P, H] (pre-pool).
+
+    Used by LocalGlobalFusionWrapper's `xattn` gate, which attends over the
+    whole-fish patch grid instead of a single pooled global vector.
+    """
+    base = model.vision_model if hasattr(model, "vision_model") else model
+    vout = base(pixel_values=pixel_values, return_dict=True)
+    last_hidden = getattr(vout, "last_hidden_state", None)
+    if last_hidden is None:
+        raise RuntimeError(
+            "xattn fusion needs the vision tower's last_hidden_state (patch tokens); "
+            f"{type(vout).__name__} did not expose it."
+        )
+    return last_hidden
+
+
 def get_text_features(model, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     if hasattr(model, "get_text_features"):
         return _unwrap_to_tensor(
@@ -115,7 +133,27 @@ def get_text_features(model, input_ids: torch.Tensor, attention_mask: Optional[t
 # Local-Global fusion wrapper
 # =========================
 class LocalGlobalFusionWrapper(nn.Module):
-    def __init__(self, base_model, hidden_size: int, dropout_prob: float = 0.1):
+    """Local (lesion crop) ⊕ global (whole-fish) image fusion.
+
+    `gate_mode` controls how the fusion branch is mixed back into the local
+    feature (`out = local + gate * fused`):
+
+    - "scalar": a single learnable scalar (original behavior, init 0.1).
+    - "film":  an input-conditioned per-channel gate
+               `g = sigmoid(gate_net([local; global]))` of shape [B, hidden].
+               Lets the whole-fish context modulate the lesion feature
+               channel-by-channel and per-sample. Initialized so g ≈ 0.1
+               everywhere, matching the scalar warm start for a fair compare.
+    - "xattn": the lesion feature (query) cross-attends over the whole-fish
+               *patch tokens* (key/value) instead of a single pooled global
+               vector. The attended context replaces `global` in the existing
+               `fusion_linear([local; ctx])` branch, mixed back via the same
+               scalar gate (init 0.1) as "scalar" for a fair warm start. Lets
+               the lesion pick *which* region of the fish is relevant rather
+               than seeing only a global average.
+    """
+
+    def __init__(self, base_model, hidden_size: int, dropout_prob: float = 0.1, gate_mode: str = "scalar"):
         super().__init__()
         self.base_model = base_model
         self.gelu = nn.GELU()
@@ -123,21 +161,69 @@ class LocalGlobalFusionWrapper(nn.Module):
         self.fusion_linear = nn.Linear(hidden_size * 2, hidden_size)
         nn.init.xavier_uniform_(self.fusion_linear.weight)
         nn.init.zeros_(self.fusion_linear.bias)
-        self.gate = nn.Parameter(torch.tensor(0.1))
+
+        self.gate_mode = gate_mode
+        if gate_mode == "scalar":
+            self.gate = nn.Parameter(torch.tensor(0.1))
+        elif gate_mode == "film":
+            self.gate_net = nn.Linear(hidden_size * 2, hidden_size)
+            nn.init.zeros_(self.gate_net.weight)
+            nn.init.constant_(self.gate_net.bias, math.log(0.1 / 0.9))  # logit(0.1) ≈ -2.197 → g≈0.1 at init
+        elif gate_mode == "xattn":
+            self.gate = nn.Parameter(torch.tensor(0.1))
+            num_heads = 8 if hidden_size % 8 == 0 else 1
+            self.cross_attn = nn.MultiheadAttention(
+                hidden_size, num_heads, dropout=dropout_prob, batch_first=True
+            )
+        else:
+            raise ValueError(f"unknown gate_mode={gate_mode!r}, expected 'scalar', 'film', or 'xattn'")
+
+    def _gate(self, local_feat_normalized: torch.Tensor, global_feat_normalized: torch.Tensor):
+        """Return the gate to multiply with `fused`: a scalar Parameter or a [B, hidden] tensor."""
+        if self.gate_mode == "scalar":
+            return self.gate
+        return torch.sigmoid(self.gate_net(torch.cat([local_feat_normalized, global_feat_normalized], dim=-1)))
+
+    def _fuse_xattn(self, local_feat_normalized: torch.Tensor, global_tokens_normalized: torch.Tensor):
+        """Cross-attend local (query) over global patch tokens (key/value), then
+        mix the context back through the shared fusion_linear + scalar gate.
+
+        Returns (out, fused). `out` is NOT renormalized (caller's responsibility).
+        """
+        query = local_feat_normalized.unsqueeze(1)  # [B, 1, H]
+        ctx, _ = self.cross_attn(
+            query, global_tokens_normalized, global_tokens_normalized, need_weights=False
+        )
+        ctx = ctx.squeeze(1)  # [B, H]
+        fused = torch.cat([local_feat_normalized, ctx], dim=-1)
+        fused = self.fusion_linear(fused)
+        fused = self.gelu(fused)
+        fused = self.dropout(fused)
+        out = local_feat_normalized + self.gate * fused
+        return out, fused
 
     def forward_image(self, pixel_values_local, pixel_values_global, return_parts: bool = False):
-        local_feat = get_image_features(self.base_model, pixel_values_local)
-        global_feat = get_image_features(self.base_model, pixel_values_global)
+        local_feat = F.normalize(get_image_features(self.base_model, pixel_values_local), dim=-1)
 
-        local_feat = F.normalize(local_feat, dim=-1)
-        global_feat = F.normalize(global_feat, dim=-1)
+        if self.gate_mode == "xattn":
+            # `global` is the whole-fish patch grid; cache it (not a pooled vector)
+            # so fuse_local_with_global_feat can reuse it on jittered crops (LSCFT).
+            global_feat = F.normalize(
+                get_image_patch_tokens(self.base_model, pixel_values_global), dim=-1
+            )
+            out, fused = self._fuse_xattn(local_feat, global_feat)
+            if return_parts:
+                return out, local_feat, global_feat, fused
+            return out
+
+        global_feat = F.normalize(get_image_features(self.base_model, pixel_values_global), dim=-1)
 
         fused = torch.cat([local_feat, global_feat], dim=-1)
         fused = self.fusion_linear(fused)
         fused = self.gelu(fused)
         fused = self.dropout(fused)
 
-        out = local_feat + self.gate * fused
+        out = local_feat + self._gate(local_feat, global_feat) * fused
 
         if return_parts:
             return out, local_feat, global_feat, fused
@@ -147,15 +233,21 @@ class LocalGlobalFusionWrapper(nn.Module):
         """Reuse fusion module on a new local feature with a precomputed global.
 
         Both inputs must already be L2-normalized (caller's responsibility).
+        For "xattn", `global_feat_normalized` is the [B, P, H] patch-token grid
+        cached by forward_image, not a pooled [B, H] vector.
         Output is NOT renormalized — the caller normalizes after gathering all
         branches, matching the existing forward_image -> external F.normalize
         flow in compute_custom_batch_loss.
         """
+        if self.gate_mode == "xattn":
+            out, _ = self._fuse_xattn(local_feat_normalized, global_feat_normalized)
+            return out
+
         fused = torch.cat([local_feat_normalized, global_feat_normalized], dim=-1)
         fused = self.fusion_linear(fused)
         fused = self.gelu(fused)
         fused = self.dropout(fused)
-        return local_feat_normalized + self.gate * fused
+        return local_feat_normalized + self._gate(local_feat_normalized, global_feat_normalized) * fused
 
     def get_text_features(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         return get_text_features(self.base_model, input_ids, attention_mask)

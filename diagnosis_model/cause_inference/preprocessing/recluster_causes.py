@@ -1,11 +1,17 @@
 """
 Cause string clustering CLI.
 
-Pipeline:
-  cache text embeddings -> optional PCA -> UMAP -> HDBSCAN -> cause_clusters.json
+Paper baseline (single command, fixed params):
+  baseline   PCA(50) -> UMAP(15,5,cosine) -> HDBSCAN(eom, mcs=100)
+             -> reassign-singletons(cosine=0.70). Output: cause_clusters_hdbscan.json.
 
-The heavy encoder step is isolated in the cache command. The same cache can be
-reused for parameter sweeps, JSON export, and singleton reassignment.
+Atomic dev commands (parameter exploration; not paper-facing):
+  cache      Encode unique cause strings -> embeddings.pt + texts.json (heavy; once).
+  reduce     PCA+UMAP only, save .npy (optional speedup for repeated clustering).
+  cluster    HDBSCAN with custom params -> JSON.
+  sweep      Grid search over UMAP/HDBSCAN params.
+  reassign-singletons   Attach size=1 clusters to nearest real cluster.
+  merge-similar-clusters  Iteratively merge cluster pairs above a cosine threshold.
 """
 from __future__ import annotations
 
@@ -347,6 +353,69 @@ def cmd_reassign_singletons(args: argparse.Namespace) -> None:
 
 
 
+BASELINE_PARAMS = {
+    "pca_components": 50,
+    "umap_n_neighbors": 15,
+    "umap_min_dist": 0.0,
+    "umap_n_components": 5,
+    "umap_metric": "cosine",
+    "random_state": 42,
+    "cluster_selection_method": "eom",
+    "min_cluster_size": 100,
+    "min_samples": None,
+    "reassign_cosine_threshold": 0.70,
+    "reassign_margin": 0.0,
+    "reassign_min_real_cluster_size": 100,
+}
+
+
+def cmd_baseline(args: argparse.Namespace) -> None:
+    """Paper-facing HDBSCAN baseline: reduce -> HDBSCAN -> reassign-singletons."""
+    texts, embeddings, _ = load_text_embedding_cache(args.cache_dir)
+    print(f"[baseline] loaded {len(texts)} texts, embeddings={tuple(embeddings.shape)}")
+    print(f"[baseline] fixed params: {BASELINE_PARAMS}")
+
+    reduced = reduce_embeddings(
+        embeddings,
+        pca_components=BASELINE_PARAMS["pca_components"],
+        umap_n_neighbors=BASELINE_PARAMS["umap_n_neighbors"],
+        umap_min_dist=BASELINE_PARAMS["umap_min_dist"],
+        umap_n_components=BASELINE_PARAMS["umap_n_components"],
+        umap_metric=BASELINE_PARAMS["umap_metric"],
+        random_state=BASELINE_PARAMS["random_state"],
+    )
+
+    clusters, labels = _run_cluster_json(
+        texts,
+        embeddings,
+        reduced,
+        cluster_selection_method=BASELINE_PARAMS["cluster_selection_method"],
+        min_cluster_size=BASELINE_PARAMS["min_cluster_size"],
+        min_samples=BASELINE_PARAMS["min_samples"],
+    )
+    n_noise = int((labels < 0).sum())
+    n_real = len(set(int(x) for x in labels if int(x) >= 0))
+    print(f"[baseline] hdbscan: {n_real} real clusters, {n_noise} noise points")
+
+    reassigned, stats = reassign_singletons_to_real_clusters(
+        clusters,
+        texts,
+        embeddings,
+        cosine_threshold=BASELINE_PARAMS["reassign_cosine_threshold"],
+        margin=BASELINE_PARAMS["reassign_margin"],
+        min_real_cluster_size=BASELINE_PARAMS["reassign_min_real_cluster_size"],
+    )
+    print(
+        f"[baseline] reassign-singletons: candidates={stats['n_singleton_candidates']}, "
+        f"attached={stats['n_attached']}, kept_singleton={stats['n_kept_singleton']}"
+    )
+
+    save_clusters_json(reassigned, args.output)
+    print()
+    print(quality_report(reassigned, top_n=args.report_top_n))
+    print(f"\nSaved: {args.output}")
+
+
 def cmd_merge_similar_clusters(args: argparse.Namespace) -> None:
     texts, embeddings, _ = load_text_embedding_cache(args.cache_dir)
     clusters = load_clusters_json(args.input)
@@ -439,6 +508,18 @@ def build_argparser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser(
+        "baseline",
+        help="Paper HDBSCAN baseline (fixed params): reduce -> HDBSCAN(mcs=100, eom) -> reassign-singletons(0.70).",
+    )
+    p.add_argument("--cache_dir", required=True)
+    p.add_argument(
+        "--output",
+        default="diagnosis_model/cause_inference/outputs/cause_clusters_hdbscan.json",
+    )
+    p.add_argument("--report_top_n", type=int, default=15)
+    p.set_defaults(func=cmd_baseline)
 
     p = sub.add_parser("cache", help="Collect cause strings and encode text embeddings.")
     p.add_argument("--coco_files", nargs="+", required=True)

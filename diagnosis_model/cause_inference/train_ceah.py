@@ -71,12 +71,20 @@ class CEAHDataset(Dataset):
             "lesion_embs": c["lesion_embs"],
             "candidate_indices": p["candidate_cause_indices"],
             "positive_mask": p["positive_mask"],
+            "gt_cause_indices": c["cause_emb_indices"],
         }
 
 
 def make_collate(text_dropout: float, in_dim: int, cause_table_embs: torch.Tensor,
-                 rng: np.random.Generator):
-    """Pads lesions, samples text token, stacks (query, candidate) pairs."""
+                 rng: np.random.Generator,
+                 soft_labels: bool = False, soft_lo: float = 0.90, soft_hi: float = 1.0):
+    """Pads lesions, samples text token, stacks (query, candidate) pairs.
+
+    When soft_labels, the per-candidate target is a graded relevance
+    clamp((max_g cos(cand, gt_g) - soft_lo) / (soft_hi - soft_lo), 0, 1)
+    (cosine on L2-normalized cause embeddings, consistent with positive_mask)
+    instead of the hard 0/1 positive_mask. Model inputs are unchanged.
+    """
 
     def collate(batch: List[dict]) -> dict:
         B = len(batch)
@@ -115,7 +123,15 @@ def make_collate(text_dropout: float, in_dim: int, cause_table_embs: torch.Tenso
             if P > 0:
                 cand_pad[i, :P] = cause_table_embs[cand_idx]
             cand_mask[i, :P] = True
-            target_pad[i, :P] = b["positive_mask"].float()
+            if soft_labels and P > 0:
+                gt_idx = torch.as_tensor(b["gt_cause_indices"], dtype=torch.long)
+                gt_n = F.normalize(cause_table_embs[gt_idx], dim=-1)        # [G, D]
+                cand_n = F.normalize(cause_table_embs[cand_idx], dim=-1)    # [P, D]
+                maxcos = (gt_n @ cand_n.T).max(dim=0).values               # [P]
+                tgt = ((maxcos - soft_lo) / (soft_hi - soft_lo)).clamp(0.0, 1.0)
+                target_pad[i, :P] = tgt
+            else:
+                target_pad[i, :P] = b["positive_mask"].float()
 
         return {
             "global_emb": global_pad,
@@ -270,6 +286,13 @@ def main():
     ap.add_argument("--warmup_steps", type=int, default=200)
     ap.add_argument("--lambda_sparsity", type=float, default=0.05)
     ap.add_argument("--text_dropout", type=float, default=0.5)
+    # Rung 0: graded soft labels (ramp on max GT cosine) instead of hard positive_mask
+    ap.add_argument("--soft_labels", action="store_true")
+    ap.add_argument("--soft_lo", type=float, default=0.90)
+    ap.add_argument("--soft_hi", type=float, default=1.0)
+    # Rung 1: multi-positive listwise CE (cross-candidate competition) on top of BCE
+    ap.add_argument("--lambda_rank", type=float, default=0.0)
+    ap.add_argument("--rank_temp", type=float, default=0.1)
 
     # eval
     ap.add_argument("--eval_every", type=int, default=1)
@@ -319,7 +342,9 @@ def main():
     train_ds = CEAHDataset(train_cases, train_pool, cause_table_embs_cpu)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=make_collate(args.text_dropout, in_dim, cause_table_embs_cpu, rng),
+        collate_fn=make_collate(args.text_dropout, in_dim, cause_table_embs_cpu, rng,
+                                soft_labels=args.soft_labels,
+                                soft_lo=args.soft_lo, soft_hi=args.soft_hi),
         num_workers=args.num_workers, drop_last=True, pin_memory=False,
     )
     total_steps = len(train_loader) * args.epochs
@@ -344,6 +369,7 @@ def main():
         ceah.train()
         ep_losses_cls: List[float] = []
         ep_losses_sp: List[float] = []
+        ep_losses_rank: List[float] = []
         ep_pos_mean: List[float] = []
         ep_neg_mean: List[float] = []
         ep_alpha_mean: List[float] = []
@@ -386,7 +412,22 @@ def main():
             denom = (cand_mask_f.unsqueeze(-1) * ev_mask.float()).sum().clamp_min(1.0)
             loss_sp = (valid_alpha * cand_mask_f.unsqueeze(-1)).sum() / denom
 
-            loss = loss_cls + args.lambda_sparsity * loss_sp
+            # Rung 1: multi-positive listwise CE — softmax(score/T) over the pool,
+            # target = uniform over the binary positives. Adds cross-candidate
+            # competition (sharpens top) on top of the per-candidate BCE.
+            loss_rank = scores.new_zeros(())
+            if args.lambda_rank > 0:
+                logits = (scores / args.rank_temp).masked_fill(~cand_mask, float("-inf"))
+                logp = F.log_softmax(logits, dim=1)                  # [B, max_P]
+                pos = (targets > 0.5) & cand_mask                    # binary positives
+                n_pos = pos.sum(dim=1)                               # [B]
+                # torch.where (not logp*pos) to avoid 0*(-inf)=nan at padded positions
+                per_q = -torch.where(pos, logp, torch.zeros_like(logp)).sum(dim=1) / n_pos.clamp_min(1)
+                valid_q = n_pos > 0
+                if valid_q.any():
+                    loss_rank = per_q[valid_q].mean()
+
+            loss = loss_cls + args.lambda_rank * loss_rank + args.lambda_sparsity * loss_sp
 
             lr_mult = get_lr_mult(global_step)
             for g in optimizer.param_groups:
@@ -398,6 +439,7 @@ def main():
 
             ep_losses_cls.append(float(loss_cls.item()))
             ep_losses_sp.append(float(loss_sp.item()))
+            ep_losses_rank.append(float(loss_rank.item()) if torch.is_tensor(loss_rank) else float(loss_rank))
 
             # Diagnostics
             with torch.no_grad():
@@ -416,6 +458,7 @@ def main():
             "epoch": epoch,
             "loss_cls": float(np.mean(ep_losses_cls)),
             "loss_sp": float(np.mean(ep_losses_sp)),
+            "loss_rank": float(np.mean(ep_losses_rank)),
             "pos_score_mean": float(np.mean(ep_pos_mean)) if ep_pos_mean else None,
             "neg_score_mean": float(np.mean(ep_neg_mean)) if ep_neg_mean else None,
             "alpha_mean": float(np.mean(ep_alpha_mean)),
@@ -445,7 +488,7 @@ def main():
 
         msg = (
             f"[ep {epoch+1}/{args.epochs}] cls={log_row['loss_cls']:.4f} "
-            f"sp={log_row['loss_sp']:.4f}  "
+            f"rank={log_row['loss_rank']:.4f} sp={log_row['loss_sp']:.4f}  "
             f"pos={log_row['pos_score_mean']:.3f} neg={log_row['neg_score_mean']:.3f}  "
             f"α̅={log_row['alpha_mean']:.3f}  dur={ep_dur:.1f}s"
         )

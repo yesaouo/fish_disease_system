@@ -171,13 +171,20 @@ def load_model_and_processor(name_or_path: str, device: str, force_fusion: bool 
         with torch.no_grad():
             hidden_size = get_image_features(base_model, dummy_pixel).shape[-1]
 
-        model = LocalGlobalFusionWrapper(base_model, hidden_size=hidden_size).to(device)
         if wrapper_state_path is None:
             raise FileNotFoundError(
                 f"--fusion 已啟用，但在 {name_or_path} 找不到 wrapper_state.pt"
             )
 
         state = torch.load(wrapper_state_path, map_location=device)
+        # auto-detect gate mode from checkpoint keys: film has gate_net.*, xattn has cross_attn.*, scalar has gate
+        if any(k.startswith("gate_net.") for k in state):
+            gate_mode = "film"
+        elif any(k.startswith("cross_attn.") for k in state):
+            gate_mode = "xattn"
+        else:
+            gate_mode = "scalar"
+        model = LocalGlobalFusionWrapper(base_model, hidden_size=hidden_size, gate_mode=gate_mode).to(device)
         model.load_state_dict(state)
         model.is_wrapper = True
         model.wrapper_state_path = wrapper_state_path

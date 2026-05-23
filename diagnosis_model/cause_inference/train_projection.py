@@ -338,7 +338,9 @@ def main():
     ap.add_argument("--case_db_dir", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
     ap.add_argument("--cluster_json", type=str,
-                    default="diagnosis_model/cause_inference/outputs/cause_clusters_reassigned.json")
+                    default="diagnosis_model/cause_inference/outputs/cause_clusters_llm.json",
+                    help="Cluster taxonomy JSON. Paper main: cause_clusters_llm.json (466). "
+                         "Paper baseline: cause_clusters_hdbscan.json (100).")
 
     # architecture
     ap.add_argument("--projection_dim", type=int, default=256)

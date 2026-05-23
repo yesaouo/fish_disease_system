@@ -9,9 +9,12 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
   Phase 1 retrieval: K=20, α_global=0.25, β_lesion=0.75, lesion_match=hungarian
   Diversification:   threshold=0.95
   CEAH:              softmax + multiplicative,  best_ceah.pt
-  Hybrid:            γ=0.75   (Phase 1 0.75 ∶ CEAH 0.25)
+  Scoring:           cascade ≡ γ=0（fine stage 純 CEAH；γ-scan 上 sem/cluster R@10 最強點）
   Cluster taxonomy:  cause_clusters_llm.json (466 LLM topics)
   Text:              medical（也支援 colloquial / none）
+
+  註：先前的 hybrid γ=0.75 線性混合已被 cascade（≡ γ=0）取代，不再是 production
+      配方；γ 只在 [B] 的 γ-scan 作為 contribution-breakdown ablation 保留。
 
 ================================================================================
 [A] Phase 1 zero-training baseline（論文對照組）
@@ -62,7 +65,7 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
 Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
 
 ================================================================================
-[B] CEAH v3 hybrid retrieval（論文主要結果）
+[B] CEAH γ-scan — fine-stage contribution-breakdown ablation（非 production；production = cascade γ=0，端到端數字見 [H]）
 ================================================================================
 時間: ~50 秒（1573 valid queries）
 
@@ -73,24 +76,26 @@ Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
   --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
   --attribution_mode softmax --scoring_mode multiplicative \
   --gammas 0.0 0.5 0.75 1.0 \
-  --dump_gamma 0.75 \
+  --dump_gamma 0.0 \     # α dump 用 γ=0（production cascade 對應點，[D] gamma_tag 吃 g=0.00）；α 對 γ 不敏感（CEAH 自身輸出）
   --top_k_cases 20 \
   --diversify_threshold 0.95 \
   --semantic_threshold 0.95 \
   --text_kind medical
 
-論文 CEAH v3 hybrid γ=0.75 結果（1573 valid，LLM 466 cluster）：
-  semantic R@1=22.4%, R@5=36.1%, R@10=45.3%, R@20=57.9%, MRR=0.302, coverage=93.1%
-  cluster  R@1=18.2%, R@5=29.3%, R@10=37.0%, R@20=46.6%, MRR=0.245
+γ 掃描＝fine-stage contribution breakdown。注意此表 pool 來自 fine-tuned case_db
+（γ-scan 需要單一 case_db 才能線性混合 phase1/ceah 分數），1573 valid，LLM 466 cluster：
 
   γ 掃描（sem_MRR / sem_R@10 / cl_MRR / cl_R@10）：
-    γ=0.00 (CEAH only):    0.301 / 46.8% / 0.271 / 39.8%   ← cluster best
-    γ=0.50:                0.303 / 45.9% / 0.254 / 37.6%   ← sem MRR best
+    γ=0.00 (純 CEAH):      0.301 / 46.8% / 0.271 / 39.8%   ← production 對應點（cascade）
+    γ=0.50:                0.303 / 45.9% / 0.254 / 37.6%
     γ=0.75:                0.302 / 45.3% / 0.245 / 37.0%
-    γ=1.00 (Phase1 only):  0.298 / 44.4% / 0.235 / 35.8%
+    γ=1.00 (純 Phase1):    0.298 / 44.4% / 0.235 / 35.8%   ← pure retrieval baseline
 
-  →  CEAH 對 cluster recall 有實質提升（γ=0 vs γ=1: cl_R@10 39.8% vs 35.8%, +4pp）；
-     semantic 在 γ=0.5 達 sem_MRR=0.303 最佳，γ=0.75 為 paper 預設（dump_gamma）
+  →  breakdown：純 CEAH（γ=0）vs 純檢索（γ=1）cl_R@10 +4pp、sem R@10 +2.4pp，量化 fine
+     stage 的增益；γ=0 同時是 sem 與 cluster R@10 最佳點 → cascade 取 γ=0、無 γ 旋鈕。
+  →  本表非 production headline：真正 production cascade（raw coarse pool → CEAH）端到端
+     數字見 [H] / eval_ceah_compressed.py dense row = sem R@10 47.6% / cl R@10 39.6%
+     （此處 fine-tuned-pool γ=0 的 46.8%/39.8% 是 breakdown 用的 ablation 對照）。
 
 ================================================================================
 [C] Faithfulness 驗證（lesion masking 實驗，論文核心結果）
@@ -168,7 +173,7 @@ Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
 /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.analyze_v3_n_buckets \
   --eval_dir diagnosis_model/cause_inference/outputs/ceah_v3_final \
   --case_db diagnosis_model/cause_inference/outputs/case_db \
-  --gamma_tag g=0.75
+  --gamma_tag g=0.00
 
 報告內容：
   - 每 N bucket 的 retrieval 指標
@@ -188,16 +193,16 @@ for mode in medical colloquial none; do
     --output_dir diagnosis_model/cause_inference/outputs/ceah_v3_text_${mode} \
     --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
     --attribution_mode softmax --scoring_mode multiplicative \
-    --gammas 0.75 --dump_gamma 0.75 \
+    --gammas 0.0 --dump_gamma 0.0 \
     --text_kind ${mode}
 done
 
-論文報告數字（1573 valid，三個 mode，2026-05-11 用當前 code 重跑）：
-  medical:    sem_MRR=0.3020, R@10=45.27%, lesion-type l/g=1.36
-  colloquial: sem_MRR=0.3016, R@10=45.30%, lesion-type l/g=1.49
-  none:       sem_MRR=0.3019, R@10=45.32%, lesion-type l/g=1.64
-  → Retrieval 持平（差 ≤ 0.0004），attribution 智能 fallback：
-    沒文字時 lesion attention 自動補位
+論文報告數字（1573 valid，三個 mode，γ=0，2026-05-22 重跑）：
+  medical:    sem_MRR=0.3009, R@10=46.83%, lesion-type l/g(N=2)=1.50
+  colloquial: sem_MRR=0.3010, R@10=46.86%, lesion-type l/g(N=2)=1.63
+  none:       sem_MRR=0.3008, R@10=46.76%, lesion-type l/g(N=2)=1.87
+  → Retrieval 持平（差 ≤ 0.0002），attribution 智能 fallback：
+    沒文字時 lesion attention 自動補位（l/g 1.50→1.87）
 
   (舊版同位置記錄為 R@10=78.65/78.62/78.51%，那是 phase1_baseline.py / eval_ceah.py
    metric 語意改寫前的數字，已不可重現。lesion-type l/g ratio 為先前 analyze_v3_n_buckets
@@ -234,22 +239,24 @@ LLM cluster 是論文預設；HDBSCAN coarse 當對照。
   --output_dir diagnosis_model/cause_inference/outputs/ceah_v3_cluster_llm \
   --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
   --attribution_mode softmax --scoring_mode multiplicative \
-  --gammas 0.75 --dump_gamma 0.75
+  --gammas 0.0 --dump_gamma 0.0
 
-# HDBSCAN coarse
+# HDBSCAN baseline (100)：把 --cluster_json 換成 cause_clusters_hdbscan.json
 /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.eval_ceah \
   --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
   --ceah_ckpt diagnosis_model/cause_inference/outputs/ceah_v3/best_ceah.pt \
   --output_dir diagnosis_model/cause_inference/outputs/ceah_v3_cluster_hdbscan \
-  --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_v100_reassigned.json \
+  --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_hdbscan.json \
   --attribution_mode softmax --scoring_mode multiplicative \
-  --gammas 0.75 --dump_gamma 0.75
+  --gammas 0.0 --dump_gamma 0.0
 
-論文報告（v3, γ=0.75）：
-  HDBSCAN fine (2807): cl_R@1=0.5%,  cl_R@10=3.7%
-  HDBSCAN coarse(100): cl_R@1=5.2%,  cl_R@10=30.2%
-  LLM topic    (466) : cl_R@1=18.1%, cl_R@10=57.9%   ← 論文主指標
-  → LLM clustering 在 absolute 指標和 v3 vs random 倍率上都最強
+論文報告（v3, 現行 metric, γ=0, 2026-05-22 重跑；paper_tables.md Table E1）：
+  HDBSCAN baseline(100): cl_R@1=4.7%,  cl_R@10=19.7%   ← LLM-free baseline
+  LLM topic       (466): cl_R@1=20.1%, cl_R@10=39.8%   ← 論文主指標
+  → LLM ≫ HDBSCAN baseline by ~2× across all three metrics
+  Supplementary（HDBSCAN fine 2807, mcs=6）: cl_R@1=0.5%, cl_R@10=3.0%
+    粒度太細 → cl R@K 退化至 strict semantic match，佐證 baseline 採 mcs=100
+  （舊記 LLM 57.9% / coarse 30.2% 為 γ=0.75 + metric 語意改寫前數字，已汰換）
 
 ================================================================================
 [I] Case encoder retrieval（替代 Phase 1，論文加速貢獻）
@@ -328,7 +335,7 @@ CC=/usr/bin/gcc-12）。
     attribution-side（Phase 2 CEAH）必須 fine-tuned VLM-Lesion fusion。
 
 ================================================================================
-[J] CRR-DeepRVQ — 壓縮 case bank + 殘差 reranker（論文 method-level 貢獻）
+[J] ABQ (Aggregation-Buffered Quantization) — case-bank codebook 壓縮（RVQ）+ 選配殘差 reranker（buffer-free 對照）
 ================================================================================
 Phase 4 訓練見 training.txt [6]。本節提供：
   J-1 純壓縮 sanity（dense vs RVQ-only）
@@ -480,13 +487,13 @@ Memory @ N=1M：
 ================================================================================
 Cascade = coarse-to-fine 二階段：
   Stage 1 (coarse, zero-shot):  raw SigLIP2  → case_db_raw   → top-K cases
-  Stage 2 (fine, fine-tuned):   VLM-Fusion   → case_db       → cause + α
+  Stage 2 (fine, fine-tuned):   VLM-Lesion   → case_db       → cause + α
 
 Index 雙存：
   outputs/case_db_raw/   raw SigLIP2 features        ← Stage 1 (retrieval)
   outputs/case_db/       fine-tuned VLM features     ← Stage 2 (attribution)
   兩者共享 case_id / image_id / causes / GT cause_emb_indices，差別只在 image
-  feature 是否經過 VLM-Fusion / VLM-Global fine-tune。
+  feature 是否經過 VLM-Lesion / VLM-Global fine-tune。
 
 Query-time inference flow（單張新影像）：
 
@@ -541,8 +548,10 @@ Step 8  [Output]
     — Step 5–8 的範本，但需把 retrieval 階段（Phase 1 hungarian）換成
       Phase 3 encoder_raw + case_db_raw.
   demo/app_gradio.py
-    — 目前仍走 unified fine-tuned pipeline（單一 VLM 路徑、γ scoring）；
-      要 cascade-ify 須加 raw SigLIP2 loader + case_db_raw + encoder_raw 載入.
+    — 完整 cascade 的可執行 reference：Stage 1 走 raw SigLIP2 → Phase 3
+      encoder_raw → Phase 4 RVQ (M=4 K=256) + Light reranker on case_db_raw，
+      Stage 2 走 VLM-Lesion + CEAH on case_db，γ-free（cascade ≡ γ=0）。
+      UI 另顯示各階段（detection / 編碼 / Stage1 / Stage2 CEAH）的 CUDA-synced 耗時。
 
 注意：
   - **γ hybrid 在 cascade 下不再使用**。Cascade ≡ γ=0（純 CEAH for fine stage），
@@ -552,7 +561,7 @@ Step 8  [Output]
   - Coarse stage 對 fine-tuned 跟 raw case_db 都 work（ablation 在 [A-ablation]
     / [I-ablation] 已驗證）；production 選 raw 是因為它 +1.2 pp R@10 且支持
     paper 的 zero-shot vision-language retrieval claim.
-  - Fine stage 對 VLM-Fusion 是 architecturally required：raw case_db 上重訓
+  - Fine stage 對 VLM-Lesion 是 architecturally required：raw case_db 上重訓
     CEAH 會 faithfulness 反轉（[C-ablation]）.
 
 ================================================================================

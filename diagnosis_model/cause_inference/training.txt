@@ -144,10 +144,27 @@ python train.py \
   --eval_test_after_train
 
 ================================================================================
-[1] Cause clustering（一次性，論文用 LLM 版）
+[1] Cause clustering（一次性，evaluation 用 lenient recall taxonomy）
 ================================================================================
-此步驟已完成，輸出 cause_clusters_llm.json（466 clusters）。
-若不需重新產生 taxonomy，可直接沿用該檔案進行後續訓練與評估。
+論文兩條 taxonomy，兩條都已建好，後續訓練/評估直接沿用：
+
+  - Paper main:     outputs/cause_clusters_llm.json       (LLM gemma4:26b, 466)
+  - Paper baseline: outputs/cause_clusters_hdbscan.json   (HDBSCAN, 100)
+
+兩條 taxonomy 只進 eval（cluster R@K / cluster MRR），不進任何訓練 loss。
+詳見 preprocessing/README.md。重建步驟（cause 字串集變更才需要）：
+
+[1a] Text embedding cache（兩條 taxonomy 共用，一次性）
+
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.recluster_causes cache \
+  --coco_files data/detection/coco/_merged/train/_annotations.coco.json \
+               data/detection/coco/_merged/valid/_annotations.coco.json \
+               data/detection/coco/_merged/test/_annotations.coco.json \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
+  --encoder_backend vlm \
+  --vlm_path diagnosis_model/vl_classifier/outputs/siglip2_base_patch16_224_multipos_fusion_en_zh
+
+[1b] Paper main — LLM taxonomy（需本機 Ollama，數小時，可斷點續跑）
 
 /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.cause_cluster_llm \
   --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
@@ -156,21 +173,12 @@ python train.py \
   --shard_size 100 \
   --merge_batch_size 20
 
-備用：HDBSCAN 粗粒度 100 clusters（論文 ablation 用）：
+[1c] Paper baseline — HDBSCAN taxonomy（一行封裝，固定論文參數，秒級）
 
-/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.recluster_causes cluster \
-  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
-  --reduced_path diagnosis_model/cause_inference/outputs/cause_reduced.npy \
-  --output diagnosis_model/cause_inference/outputs/cause_clusters_v100.json \
-  --cluster_selection_method eom \
-  --min_cluster_size 100 \
-  --report_top_n 5
-
-/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.recluster_causes reassign-singletons \
-  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache \
-  --input diagnosis_model/cause_inference/outputs/cause_clusters_v100.json \
-  --output diagnosis_model/cause_inference/outputs/cause_clusters_v100_reassigned.json \
-  --cosine_threshold 0.70 --margin 0.0 --min_real_cluster_size 100
+/home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.recluster_causes baseline \
+  --cache_dir diagnosis_model/cause_inference/outputs/cause_cache
+  # 等價於 PCA(50)+UMAP(15,5,cosine)+HDBSCAN(eom,mcs=100)+reassign-singletons(0.70)
+  # 輸出: outputs/cause_clusters_hdbscan.json
 
 ================================================================================
 [2] 建立 train candidate pool（CEAH 訓練前置，一次性）
@@ -339,9 +347,14 @@ CC=/usr/bin/gcc-12 \
 MeanPool 同樣可用 `--encoder_type mean`，但 mean baseline 不需切 env。
 
 ================================================================================
-[6] Phase 4 — CRR-DeepRVQ（壓縮 + 殘差 reranker，論文 method-level 貢獻）
+[6] Phase 4 — ABQ (Aggregation-Buffered Quantization)：case-bank codebook 壓縮（RVQ；論文 method-level 貢獻＝aggregation-buffer scaling law）
 ================================================================================
-CRR-DeepRVQ = Compression-Residual Reranking for DeepSets-RVQ Case Retrieval。
+做法：對 Phase 3 凍結的 DeepSets z 做 codebook 量化（RVQ 為實作）壓縮，選配
+residual reranker 學 Δ ≈ qᵀe 修正排序。命名收尾（2026-05-21）：不再用 CRR-DeepRVQ /
+DeepRVQ 招牌——RVQ 與 reranker 都是元件。端到端（eval_ceah_compressed.py）顯示
+reranker 在 production（top_k=20 + CEAH）多餘，只在 buffer-free（top_k=1）部署有效，
+故 reranker 是對照點、非 production 元件；method-level 貢獻是 aggregation-buffer 吸收
+量化損害的 scaling law（D ≈ c·ε/K^0.84）+ importance-weighted codebook。
 
 把 Phase 3 已訓好的 DeepSets case encoder 凍結後，對 z_i ∈ R^768 做 post-hoc
 Residual Vector Quantization 壓縮成 codes ∈ [K]^M（每 case M bytes for K≤256），

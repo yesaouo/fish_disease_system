@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--case_db_dir", type=str, required=True)
     ap.add_argument("--ceah_ckpt", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
+    ap.add_argument("--query_split", type=str, default="valid",
+                    choices=["valid", "test"],
+                    help="which split to use as the query set (default valid)")
     ap.add_argument("--top_k_cases", type=int, default=20)
     ap.add_argument("--alpha_global", type=float, default=0.25)
     ap.add_argument("--beta_lesion", type=float, default=0.75)
@@ -107,7 +110,9 @@ def main():
 
     case_db_dir = Path(args.case_db_dir)
     train_cases = torch.load(case_db_dir / "train_cases.pt", weights_only=False)
-    valid_cases = torch.load(case_db_dir / "valid_cases.pt", weights_only=False)
+    valid_cases = torch.load(
+        case_db_dir / f"{args.query_split}_cases.pt", weights_only=False,
+    )
     cause_pack = torch.load(case_db_dir / "cause_text_embs.pt", weights_only=False)
     cause_table_embs = cause_pack["embeddings"].to(device)
     cause_texts = cause_pack["texts"]
@@ -124,7 +129,7 @@ def main():
     ).to(device)
     ceah.load_state_dict(torch.load(args.ceah_ckpt, map_location=device))
     ceah.eval()
-    print(f"[load] valid={len(valid_cases)}  ceah={args.ceah_ckpt}")
+    print(f"[load] {args.query_split}={len(valid_cases)}  ceah={args.ceah_ckpt}")
 
     queries = valid_cases if args.max_queries <= 0 else valid_cases[: args.max_queries]
 
