@@ -4,15 +4,33 @@ import json
 import math
 import os
 import random
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from sklearn.metrics import classification_report, confusion_matrix
+
+try:
+    from diagnosis_model.vl_classifier.common import (
+        LocalGlobalFusionWrapper,
+        format_caption,
+        get_image_features,
+        get_text_features,
+        normalize_text_mode,
+    )
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from diagnosis_model.vl_classifier.common import (
+        LocalGlobalFusionWrapper,
+        format_caption,
+        get_image_features,
+        get_text_features,
+        normalize_text_mode,
+    )
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -23,11 +41,9 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-
 def load_json(path: str | Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
 
 
 def save_json(obj: dict, path: str | Path) -> None:
@@ -37,8 +53,28 @@ def save_json(obj: dict, path: str | Path) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
+def _voc_label_name(label_map: Dict[str, object], key: str) -> str:
+    info = label_map.get(str(key), {})
+    if isinstance(info, dict):
+        value = info.get("en") or info.get("zh") or str(key)
+    elif isinstance(info, str):
+        value = info
+    else:
+        value = str(key)
+    return str(value).strip().replace("_", " ")
 
-def load_label_bank(label_bank_path: str | Path) -> Tuple[Dict[str, List[str]], Dict[str, dict]]:
+
+def _append_unique_text(out: List[str], text: str) -> None:
+    text = str(text).strip()
+    if text and text not in out:
+        out.append(text)
+
+
+def load_label_bank(
+    label_bank_path: str | Path,
+    text_mode: str = "captions",
+) -> Tuple[Dict[str, List[str]], Dict[str, dict]]:
+    text_mode = normalize_text_mode(text_mode)
     payload = load_json(label_bank_path)
     if "data" not in payload or not isinstance(payload["data"], dict):
         raise ValueError("label_bank json 缺少 data 欄位")
@@ -48,18 +84,27 @@ def load_label_bank(label_bank_path: str | Path) -> Tuple[Dict[str, List[str]], 
     for key, value in payload["data"].items():
         if not isinstance(value, dict):
             continue
-        caps = value.get("captions_en", [])
-        if not isinstance(caps, list) or len(caps) == 0:
-            raise ValueError(f"label_bank 缺少 captions_en 或為空: category_id={key}")
-        captions_by_cat[str(key)] = [str(x) for x in caps]
+        texts: List[str] = []
+        if text_mode in ("captions", "captions_plus_class_name"):
+            caps = value.get("captions_en", [])
+            if not isinstance(caps, list) or len(caps) == 0:
+                raise ValueError(f"label_bank 缺少 captions_en 或為空: category_id={key}")
+            for cap in caps:
+                _append_unique_text(texts, str(cap))
+        if text_mode in ("class_name", "captions_plus_class_name"):
+            _append_unique_text(texts, _voc_label_name(label_map, str(key)))
+        if not texts:
+            raise ValueError(f"label_bank category_id={key} 沒有可用文字: text_mode={text_mode}")
+        captions_by_cat[str(key)] = texts
     if not captions_by_cat:
-        raise ValueError("label_bank 內沒有可用的 captions_en")
+        raise ValueError(f"label_bank 內沒有可用文字: text_mode={text_mode}")
     return captions_by_cat, label_map
 
 
-
 def build_caption_bank(
-    captions_by_cat: Dict[str, List[str]]
+    captions_by_cat: Dict[str, List[str]],
+    *,
+    prompt_wrap: bool = True,
 ) -> Tuple[List[str], List[int], Dict[int, List[int]]]:
     bank_texts: List[str] = []
     bank_labels: List[int] = []
@@ -71,14 +116,17 @@ def build_caption_bank(
         idxs: List[int] = []
         for cap in captions_by_cat[key]:
             idxs.append(len(bank_texts))
-            bank_texts.append(cap)
+            bank_texts.append(format_caption(cap, "en") if prompt_wrap else str(cap))
             bank_labels.append(label_id)
         cat2bank_indices[label_id] = idxs
     return bank_texts, bank_labels, cat2bank_indices
 
 
-
-def load_eval_texts(label_bank_path: str | Path) -> Tuple[List[str], List[str], Dict[str, str], List[str]]:
+def load_eval_texts(
+    label_bank_path: str | Path,
+    text_mode: str = "captions",
+) -> Tuple[List[str], List[str], Dict[str, str], List[str]]:
+    text_mode = normalize_text_mode(text_mode)
     payload = load_json(label_bank_path)
     label_map = payload.get("label_map", {})
     data = payload.get("data", {})
@@ -94,17 +142,29 @@ def load_eval_texts(label_bank_path: str | Path) -> Tuple[List[str], List[str], 
     flat_label_ids: List[str] = []
     for key, content in data.items():
         label_id = str(key)
-        captions = content.get("captions_en", []) if isinstance(content, dict) else []
-        for cap in captions:
-            flat_texts.append(f"This is {str(cap).lower()}.")
+        texts: List[str] = []
+        if text_mode in ("captions", "captions_plus_class_name"):
+            captions = content.get("captions_en", []) if isinstance(content, dict) else []
+            for cap in captions:
+                _append_unique_text(texts, str(cap))
+        if text_mode in ("class_name", "captions_plus_class_name"):
+            _append_unique_text(texts, _voc_label_name(label_map, label_id))
+        for text in texts:
+            flat_texts.append(format_caption(str(text), "en"))
             flat_label_ids.append(label_id)
 
     all_label_ids = sorted(set(flat_label_ids), key=lambda x: int(x))
     return flat_texts, flat_label_ids, id_to_zh, all_label_ids
 
 
-
-def clamp_bbox_xyxy(x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> Tuple[int, int, int, int]:
+def clamp_bbox_xyxy(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    width: int,
+    height: int,
+) -> Tuple[int, int, int, int]:
     x1 = int(max(0, min(width - 1, math.floor(x1))))
     y1 = int(max(0, min(height - 1, math.floor(y1))))
     x2 = int(max(1, min(width, math.ceil(x2))))
@@ -116,7 +176,6 @@ def clamp_bbox_xyxy(x1: float, y1: float, x2: float, y2: float, width: int, heig
     return x1, y1, x2, y2
 
 
-
 def crop_bbox(image: Image.Image, bbox_xywh: Tuple[float, float, float, float]) -> Image.Image:
     x, y, w, h = bbox_xywh
     width, height = image.size
@@ -124,8 +183,10 @@ def crop_bbox(image: Image.Image, bbox_xywh: Tuple[float, float, float, float]) 
     return image.crop((x1, y1, x2, y2))
 
 
-
-def crop_square_with_black_padding(image: Image.Image, bbox_xywh: Tuple[float, float, float, float]) -> Image.Image:
+def crop_square_with_black_padding(
+    image: Image.Image,
+    bbox_xywh: Tuple[float, float, float, float],
+) -> Image.Image:
     x, y, w, h = bbox_xywh
     width, height = image.size
 
@@ -154,63 +215,11 @@ def crop_square_with_black_padding(image: Image.Image, bbox_xywh: Tuple[float, f
     return out
 
 
-
-def _pool_from_last_hidden(last_hidden: torch.Tensor) -> torch.Tensor:
-    return last_hidden[:, 0]
-
-
-
-def get_image_features(model, pixel_values: torch.Tensor) -> torch.Tensor:
-    if hasattr(model, "get_image_features"):
-        return model.get_image_features(pixel_values=pixel_values)
-
-    out = model(pixel_values=pixel_values, return_dict=True)
-    if getattr(out, "image_embeds", None) is not None:
-        return out.image_embeds
-    if getattr(out, "pooler_output", None) is not None:
-        return out.pooler_output
-    if getattr(out, "last_hidden_state", None) is not None:
-        return _pool_from_last_hidden(out.last_hidden_state)
-
-    if hasattr(model, "vision_model"):
-        vout = model.vision_model(pixel_values=pixel_values, return_dict=True)
-        if getattr(vout, "pooler_output", None) is not None:
-            return vout.pooler_output
-        if getattr(vout, "last_hidden_state", None) is not None:
-            return _pool_from_last_hidden(vout.last_hidden_state)
-
-    raise RuntimeError("Cannot extract image features from this model.")
-
-
-
-def get_text_features(
+def get_logit_scale_and_bias(
     model,
-    input_ids: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if hasattr(model, "get_text_features"):
-        return model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
-
-    out = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-    if getattr(out, "text_embeds", None) is not None:
-        return out.text_embeds
-    if getattr(out, "pooler_output", None) is not None:
-        return out.pooler_output
-    if getattr(out, "last_hidden_state", None) is not None:
-        return _pool_from_last_hidden(out.last_hidden_state)
-
-    if hasattr(model, "text_model"):
-        tout = model.text_model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        if getattr(tout, "pooler_output", None) is not None:
-            return tout.pooler_output
-        if getattr(tout, "last_hidden_state", None) is not None:
-            return _pool_from_last_hidden(tout.last_hidden_state)
-
-    raise RuntimeError("Cannot extract text features from this model.")
-
-
-
-def get_logit_scale_and_bias(model, device: str, default_temperature: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    device: str,
+    default_temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     target_model = model.base_model if hasattr(model, "base_model") else model
     scale = None
     bias = None
@@ -232,53 +241,17 @@ def get_logit_scale_and_bias(model, device: str, default_temperature: float) -> 
     return scale, bias
 
 
-
-class LocalGlobalFusionWrapper(nn.Module):
-    def __init__(self, base_model, hidden_size: int, dropout_prob: float = 0.1):
-        super().__init__()
-        self.base_model = base_model
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(dropout_prob)
-        self.fusion_linear = nn.Linear(hidden_size * 2, hidden_size)
-        nn.init.xavier_uniform_(self.fusion_linear.weight)
-        nn.init.zeros_(self.fusion_linear.bias)
-        self.gate = nn.Parameter(torch.tensor(0.1))
-
-    def forward_image(
-        self,
-        pixel_values_local: torch.Tensor,
-        pixel_values_global: torch.Tensor,
-        return_parts: bool = False,
-    ):
-        local_feat = get_image_features(self.base_model, pixel_values_local)
-        global_feat = get_image_features(self.base_model, pixel_values_global)
-
-        local_feat = F.normalize(local_feat, dim=-1)
-        global_feat = F.normalize(global_feat, dim=-1)
-
-        fused = torch.cat([local_feat, global_feat], dim=-1)
-        fused = self.fusion_linear(fused)
-        fused = self.gelu(fused)
-        fused = self.dropout(fused)
-
-        out = local_feat + self.gate * fused
-        if return_parts:
-            return out, local_feat, global_feat, fused
-        return out
-
-    def get_text_features(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return get_text_features(self.base_model, input_ids, attention_mask)
-
-
-
 def _find_wrapper_state_path(name_or_path: str | Path) -> Optional[str]:
     candidate = os.path.join(str(name_or_path), "wrapper_state.pt")
     return candidate if os.path.exists(candidate) else None
 
+
+def _infer_wrapper_gate_mode(state: Dict[str, torch.Tensor]) -> str:
+    if any(k.startswith("gate_net.") for k in state):
+        return "film"
+    if any(k.startswith("cross_attn.") for k in state):
+        return "xattn"
+    return "scalar"
 
 
 def load_model_and_processor(name_or_path: str, device: str, force_fusion: bool = False):
@@ -291,29 +264,36 @@ def load_model_and_processor(name_or_path: str, device: str, force_fusion: bool 
     use_wrapper = bool(force_fusion or wrapper_state_path is not None)
 
     if use_wrapper:
-        dummy_image = Image.new("RGB", (224, 224), (0, 0, 0))
-        dummy_pixel = processor(images=[dummy_image], return_tensors="pt")["pixel_values"].to(device)
-        with torch.no_grad():
-            hidden_size = get_image_features(base_model, dummy_pixel).shape[-1]
-
-        model = LocalGlobalFusionWrapper(base_model, hidden_size=hidden_size).to(device)
         if wrapper_state_path is None:
             raise FileNotFoundError(
                 f"--fusion 已啟用，但在 {name_or_path} 找不到 wrapper_state.pt"
             )
 
         state = torch.load(wrapper_state_path, map_location=device)
+        gate_mode = _infer_wrapper_gate_mode(state)
+
+        dummy_image = Image.new("RGB", (224, 224), (0, 0, 0))
+        dummy_pixel = processor(images=[dummy_image], return_tensors="pt")["pixel_values"].to(device)
+        with torch.no_grad():
+            hidden_size = get_image_features(base_model, dummy_pixel).shape[-1]
+
+        model = LocalGlobalFusionWrapper(
+            base_model,
+            hidden_size=hidden_size,
+            gate_mode=gate_mode,
+        ).to(device)
         model.load_state_dict(state)
         model.is_wrapper = True
         model.wrapper_state_path = wrapper_state_path
+        model.wrapper_gate_mode = gate_mode
     else:
         model = base_model
         model.is_wrapper = False
         model.wrapper_state_path = None
+        model.wrapper_gate_mode = None
 
     model.eval()
     return model, processor
-
 
 
 def compute_symmetric_multipos_sigmoid_loss(
@@ -386,11 +366,9 @@ def compute_symmetric_multipos_sigmoid_loss(
     return total, i2t, t2i
 
 
-
 def compute_paired_sigmoid_loss(
     logits: torch.Tensor,
     label_smoothing: float,
-    eps: float = 1e-8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if logits.dim() != 2 or logits.size(0) != logits.size(1):
         raise ValueError(f"paired sigmoid loss expects square logits, got shape={tuple(logits.shape)}")
@@ -441,8 +419,7 @@ def encode_text_features(
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.cuda.amp.autocast(enabled=amp_ok):
             f = get_text_features(model, inputs["input_ids"], inputs.get("attention_mask", None))
-        f = f.float()
-        f = f / (f.norm(dim=-1, keepdim=True) + 1e-12)
+        f = F.normalize(f.float(), dim=-1)
         feats.append(f.detach().cpu())
     return torch.cat(feats, dim=0)
 
@@ -477,11 +454,9 @@ def encode_image_features(
                 f = model.forward_image(inputs_local["pixel_values"], inputs_global["pixel_values"])
             else:
                 f = get_image_features(model, inputs_local["pixel_values"])
-        f = f.float()
-        f = f / (f.norm(dim=-1, keepdim=True) + 1e-12)
+        f = F.normalize(f.float(), dim=-1)
         feats.append(f.detach().cpu())
     return torch.cat(feats, dim=0)
-
 
 
 def plot_loss_curve(train_losses: List[float], valid_losses: List[float], output_path: str | Path) -> None:
@@ -498,6 +473,9 @@ def plot_loss_curve(train_losses: List[float], valid_losses: List[float], output
     plt.close()
 
 
+def _sort_label_ids(labels: List[str]) -> List[str]:
+    return sorted(list(labels), key=lambda x: int(x))
+
 
 def save_confusion_matrix(
     y_true: List[str],
@@ -507,7 +485,7 @@ def save_confusion_matrix(
     title: str = "Confusion Matrix",
     normalize: Optional[str] = None,
 ) -> None:
-    labels = sorted(list(set(labels) | set(y_true) | set(y_pred)), key=lambda x: int(x))
+    labels = _sort_label_ids(list(set(labels) | set(y_true) | set(y_pred)))
     cm = confusion_matrix(y_true, y_pred, labels=labels, normalize=normalize)
 
     plt.figure(figsize=(12, 10))
@@ -523,21 +501,22 @@ def save_confusion_matrix(
     plt.close()
 
 
-
 def save_classification_report(
     y_true: List[str],
     y_pred: List[str],
     labels: List[str],
     output_path: str | Path,
-) -> None:
-    labels = sorted(list(set(labels) | set(y_true) | set(y_pred)), key=lambda x: int(x))
-    report = classification_report(y_true, y_pred, labels=labels, zero_division=0)
+) -> dict:
+    labels = _sort_label_ids(list(set(labels) | set(y_true) | set(y_pred)))
+    text_report = classification_report(y_true, y_pred, labels=labels, zero_division=0)
+    dict_report = classification_report(y_true, y_pred, labels=labels, zero_division=0, output_dict=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(report)
+        f.write(text_report)
+    save_json(dict_report, Path(output_path).with_suffix(".json"))
+    return dict_report
 
 
 DEFAULT_FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-
 
 
 def draw_prediction_visualization(

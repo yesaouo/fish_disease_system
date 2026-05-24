@@ -9,8 +9,27 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.datasets import VOCDetection
 
-from common import crop_bbox, crop_square_with_black_padding, load_label_bank
-from voc_labels import VOC_CLASS_TO_ID, VOC_CLASSES_EN
+try:
+    from diagnosis_model.vl_classifier.voc_pipeline.common import (
+        crop_bbox,
+        crop_square_with_black_padding,
+        format_caption,
+        load_label_bank,
+        normalize_text_mode,
+    )
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_labels import VOC_CLASS_TO_ID, VOC_CLASSES_EN
+except ModuleNotFoundError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from diagnosis_model.vl_classifier.voc_pipeline.common import (
+        crop_bbox,
+        crop_square_with_black_padding,
+        format_caption,
+        load_label_bank,
+        normalize_text_mode,
+    )
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_labels import VOC_CLASS_TO_ID, VOC_CLASSES_EN
 
 
 @dataclass
@@ -41,6 +60,7 @@ class VocRegionDataset(Dataset):
         download: bool = False,
         skip_difficult: bool = False,
         mode: Optional[str] = None,
+        text_mode: str = "captions",
     ):
         self.root = root
         self.year = str(year)
@@ -48,6 +68,7 @@ class VocRegionDataset(Dataset):
         self.crop_mode = crop_mode.lower().strip()
         self.skip_difficult = skip_difficult
         self.return_meta = return_meta
+        self.text_mode = normalize_text_mode(text_mode)
 
         if mode is not None:
             mode = str(mode).lower().strip()
@@ -85,7 +106,7 @@ class VocRegionDataset(Dataset):
         if self.year == "2012" and self.image_set == "test":
             raise ValueError("VOC2012 的 test annotations 不公開，請改用 val 或 trainval")
 
-        self.captions_by_cat, self.label_map = load_label_bank(label_bank_json)
+        self.captions_by_cat, self.label_map = load_label_bank(label_bank_json, text_mode=self.text_mode)
         for idx, class_name in enumerate(VOC_CLASSES_EN):
             if str(idx) not in self.captions_by_cat:
                 raise KeyError(f"label_bank 缺少 VOC 類別 {idx} / {class_name}")
@@ -133,7 +154,7 @@ class VocRegionDataset(Dataset):
                 if not self.use_multipos:
                     caps = self.captions_by_cat[str(label_id)]
                     ptr = rr_ptr.get(label_id, 0)
-                    text = caps[ptr % len(caps)]
+                    text = format_caption(caps[ptr % len(caps)], "en")
                     rr_ptr[label_id] = ptr + 1
 
                 samples.append(
@@ -156,7 +177,8 @@ class VocRegionDataset(Dataset):
         print(
             f"[VOC {self.year} {self.image_set}] samples={len(self.samples)} "
             f"skipped={skipped} crop_mode={self.crop_mode} "
-            f"multipos={self.use_multipos} fusion={self.use_fusion} return_meta={self.return_meta}"
+            f"multipos={self.use_multipos} fusion={self.use_fusion} "
+            f"text_mode={self.text_mode} return_meta={self.return_meta}"
         )
 
     def __len__(self) -> int:

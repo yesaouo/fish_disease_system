@@ -10,23 +10,44 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModel, AutoProcessor, get_cosine_schedule_with_warmup
 
-from common import (
-    LocalGlobalFusionWrapper,
-    build_caption_bank,
-    compute_paired_sigmoid_loss,
-    compute_symmetric_multipos_sigmoid_loss,
-    get_image_features,
-    get_logit_scale_and_bias,
-    get_text_features,
-    load_label_bank,
-    plot_loss_curve,
-    save_json,
-    set_seed,
-)
-from voc_dataset import VocRegionDataset
-from voc_labels import save_default_voc_label_bank
+try:
+    from diagnosis_model.vl_classifier.voc_pipeline.common import (
+        LocalGlobalFusionWrapper,
+        build_caption_bank,
+        compute_paired_sigmoid_loss,
+        compute_symmetric_multipos_sigmoid_loss,
+        get_image_features,
+        get_logit_scale_and_bias,
+        get_text_features,
+        load_label_bank,
+        normalize_text_mode,
+        plot_loss_curve,
+        save_json,
+        set_seed,
+    )
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_dataset import VocRegionDataset
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_labels import save_default_voc_label_bank
+except ModuleNotFoundError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from diagnosis_model.vl_classifier.voc_pipeline.common import (
+        LocalGlobalFusionWrapper,
+        build_caption_bank,
+        compute_paired_sigmoid_loss,
+        compute_symmetric_multipos_sigmoid_loss,
+        get_image_features,
+        get_logit_scale_and_bias,
+        get_text_features,
+        load_label_bank,
+        normalize_text_mode,
+        plot_loss_curve,
+        save_json,
+        set_seed,
+    )
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_dataset import VocRegionDataset
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_labels import save_default_voc_label_bank
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -41,6 +62,7 @@ DEFAULT_CONFIG = {
     "label_bank_json": None,
     "output_dir": None,
     "crop_mode": "bbox",
+    "text_mode": "captions",
     "batch_size": 128,
     "num_epochs": 10,
     "learning_rate": 1e-4,
@@ -54,6 +76,8 @@ DEFAULT_CONFIG = {
     "dropout_prob": 0.1,
     "fusion_base_lr": 3e-5,
     "fusion_head_lr": 1e-4,
+    "fusion_gate_mode": "scalar",
+    "freeze_text_encoder": False,
     "evidence_alpha": 3.0,
     "temperature": 0.07,
     "label_smoothing": 0.05,
@@ -80,6 +104,9 @@ def infer_output_dir(config: Dict[str, Any]) -> str:
         suffix = "fusion"
     else:
         suffix = "baseline"
+    text_mode = normalize_text_mode(config.get("text_mode", "captions"))
+    if text_mode != "captions":
+        suffix = f"{suffix}_{text_mode}"
     return f"./{model_stub}_voc{config['year']}_{suffix}"
 
 
@@ -88,6 +115,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified VOC training entry for baseline / multi-positive / fusion modes")
     parser.add_argument("--multipos", action="store_true", help="use multi-positive caption-bank training")
     parser.add_argument("--fusion", action="store_true", help="use local-global image fusion")
+    parser.add_argument("--freeze_text_encoder", action="store_true", help="freeze text-side CLIP/SigLIP parameters")
+    parser.add_argument(
+        "--fusion_gate_mode",
+        type=str,
+        choices=["scalar", "film", "xattn"],
+        default=None,
+        help="fusion gate: scalar, FiLM-style per-channel gate, or local-query cross-attention over global patches",
+    )
 
     parser.add_argument("--model_name", type=str, default=None)
     parser.add_argument("--voc_root", type=str, default=None)
@@ -98,6 +133,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label_bank_json", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--crop_mode", type=str, choices=["bbox", "square"], default=None)
+    parser.add_argument(
+        "--text_mode",
+        type=str,
+        choices=["captions", "class_name", "captions_plus_class_name"],
+        default=None,
+        help="VOC text source: caption bank descriptions, direct class names, or both",
+    )
 
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=None)
@@ -138,6 +180,10 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     config = dict(DEFAULT_CONFIG)
     config["multipos"] = bool(args.multipos)
     config["fusion"] = bool(args.fusion)
+    if getattr(args, "text_mode", None) is not None:
+        config["text_mode"] = normalize_text_mode(args.text_mode)
+    else:
+        config["text_mode"] = normalize_text_mode(config.get("text_mode", "captions"))
 
     for key in [
         "model_name",
@@ -160,6 +206,7 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         "dropout_prob",
         "fusion_base_lr",
         "fusion_head_lr",
+        "fusion_gate_mode",
         "base_learning_rate",
         "fusion_learning_rate",
         "evidence_alpha",
@@ -177,6 +224,8 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     if args.fusion_learning_rate is not None:
         config["fusion_head_lr"] = args.fusion_learning_rate
 
+    if args.freeze_text_encoder:
+        config["freeze_text_encoder"] = True
     if args.pin_memory:
         config["pin_memory"] = True
     if args.t2i_skip_no_positive:
@@ -198,6 +247,9 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         config["skip_difficult_valid"] = True
     if args.skip_difficult_test:
         config["skip_difficult_test"] = True
+
+    if config.get("fusion_gate_mode", "scalar") in ("film", "xattn") and not config["fusion"]:
+        raise ValueError(f"--fusion_gate_mode {config['fusion_gate_mode']} requires --fusion")
 
     if config["weight_decay"] is None:
         config["weight_decay"] = 0.01 if (config["multipos"] or config["fusion"]) else 0.0
@@ -224,6 +276,8 @@ def ensure_label_bank(config: Dict[str, Any]) -> str:
 
 
 def create_processor_and_model(config: Dict[str, Any]):
+    from transformers import AutoModel, AutoProcessor
+
     device = config["device"]
     processor = AutoProcessor.from_pretrained(config["model_name"])
     base_model = AutoModel.from_pretrained(config["model_name"]).to(device)
@@ -241,9 +295,80 @@ def create_processor_and_model(config: Dict[str, Any]):
         base_model=base_model,
         hidden_size=hidden_size,
         dropout_prob=float(config["dropout_prob"]),
+        gate_mode=str(config.get("fusion_gate_mode", "scalar")),
     ).to(device)
+    model.is_wrapper = True
+    model.wrapper_gate_mode = str(config.get("fusion_gate_mode", "scalar"))
     return processor, model
 
+
+
+def _collect_attr_parameters(obj, attr_name: str) -> List[torch.nn.Parameter]:
+    if not hasattr(obj, attr_name):
+        return []
+    attr = getattr(obj, attr_name)
+    if attr is None:
+        return []
+    if isinstance(attr, torch.nn.Module):
+        return list(attr.parameters())
+    if isinstance(attr, torch.nn.Parameter):
+        return [attr]
+    if isinstance(attr, torch.Tensor) and getattr(attr, "requires_grad", False):
+        return [attr]
+    return []
+
+
+def _set_requires_grad_unique(params, requires_grad: bool) -> int:
+    seen = set()
+    n_params = 0
+    for p in params:
+        if p is None or id(p) in seen:
+            continue
+        seen.add(id(p))
+        p.requires_grad = requires_grad
+        n_params += int(p.numel())
+    return n_params
+
+
+def freeze_text_encoder(model) -> int:
+    base = model.base_model if isinstance(model, LocalGlobalFusionWrapper) else model
+    text_param_candidates: List[torch.nn.Parameter] = []
+    for attr_name in [
+        "text_model",
+        "text_encoder",
+        "language_model",
+        "text_projection",
+        "text_proj",
+        "text_embedder",
+    ]:
+        text_param_candidates.extend(_collect_attr_parameters(base, attr_name))
+
+    for name, p in base.named_parameters():
+        name_l = name.lower()
+        if (
+            name_l.startswith("text_")
+            or ".text_" in name_l
+            or name_l.startswith("text.")
+            or ".text." in name_l
+            or "text_model" in name_l
+            or "text_encoder" in name_l
+        ):
+            text_param_candidates.append(p)
+    return _set_requires_grad_unique(text_param_candidates, False)
+
+
+def count_trainable_parameters(model) -> tuple[int, int]:
+    total = sum(int(p.numel()) for p in model.parameters())
+    trainable = sum(int(p.numel()) for p in model.parameters() if p.requires_grad)
+    return trainable, total
+
+
+def apply_freeze_config(model, config: Dict[str, Any]) -> None:
+    if config.get("freeze_text_encoder", False):
+        frozen = freeze_text_encoder(model)
+        print(f"Froze text encoder parameters: {frozen:,}")
+    trainable, total = count_trainable_parameters(model)
+    print(f"Trainable parameters: {trainable:,} / {total:,}")
 
 
 def build_collate_fn(
@@ -324,19 +449,45 @@ def build_collate_fn(
 
 
 
+def _trainable_params(module_or_params) -> List[torch.nn.Parameter]:
+    if isinstance(module_or_params, torch.nn.Module):
+        params = module_or_params.parameters()
+    else:
+        params = module_or_params
+    return [p for p in params if p.requires_grad]
+
+
 def build_optimizer(model, config: Dict[str, Any]):
     if config["fusion"]:
-        return torch.optim.AdamW(
-            [
-                {"params": model.base_model.parameters(), "lr": float(config["fusion_base_lr"])},
-                {"params": model.fusion_linear.parameters(), "lr": float(config["fusion_head_lr"])},
-                {"params": [model.gate], "lr": float(config["fusion_head_lr"])},
-            ],
-            weight_decay=float(config["weight_decay"]),
-        )
+        param_groups = []
+        base_params = _trainable_params(model.base_model)
+        if base_params:
+            param_groups.append({"params": base_params, "lr": float(config["fusion_base_lr"])})
 
+        fusion_head_params: List[torch.nn.Parameter] = []
+        fusion_head_params.extend(_trainable_params(model.fusion_linear))
+        if hasattr(model, "gate_net"):
+            fusion_head_params.extend(_trainable_params(model.gate_net))
+        if hasattr(model, "cross_attn"):
+            fusion_head_params.extend(_trainable_params(model.cross_attn))
+        if fusion_head_params:
+            param_groups.append({"params": fusion_head_params, "lr": float(config["fusion_head_lr"])})
+
+        gate_params = []
+        if hasattr(model, "gate") and isinstance(model.gate, torch.nn.Parameter) and model.gate.requires_grad:
+            gate_params.append(model.gate)
+        if gate_params:
+            param_groups.append({"params": gate_params, "lr": float(config["fusion_head_lr"])})
+
+        if not param_groups:
+            raise ValueError("No trainable parameters available for fusion optimizer")
+        return torch.optim.AdamW(param_groups, weight_decay=float(config["weight_decay"]))
+
+    params = _trainable_params(model)
+    if not params:
+        raise ValueError("No trainable parameters available for optimizer")
     return torch.optim.AdamW(
-        model.parameters(),
+        params,
         lr=float(config["learning_rate"]),
         weight_decay=float(config["weight_decay"]),
     )
@@ -366,7 +517,7 @@ def save_best_checkpoint(model, processor, config: Dict[str, Any], best_metric: 
 
 
 def prepare_custom_supervision(config: Dict[str, Any], processor):
-    captions_by_cat, _ = load_label_bank(config["label_bank_json"])
+    captions_by_cat, _ = load_label_bank(config["label_bank_json"], text_mode=config["text_mode"])
 
     bank_texts = None
     bank_labels_t = None
@@ -533,7 +684,7 @@ def train_baseline(config: Dict[str, Any]):
     device = config["device"]
     os.makedirs(config["output_dir"], exist_ok=True)
 
-    load_label_bank(config["label_bank_json"])
+    load_label_bank(config["label_bank_json"], text_mode=config["text_mode"])
     train_ds = VocRegionDataset(
         root=config["voc_root"],
         year=config["year"],
@@ -544,6 +695,7 @@ def train_baseline(config: Dict[str, Any]):
         use_fusion=False,
         download=bool(config["download"]),
         skip_difficult=bool(config["skip_difficult_train"]),
+        text_mode=config["text_mode"],
     )
     valid_ds = VocRegionDataset(
         root=config["voc_root"],
@@ -555,9 +707,11 @@ def train_baseline(config: Dict[str, Any]):
         use_fusion=False,
         download=bool(config["download"]),
         skip_difficult=bool(config["skip_difficult_valid"]),
+        text_mode=config["text_mode"],
     )
 
     processor, model = create_processor_and_model(config)
+    apply_freeze_config(model, config)
     collate_fn = build_collate_fn(processor, config, use_multipos=False, use_fusion=False)
 
     pin_memory = bool(config["pin_memory"]) and str(device).startswith("cuda")
@@ -577,6 +731,8 @@ def train_baseline(config: Dict[str, Any]):
         pin_memory=pin_memory,
         collate_fn=collate_fn,
     )
+
+    from transformers import get_cosine_schedule_with_warmup
 
     optimizer = build_optimizer(model, config)
     total_steps = len(train_loader) * int(config["num_epochs"])
@@ -646,6 +802,7 @@ def train_baseline(config: Dict[str, Any]):
             use_fusion=False,
             download=bool(config["download"]),
             skip_difficult=bool(config["skip_difficult_test"]),
+            text_mode=config["text_mode"],
         )
         test_loader = DataLoader(
             test_ds,
@@ -666,6 +823,7 @@ def train_custom(config: Dict[str, Any]):
     os.makedirs(config["output_dir"], exist_ok=True)
 
     processor, model = create_processor_and_model(config)
+    apply_freeze_config(model, config)
     captions_by_cat, bank_tokens_device, bank_labels_t, cat2bank_indices = prepare_custom_supervision(config, processor)
 
     train_ds = VocRegionDataset(
@@ -678,6 +836,7 @@ def train_custom(config: Dict[str, Any]):
         use_fusion=bool(config["fusion"]),
         download=bool(config["download"]),
         skip_difficult=bool(config["skip_difficult_train"]),
+        text_mode=config["text_mode"],
     )
     valid_ds = VocRegionDataset(
         root=config["voc_root"],
@@ -689,6 +848,7 @@ def train_custom(config: Dict[str, Any]):
         use_fusion=bool(config["fusion"]),
         download=bool(config["download"]),
         skip_difficult=bool(config["skip_difficult_valid"]),
+        text_mode=config["text_mode"],
     )
 
     collate_fn = build_collate_fn(
@@ -716,6 +876,8 @@ def train_custom(config: Dict[str, Any]):
         pin_memory=pin_memory,
         collate_fn=collate_fn,
     )
+
+    from transformers import get_cosine_schedule_with_warmup
 
     optimizer = build_optimizer(model, config)
     total_steps = len(train_loader) * int(config["num_epochs"])
@@ -803,6 +965,7 @@ def train_custom(config: Dict[str, Any]):
             use_fusion=bool(config["fusion"]),
             download=bool(config["download"]),
             skip_difficult=bool(config["skip_difficult_test"]),
+            text_mode=config["text_mode"],
         )
         test_loader = DataLoader(
             test_ds,
@@ -830,8 +993,9 @@ def main():
     config["label_bank_json"] = ensure_label_bank(config)
 
     print(
-        f"Mode: multipos={config['multipos']}, fusion={config['fusion']} | "
-        f"output_dir={config['output_dir']}"
+        f"Mode: multipos={config['multipos']}, fusion={config['fusion']}, "
+        f"gate={config.get('fusion_gate_mode', 'scalar')}, freeze_text={config.get('freeze_text_encoder', False)} | "
+        f"text_mode={config['text_mode']} | output_dir={config['output_dir']}"
     )
 
     if not config["multipos"] and not config["fusion"]:

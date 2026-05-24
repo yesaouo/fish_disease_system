@@ -16,6 +16,28 @@ import torch.nn.functional as F
 # =========================
 PROMPT_EN = "This is {cap}."
 PROMPT_ZH = "{cap}。"
+TEXT_MODE_CHOICES = ("captions", "class_name", "captions_plus_class_name")
+
+
+def normalize_text_mode(text_mode: str) -> str:
+    mode = str(text_mode or "captions").strip().lower().replace("-", "_")
+    aliases = {
+        "caption": "captions",
+        "description": "captions",
+        "descriptions": "captions",
+        "class": "class_name",
+        "class_names": "class_name",
+        "name": "class_name",
+        "names": "class_name",
+        "both": "captions_plus_class_name",
+        "caption_plus_class_name": "captions_plus_class_name",
+        "captions+class_name": "captions_plus_class_name",
+        "captions_plus_class_names": "captions_plus_class_name",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in TEXT_MODE_CHOICES:
+        raise ValueError(f"text_mode must be one of {TEXT_MODE_CHOICES}, got {text_mode!r}")
+    return mode
 
 
 def format_caption(cap: str, lang: str) -> str:
@@ -276,17 +298,39 @@ class FlatCaptionBank:
     id_to_zh: Dict[str, str] = field(default_factory=dict)      # cat_id -> zh display name (from label_map)
     raw_by_cat: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)  # cat_id -> [(raw_caption, lang), ...]
     sorted_label_ids: List[str] = field(default_factory=list)
+    text_mode: str = "captions"
+
+
+def _label_name_for_lang(label_info, lang: str) -> Optional[str]:
+    if isinstance(label_info, dict):
+        value = label_info.get(lang)
+        if not value:
+            value = label_info.get("en") or label_info.get("zh")
+    elif isinstance(label_info, str):
+        value = label_info
+    else:
+        value = None
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    value = value.strip()
+    if lang == "en":
+        value = value.replace("_", " ")
+    return value
 
 
 def load_flat_caption_bank(
     symptoms_path: str,
     langs: Tuple[str, ...] = ("en", "zh"),
+    text_mode: str = "captions",
 ) -> FlatCaptionBank:
     """Load symptoms.json and build a flat caption bank + per-category structure.
 
-    Bank order: categories sorted (numeric-aware), then by `langs` argument order, then caption order.
-    Raises if a category has zero usable captions for the requested langs.
+    Bank order: categories sorted (numeric-aware), then by `langs` argument order, then text order.
+    Raises if a category has zero usable texts for the requested langs/text_mode.
     """
+    text_mode = normalize_text_mode(text_mode)
     if not symptoms_path or not os.path.exists(symptoms_path):
         raise FileNotFoundError(f"symptoms.json not found: {symptoms_path}")
 
@@ -320,18 +364,30 @@ def load_flat_caption_bank(
             continue
         cat_id = str(k)
         pairs: List[Tuple[str, str]] = []
-        for lang in langs:
-            key = f"captions_{lang}"
-            caps = v.get(key, None)
-            if caps is None:
-                continue
-            if not isinstance(caps, list):
-                raise ValueError(f"{key} for category_id={cat_id} is not a list")
-            for cap in caps:
-                if isinstance(cap, str) and cap.strip():
-                    pairs.append((cap.strip(), lang))
+        if text_mode in ("captions", "captions_plus_class_name"):
+            for lang in langs:
+                key = f"captions_{lang}"
+                caps = v.get(key, None)
+                if caps is None:
+                    continue
+                if not isinstance(caps, list):
+                    raise ValueError(f"{key} for category_id={cat_id} is not a list")
+                for cap in caps:
+                    if isinstance(cap, str) and cap.strip():
+                        pairs.append((cap.strip(), lang))
+
+        if text_mode in ("class_name", "captions_plus_class_name"):
+            label_info = label_map.get(cat_id, {})
+            for lang in langs:
+                label_name = _label_name_for_lang(label_info, lang)
+                if label_name:
+                    pairs.append((label_name, lang))
+
         if not pairs:
-            raise ValueError(f"symptoms.json category_id={cat_id} has no usable captions for langs={langs}")
+            raise ValueError(
+                f"symptoms.json category_id={cat_id} has no usable texts for "
+                f"langs={langs}, text_mode={text_mode}"
+            )
         raw_by_cat[cat_id] = pairs
         for cap, lang in pairs:
             texts.append(format_caption(cap, lang))
@@ -348,4 +404,5 @@ def load_flat_caption_bank(
         id_to_zh=id_to_zh,
         raw_by_cat=raw_by_cat,
         sorted_label_ids=sort_label_ids(label_ids),
+        text_mode=text_mode,
     )

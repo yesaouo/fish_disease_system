@@ -6,7 +6,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from voc_labels import save_default_voc_label_bank
+try:
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_labels import save_default_voc_label_bank
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_labels import save_default_voc_label_bank
 
 
 
@@ -29,6 +33,12 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--output_root", type=str, required=True)
     ap.add_argument("--model_name", type=str, default="google/siglip2-base-patch16-224")
     ap.add_argument("--crop_mode", type=str, choices=["bbox", "square"], default="bbox")
+    ap.add_argument(
+        "--text_mode",
+        type=str,
+        choices=["captions", "class_name", "captions_plus_class_name"],
+        default="captions",
+    )
     ap.add_argument("--train_image_set", type=str, default="train")
     ap.add_argument("--valid_image_set", type=str, default="val")
     ap.add_argument("--eval_image_set", type=str, default="")
@@ -38,6 +48,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--learning_rate", type=float, default=1e-4)
     ap.add_argument("--base_learning_rate", type=float, default=3e-5)
     ap.add_argument("--fusion_learning_rate", type=float, default=1e-4)
+    ap.add_argument("--fusion_gate_mode", type=str, choices=["scalar", "film", "xattn"], default="scalar")
+    ap.add_argument("--freeze_text_encoder", action="store_true")
     ap.add_argument("--max_length", type=int, default=64)
     ap.add_argument("--num_workers", type=int, default=8)
     ap.add_argument("--device", type=str, default="cuda")
@@ -53,18 +65,21 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
     here = Path(__file__).resolve().parent
-    output_root = Path(args.output_root)
+    repo_root = here.parents[2]
+    output_root = Path(args.output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    voc_root = str(Path(args.voc_root).expanduser().resolve())
 
-    label_bank_json = Path(args.label_bank_json) if args.label_bank_json else output_root / "voc_label_bank.json"
+    label_bank_json = Path(args.label_bank_json).expanduser().resolve() if args.label_bank_json else output_root / "voc_label_bank.json"
     if not label_bank_json.exists():
         save_default_voc_label_bank(label_bank_json)
 
     eval_image_set = args.eval_image_set.strip() or ("test" if args.year == "2007" else "val")
     common = [
-        "--voc_root", args.voc_root,
+        "--voc_root", voc_root,
         "--year", args.year,
         "--crop_mode", args.crop_mode,
+        "--text_mode", args.text_mode,
         "--label_bank_json", str(label_bank_json),
         "--max_length", str(args.max_length),
         "--num_workers", str(args.num_workers),
@@ -75,16 +90,18 @@ def main() -> None:
     if args.no_amp:
         common.append("--no_amp")
 
-    baseline_dir = output_root / f"voc{args.year}_baseline"
-    multipos_dir = output_root / f"voc{args.year}_multipos"
-    fusion_dir = output_root / f"voc{args.year}_fusion"
-    multipos_fusion_dir = output_root / f"voc{args.year}_multipos_fusion"
-    eval_dir = output_root / f"voc{args.year}_eval"
+    text_suffix = "" if args.text_mode == "captions" else f"_{args.text_mode}"
+    baseline_dir = output_root / f"voc{args.year}_baseline{text_suffix}"
+    multipos_dir = output_root / f"voc{args.year}_multipos{text_suffix}"
+    fusion_dir = output_root / f"voc{args.year}_fusion{text_suffix}"
+    multipos_fusion_dir = output_root / f"voc{args.year}_multipos_fusion{text_suffix}"
+    eval_dir = output_root / f"voc{args.year}_eval{text_suffix}"
 
     def train_cmd(extra_flags, out_dir, batch_size, lr=None, fusion_base_lr=None, fusion_head_lr=None):
         cmd = [
             sys.executable,
-            str(here / "train.py"),
+            "-m",
+            "diagnosis_model.vl_classifier.voc_pipeline.train",
             "--model_name", args.model_name,
             "--train_image_set", args.train_image_set,
             "--valid_image_set", args.valid_image_set,
@@ -100,26 +117,32 @@ def main() -> None:
             cmd += ["--fusion_base_lr", str(fusion_base_lr)]
         if fusion_head_lr is not None:
             cmd += ["--fusion_head_lr", str(fusion_head_lr)]
+        if args.freeze_text_encoder:
+            cmd.append("--freeze_text_encoder")
+        if "--fusion" in extra_flags:
+            cmd += ["--fusion_gate_mode", args.fusion_gate_mode]
         if args.skip_difficult_train:
             cmd.append("--skip_difficult_train")
         if args.skip_difficult_eval:
             cmd.append("--skip_difficult_valid")
         return cmd
 
-    run(train_cmd([], baseline_dir, args.batch_size, lr=args.learning_rate), cwd=here)
-    run(train_cmd(["--multipos"], multipos_dir, args.batch_size, lr=args.learning_rate), cwd=here)
-    run(train_cmd(["--fusion"], fusion_dir, args.fusion_batch_size, fusion_base_lr=args.base_learning_rate, fusion_head_lr=args.fusion_learning_rate), cwd=here)
-    run(train_cmd(["--multipos", "--fusion"], multipos_fusion_dir, args.fusion_batch_size, fusion_base_lr=args.base_learning_rate, fusion_head_lr=args.fusion_learning_rate), cwd=here)
+    run(train_cmd([], baseline_dir, args.batch_size, lr=args.learning_rate), cwd=repo_root)
+    run(train_cmd(["--multipos"], multipos_dir, args.batch_size, lr=args.learning_rate), cwd=repo_root)
+    run(train_cmd(["--fusion"], fusion_dir, args.fusion_batch_size, fusion_base_lr=args.base_learning_rate, fusion_head_lr=args.fusion_learning_rate), cwd=repo_root)
+    run(train_cmd(["--multipos", "--fusion"], multipos_fusion_dir, args.fusion_batch_size, fusion_base_lr=args.base_learning_rate, fusion_head_lr=args.fusion_learning_rate), cwd=repo_root)
 
     eval_common = [
         sys.executable,
-        str(here / "eval.py"),
-        "--voc_root", args.voc_root,
+        "-m",
+        "diagnosis_model.vl_classifier.voc_pipeline.eval",
+        "--voc_root", voc_root,
         "--year", args.year,
         "--image_set", eval_image_set,
         "--label_bank_json", str(label_bank_json),
         "--output_dir", str(eval_dir),
         "--crop_mode", args.crop_mode,
+        "--text_mode", args.text_mode,
         "--device", args.device,
         "--max_length", str(args.max_length),
         "--img_batch_size", str(args.fusion_batch_size),
@@ -139,7 +162,7 @@ def main() -> None:
     if args.save_vis:
         eval_common.append("--save_vis")
 
-    run(eval_common, cwd=here)
+    run(eval_common, cwd=repo_root)
 
     print("\nAll done.")
     print(f"Output root: {output_root}")

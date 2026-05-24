@@ -104,9 +104,25 @@ def max_mean_set_score(sim_block: np.ndarray) -> float:
     return 0.5 * (forward + backward)
 
 
+def max_mean_normalized_set_score(sim_block: np.ndarray) -> float:
+    """Symmetric max-mean with the same /max(N,M) penalty as Hungarian.
+
+    Isolates the aggregation operator (one-to-one Hungarian assignment vs
+    bidirectional soft MaxSim) from the size-mismatch normalization that
+    `hungarian_set_score` applies. Used for the aggregation ablation.
+    """
+    n, m = sim_block.shape
+    if n == 0 or m == 0:
+        return 0.0
+    forward = float(sim_block.max(axis=1).sum())
+    backward = float(sim_block.max(axis=0).sum())
+    return 0.5 * (forward + backward) / max(n, m)
+
+
 _LESION_MATCH_FNS = {
-    "hungarian": hungarian_set_score,
-    "max_mean":  max_mean_set_score,
+    "hungarian":           hungarian_set_score,
+    "max_mean":            max_mean_set_score,
+    "max_mean_normalized": max_mean_normalized_set_score,
 }
 
 
@@ -334,7 +350,7 @@ def main():
     ap.add_argument("--alpha_global", type=float, default=0.25)
     ap.add_argument("--beta_lesion", type=float, default=0.75)
     ap.add_argument("--lesion_match", type=str, default="hungarian",
-                    choices=["hungarian", "max_mean"],
+                    choices=["hungarian", "max_mean", "max_mean_normalized"],
                     help="lesion-set matching mode for case similarity")
     ap.add_argument("--device", type=str,
                     default="cuda" if torch.cuda.is_available() else "cpu")

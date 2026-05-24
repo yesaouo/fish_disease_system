@@ -9,6 +9,29 @@
 
 評估用 [eval.py](eval.py)（病灶分類在 `data/coco/_merged/test` 上對 GT bbox 做 caption-bank 分類，輸出 `classification_report`）。
 
+## Text Mode Baseline
+
+`--text_mode captions` 是既有描述式 supervision；`--text_mode class_name` 是常見 CLIP/SigLIP zero-shot/finetune baseline，只用 `symptoms.json` 的 `label_map.*` 類別名稱；`--text_mode captions_plus_class_name` 會把兩者放進同一個 bank。英文類別名會自動把 `_` 轉成空白，例如 `body_color_change` 變成 `body color change`。
+
+訓練 class-name baseline：
+
+```bash
+$PY train.py --multipos --fusion --freeze_text_encoder \
+  --text_mode class_name \
+  --output_dir outputs/siglip2_base_patch16_224_multipos_fusion_class_name_en_zh
+```
+
+評估同一 checkpoint 時，可切換文字 bank 直接比較 class name 與描述式結果：
+
+```bash
+$PY eval.py --target lesion --fusion \
+  --data_dir ../../data/coco/_merged/test \
+  --symptoms_json ../../data/annotation/backup/20260207/fish_disease/symptoms.json \
+  --model clsname=outputs/siglip2_base_patch16_224_multipos_fusion_class_name_en_zh \
+  --text_mode class_name \
+  --output_dir outputs/eval_class_name
+```
+
 ---
 
 ## VLM-Lesion 強化方法記錄

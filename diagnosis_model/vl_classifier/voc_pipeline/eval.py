@@ -9,19 +9,39 @@ import numpy as np
 import torch
 from PIL import Image
 
-from common import (
-    DEFAULT_FONT_PATH,
-    draw_prediction_visualization,
-    encode_image_features,
-    encode_text_features,
-    load_eval_texts,
-    load_model_and_processor,
-    save_classification_report,
-    save_confusion_matrix,
-)
-from voc_dataset import VocRegionDataset
-from voc_labels import save_default_voc_label_bank
+try:
+    from diagnosis_model.vl_classifier.voc_pipeline.common import (
+        DEFAULT_FONT_PATH,
+        draw_prediction_visualization,
+        encode_image_features,
+        encode_text_features,
+        load_eval_texts,
+        load_model_and_processor,
+        normalize_text_mode,
+        save_classification_report,
+        save_confusion_matrix,
+        save_json,
+    )
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_dataset import VocRegionDataset
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_labels import save_default_voc_label_bank
+except ModuleNotFoundError:
+    import sys
 
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from diagnosis_model.vl_classifier.voc_pipeline.common import (
+        DEFAULT_FONT_PATH,
+        draw_prediction_visualization,
+        encode_image_features,
+        encode_text_features,
+        load_eval_texts,
+        load_model_and_processor,
+        normalize_text_mode,
+        save_classification_report,
+        save_confusion_matrix,
+        save_json,
+    )
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_dataset import VocRegionDataset
+    from diagnosis_model.vl_classifier.voc_pipeline.voc_labels import save_default_voc_label_bank
 
 
 def parse_model_specs(model_specs: List[str]) -> List[Tuple[str, str]]:
@@ -51,6 +71,13 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--label_bank_json", type=str, default="")
     ap.add_argument("--output_dir", type=str, required=True)
     ap.add_argument("--crop_mode", type=str, choices=["bbox", "square"], default="bbox")
+    ap.add_argument(
+        "--text_mode",
+        type=str,
+        choices=["captions", "class_name", "captions_plus_class_name"],
+        default="captions",
+        help="VOC text source: caption bank descriptions, direct class names, or both",
+    )
     ap.add_argument("--model", type=str, action="append", required=True, help="可重複指定：tag=repo_or_path")
     ap.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     ap.add_argument("--text_batch_size", type=int, default=256)
@@ -99,12 +126,14 @@ def process_voc_dataset(
     force_fusion: bool = False,
     download: bool = False,
     skip_difficult: bool = False,
+    text_mode: str = "captions",
 ):
+    text_mode = normalize_text_mode(text_mode)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading label bank ...")
-    flat_texts, flat_label_ids, id_to_zh_map, all_label_ids = load_eval_texts(label_bank_json)
+    print(f"Loading label bank (text_mode={text_mode}) ...")
+    flat_texts, flat_label_ids, id_to_zh_map, all_label_ids = load_eval_texts(label_bank_json, text_mode=text_mode)
     if len(flat_texts) == 0:
         raise RuntimeError("label_bank_json 的 captions_en 為空，無法做 text candidates。")
 
@@ -126,7 +155,9 @@ def process_voc_dataset(
         )
         text_features[tag] = tf
         mode_name = "fusion" if getattr(m, "is_wrapper", False) else "baseline"
-        print(f"    mode={mode_name}, text_features={tuple(tf.shape)}")
+        gate_mode = getattr(m, "wrapper_gate_mode", None)
+        gate_suffix = f", gate={gate_mode}" if gate_mode else ""
+        print(f"    mode={mode_name}{gate_suffix}, text_features={tuple(tf.shape)}")
 
     dataset = VocRegionDataset(
         root=voc_root,
@@ -139,6 +170,7 @@ def process_voc_dataset(
         return_meta=True,
         download=download,
         skip_difficult=skip_difficult,
+        text_mode=text_mode,
     )
 
     image_to_samples: Dict[str, List] = defaultdict(list)
@@ -197,13 +229,33 @@ def process_voc_dataset(
             vis.save(vis_dir / f"pred_{Path(image_path).name}")
 
     print("\n===== Results =====")
+    summary = {}
     for tag, _ in model_specs:
         pred = y_pred[tag]
         if len(pred) != len(y_true):
             raise RuntimeError(f"{tag} 的 y_pred 長度({len(pred)}) != y_true 長度({len(y_true)})，資料對齊有問題。")
 
-        acc = (np.array(pred) == np.array(y_true)).mean() if len(y_true) else 0.0
-        print(f"[{tag}] accuracy = {acc:.4f}  (n={len(y_true)})")
+        acc = float((np.array(pred) == np.array(y_true)).mean()) if len(y_true) else 0.0
+        report = save_classification_report(
+            y_true,
+            pred,
+            all_label_ids,
+            output_dir / f"report_{tag}.txt",
+        )
+        macro_f1 = float(report.get("macro avg", {}).get("f1-score", 0.0))
+        weighted_f1 = float(report.get("weighted avg", {}).get("f1-score", 0.0))
+        balanced_acc = float(report.get("macro avg", {}).get("recall", 0.0))
+        summary[tag] = {
+            "accuracy": acc,
+            "macro_f1": macro_f1,
+            "weighted_f1": weighted_f1,
+            "balanced_accuracy": balanced_acc,
+            "n": len(y_true),
+        }
+        print(
+            f"[{tag}] acc={acc:.4f} macro_f1={macro_f1:.4f} "
+            f"weighted_f1={weighted_f1:.4f} balanced_acc={balanced_acc:.4f} (n={len(y_true)})"
+        )
 
         save_confusion_matrix(
             y_true,
@@ -221,13 +273,8 @@ def process_voc_dataset(
             title=f"Confusion Matrix ({tag}) - Normalized (Recall)",
             normalize="true",
         )
-        save_classification_report(
-            y_true,
-            pred,
-            all_label_ids,
-            output_dir / f"report_{tag}.txt",
-        )
 
+    save_json(summary, output_dir / "summary_metrics.json")
     print(f"\nDone! Saved outputs to: {output_dir}")
     if save_vis:
         print(f"Visualization saved to: {vis_dir}")
@@ -259,6 +306,7 @@ def main():
         force_fusion=bool(args.fusion),
         download=bool(args.download),
         skip_difficult=bool(args.skip_difficult),
+        text_mode=args.text_mode,
     )
 
 

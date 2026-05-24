@@ -22,6 +22,7 @@ from common import (
     get_text_features,
     load_flat_caption_bank,
     LocalGlobalFusionWrapper,
+    normalize_text_mode,
     sort_label_ids,
 )
 
@@ -287,7 +288,9 @@ def process_gt_dataset(
     use_amp: bool = True,
     force_fusion: bool = False,
     eval_lang: str = "both",
+    text_mode: str = "captions",
 ):
+    text_mode = normalize_text_mode(text_mode)
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -303,8 +306,8 @@ def process_gt_dataset(
     if not coco_json_path.exists():
         raise FileNotFoundError(f"找不到：{coco_json_path}")
 
-    print(f"Loading symptoms.json (langs={langs}) ...")
-    bank = load_flat_caption_bank(symptoms_json_path, langs=langs)
+    print(f"Loading symptoms.json (langs={langs}, text_mode={text_mode}) ...")
+    bank = load_flat_caption_bank(symptoms_json_path, langs=langs, text_mode=text_mode)
     flat_texts = bank.texts
     flat_label_ids = bank.label_ids
     flat_langs = bank.langs
@@ -781,6 +784,13 @@ def build_argparser():
         default="both",
         help="評估時要啟用的語言 bank；both 會同時輸出 all/en/zh 三組指標"
     )
+    ap.add_argument(
+        "--text_mode",
+        type=str,
+        choices=["captions", "class_name", "captions_plus_class_name"],
+        default="captions",
+        help="lesion text source: descriptions/captions, direct label names, or both"
+    )
     return ap
 
 
@@ -793,6 +803,8 @@ def main():
     if args.target == "overall":
         if args.fusion:
             parser.error("--target overall is incompatible with --fusion")
+        if args.text_mode != "captions":
+            parser.error("--text_mode is only supported for --target lesion")
         if args.save_vis:
             print("[WARN] --save_vis is not implemented for target=overall yet; ignoring.")
         process_overall_dataset(
@@ -826,6 +838,7 @@ def main():
         use_amp=(not args.no_amp),
         force_fusion=bool(args.fusion),
         eval_lang=args.eval_lang,
+        text_mode=args.text_mode,
     )
 
 

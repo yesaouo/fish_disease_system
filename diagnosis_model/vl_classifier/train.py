@@ -22,6 +22,7 @@ from common import (
     get_text_features,
     load_flat_caption_bank,
     LocalGlobalFusionWrapper,
+    normalize_text_mode,
 )
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -39,8 +40,9 @@ DEFAULT_CONFIG = {
     "output_dir": None,
     "crop_mode": "bbox",  # "bbox" or "square"
 
-    # languages
+    # text supervision
     "langs": ["en", "zh"],     # 訓練時用到的語言；多語會 flatten 進同一個 caption bank
+    "text_mode": "captions",   # captions | class_name | captions_plus_class_name
     "warmup_ratio": 0.15,       # 單語建議 0.2；雙語建議 0.25；凍結建議預設 -1
 
     # train hypers
@@ -292,6 +294,8 @@ class CocoCropDataset(Dataset):
         captions_by_cat: Dict[str, List[Tuple[str, str]]],
         use_multipos: bool = False,
         use_fusion: bool = False,
+        use_annotation_text: bool = True,
+        text_mode: str = "captions",
     ):
         self.data_root = data_root
         self.split = split
@@ -299,6 +303,8 @@ class CocoCropDataset(Dataset):
         self.captions_by_cat = captions_by_cat
         self.use_multipos = use_multipos
         self.use_fusion = use_fusion
+        self.use_annotation_text = use_annotation_text
+        self.text_mode = normalize_text_mode(text_mode)
 
         split_dir = os.path.join(data_root, split)
         coco_json_path = os.path.join(split_dir, "_annotations.coco.json")
@@ -362,10 +368,13 @@ class CocoCropDataset(Dataset):
                 raise KeyError(f"symptoms.json missing category_id={cat_key} (required)")
 
             if self.use_multipos:
-                ei = int(ann.get("evidence_index", -1)) if ann.get("evidence_index") is not None else -1
-                if ei >= 0:
-                    caps = self.captions_by_cat[cat_key]
-                    ei = max(0, min(ei, len(caps) - 1))
+                if self.text_mode == "class_name":
+                    ei = 0
+                else:
+                    ei = int(ann.get("evidence_index", -1)) if ann.get("evidence_index") is not None else -1
+                    if ei >= 0:
+                        caps = self.captions_by_cat[cat_key]
+                        ei = max(0, min(ei, len(caps) - 1))
 
                 samples.append(
                     CocoSample(
@@ -379,7 +388,7 @@ class CocoCropDataset(Dataset):
             else:
                 # baseline paired mode：每筆從多語 caption pool 選一條（支持 evidence_index 指定 或 round-robin）
                 ann_text = ann.get("text", None)
-                if isinstance(ann_text, str) and ann_text.strip():
+                if self.use_annotation_text and isinstance(ann_text, str) and ann_text.strip():
                     # 若 annotation 直接給 text，就不做 prompt 包裝（視為使用者自訂）
                     text = ann_text.strip()
                 else:
@@ -1061,6 +1070,10 @@ def infer_output_dir(config: Dict[str, Any]) -> str:
     if target != "lesion":
         suffix = f"{target}_{suffix}"
 
+    text_mode = normalize_text_mode(config.get("text_mode", "captions"))
+    if target == "lesion" and text_mode != "captions":
+        suffix = f"{suffix}_{text_mode}"
+
     langs = config.get("langs", ["en"])
     if isinstance(langs, (list, tuple)) and len(langs) > 0:
         lang_tag = "_".join(sorted(langs))
@@ -1130,6 +1143,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop_mode", type=str, choices=["bbox", "square"], default=None)
 
     parser.add_argument("--lang", type=str, choices=["en", "zh", "both"], default=None)
+    parser.add_argument(
+        "--text_mode",
+        type=str,
+        choices=["captions", "class_name", "captions_plus_class_name"],
+        default=None,
+        help="lesion text source: generated captions/descriptions, direct label names, or both",
+    )
     parser.add_argument("--warmup_ratio", type=float, default=None)
 
     parser.add_argument("--batch_size", type=int, default=None)
@@ -1168,9 +1188,15 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     config["target"] = str(getattr(args, "target", "lesion") or "lesion")
     config["multipos"] = bool(args.multipos)
     config["fusion"] = bool(args.fusion)
+    if getattr(args, "text_mode", None) is not None:
+        config["text_mode"] = normalize_text_mode(args.text_mode)
+    else:
+        config["text_mode"] = normalize_text_mode(config.get("text_mode", "captions"))
 
     if config["target"] == "overall" and config["fusion"]:
         raise ValueError("--target overall is incompatible with --fusion (no local/global crops in overall mode)")
+    if config["target"] == "overall" and config["text_mode"] != "captions":
+        raise ValueError("--text_mode is only supported for --target lesion")
 
     for key in [
         "model_name",
@@ -1715,7 +1741,11 @@ def train_baseline(config: Dict[str, Any]):
         )
     else:
         langs = tuple(config.get("langs", ["en"]))
-        captions_by_cat = load_flat_caption_bank(config["symptoms_file"], langs=langs).raw_by_cat
+        captions_by_cat = load_flat_caption_bank(
+            config["symptoms_file"],
+            langs=langs,
+            text_mode=config["text_mode"],
+        ).raw_by_cat
         train_ds = CocoCropDataset(
             data_root=config["data_root"],
             split=config["train_split"],
@@ -1723,6 +1753,8 @@ def train_baseline(config: Dict[str, Any]):
             captions_by_cat=captions_by_cat,
             use_multipos=False,
             use_fusion=False,
+            use_annotation_text=(config["text_mode"] == "captions"),
+            text_mode=config["text_mode"],
         )
         valid_ds = CocoCropDataset(
             data_root=config["data_root"],
@@ -1731,6 +1763,8 @@ def train_baseline(config: Dict[str, Any]):
             captions_by_cat=captions_by_cat,
             use_multipos=False,
             use_fusion=False,
+            use_annotation_text=(config["text_mode"] == "captions"),
+            text_mode=config["text_mode"],
         )
 
     processor, model = create_processor_and_model(config)
@@ -1826,6 +1860,8 @@ def train_baseline(config: Dict[str, Any]):
                 captions_by_cat=captions_by_cat,
                 use_multipos=False,
                 use_fusion=False,
+                use_annotation_text=(config["text_mode"] == "captions"),
+                text_mode=config["text_mode"],
             )
         test_loader = DataLoader(
             test_ds,
@@ -1845,7 +1881,11 @@ def train_baseline(config: Dict[str, Any]):
 
 def prepare_custom_supervision(config: Dict[str, Any], processor):
     langs = tuple(config.get("langs", ["en"]))
-    captions_by_cat = load_flat_caption_bank(config["symptoms_file"], langs=langs).raw_by_cat
+    captions_by_cat = load_flat_caption_bank(
+        config["symptoms_file"],
+        langs=langs,
+        text_mode=config["text_mode"],
+    ).raw_by_cat
 
     bank_tokens_device = None
     bank_labels_t = None
@@ -1877,7 +1917,7 @@ def prepare_custom_supervision(config: Dict[str, Any], processor):
 
         print(
             f"[CaptionBank] size={len(bank_texts)}, langs={langs}, "
-            f"evidence_slots={evidence_slots}"
+            f"text_mode={config['text_mode']}, evidence_slots={evidence_slots}"
         )
 
     return captions_by_cat, bank_tokens_device, bank_labels_t, cat2bank_indices, cat2evidence, evidence_slots
@@ -2150,6 +2190,8 @@ def train_custom(config: Dict[str, Any]):
             captions_by_cat=captions_by_cat,
             use_multipos=bool(config["multipos"]),
             use_fusion=bool(config["fusion"]),
+            use_annotation_text=(config["text_mode"] == "captions"),
+            text_mode=config["text_mode"],
         )
         valid_ds = CocoCropDataset(
             data_root=config["data_root"],
@@ -2158,6 +2200,8 @@ def train_custom(config: Dict[str, Any]):
             captions_by_cat=captions_by_cat,
             use_multipos=bool(config["multipos"]),
             use_fusion=bool(config["fusion"]),
+            use_annotation_text=(config["text_mode"] == "captions"),
+            text_mode=config["text_mode"],
         )
 
     collate_fn = build_collate_fn(
@@ -2342,6 +2386,8 @@ def train_custom(config: Dict[str, Any]):
                 captions_by_cat=captions_by_cat,
                 use_multipos=bool(config["multipos"]),
                 use_fusion=bool(config["fusion"]),
+                use_annotation_text=(config["text_mode"] == "captions"),
+                text_mode=config["text_mode"],
             )
         test_loader = DataLoader(
             test_ds,
@@ -2377,8 +2423,8 @@ def main():
     print(
         f"Mode: target={config['target']}, multipos={config['multipos']}, fusion={config['fusion']}, "
         f"freeze_text_encoder={config['freeze_text_encoder']} | "
-        f"langs={config['langs']} | warmup_ratio={config['warmup_ratio']} | "
-        f"output_dir={config['output_dir']}"
+        f"langs={config['langs']} | text_mode={config['text_mode']} | "
+        f"warmup_ratio={config['warmup_ratio']} | output_dir={config['output_dir']}"
     )
 
     if not config["multipos"] and not config["fusion"]:

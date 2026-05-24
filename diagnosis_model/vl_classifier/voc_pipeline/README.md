@@ -1,294 +1,143 @@
-# VOC SigLIP Pipeline
+# VOC Region Benchmark for VLM Lesion Classifier
 
-以 SigLIP / SigLIP2 為基礎的 VOC 物件區域分類流程，支援四種訓練模式：
+這個資料夾把 PASCAL VOC 轉成 region-level vision-language benchmark。它不是魚病任務；用途是測試同一套 crop / text / fusion 流程，能不能在固定類別的物件區域資料集上運作。
 
-- baseline
-- multipos
-- fusion
-- multipos + fusion
+pipeline 會把每個 VOC object bbox 視為一筆 region sample：
 
-並提供：
+- local image：object bbox crop
+- global image：完整 VOC 影像，只在 fusion checkpoint 使用
+- text candidates：來自 `voc_label_bank.json` 的 caption bank
+- prediction：在 VLM embedding space 中找最接近的 caption / label
 
-- 單一訓練入口：`train.py`
-- 單一評估入口：`eval.py`
-- 一鍵跑完整訓練與評估：`run_all_voc.py`
-- Heatmap 與 VOC2012 semantic segmentation 差異可視化：`voc_heatmap.ipynb`
+## 這個 benchmark 的角色
 
-## 檔案結構
-
-- `train.py`：VOC 訓練主程式
-- `eval.py`：VOC 評估主程式
-- `run_all_voc.py`：依序訓練四種模式並統一評估
-- `voc_dataset.py`：VOC region dataset 與 bbox / square crop 邏輯
-- `common.py`：共用 loss、feature extraction、fusion wrapper、視覺化工具
-- `voc_labels.py`：VOC 類別定義與預設 label bank 產生器
-- `voc_heatmap.ipynb`：heatmap 與 segmentation 差異分析 notebook
-
-## 安裝
-
-```bash
-pip install torch torchvision transformers pillow tqdm matplotlib scikit-learn opencv-python seaborn
-```
-
-## 資料集
-
-本專案使用 `torchvision.datasets.VOCDetection` 讀取 VOC，因此 `--voc_root` 應指向 VOC 的根目錄，例如：
+論文敘事裡，VOC 是語意分類階段的 sanity benchmark：
 
 ```text
-/path/to/data/
-└── VOCdevkit/
-    ├── VOC2007/
-    └── VOC2012/
+RF-DETR abnormal-region proposal -> VLM semantic region classifier/retriever
 ```
 
-若本機尚未下載資料，可在訓練或評估時加上 `--download`。
+VOC 不能證明魚病診斷能力。它的作用是顯示這個分類器本質上是 general region-text classifier，並且可以拿來比較 closed fixed-class recognition 和 semantic VLM recognition。
 
-### split 建議
+## 檔案
 
-#### VOC 2007
+- `voc_dataset.py`：把 VOC XML annotation 轉成 region samples 和 crops。
+- `common.py`：VOC 專用的 label bank、crop、metric、visualization helper。VLM feature extraction 和 fusion 直接復用 `diagnosis_model.vl_classifier.common`。
+- `train.py`：訓練 paired、multipos、fusion、multipos+fusion 的 SigLIP/SigLIP2 checkpoint。
+- `eval.py`：評估 zero-shot model 或 finetuned checkpoint 的 VOC region classification。
+- `run_all_voc.py`：一次跑標準比較組。
 
-- train：`train`
-- valid：`val`
-- eval：`test`
+### Text Mode
 
-#### VOC 2012
+`--text_mode captions` 維持原本 VOC caption bank；`--text_mode class_name` 只用 `label_map.en` 的直接類別名稱；`--text_mode captions_plus_class_name` 會合併兩者並去除重複文字。這可用來把描述式 prompts 與常見 class-name baseline 分開比較。
+- `voc_heatmap_fixed.ipynb`：薄 notebook wrapper，只用來跑 eval、讀 summary、看 visualization。
 
-- train：`train`
-- valid：`val`
-- eval：`val`
+## 建議指令
 
-> VOC2012 的 `test` annotations 不公開，因此通常使用 `val` 做驗證與評估。
+請從 repo root 執行。
 
-## 訓練模式
+### 評估 Zero-Shot SigLIP2
 
-`train.py` 使用兩個旗標控制模式：
+```bash
+python -m diagnosis_model.vl_classifier.voc_pipeline.eval \
+  --voc_root /path/to/data \
+  --year 2007 \
+  --image_set test \
+  --output_dir diagnosis_model/vl_classifier/voc_pipeline/outputs/eval_zeroshot \
+  --model zeroshot=google/siglip2-base-patch16-224 \
+  --download
+```
 
-- baseline：不加旗標
+### 訓練單一模式
+
+```bash
+python -m diagnosis_model.vl_classifier.voc_pipeline.train \
+  --voc_root /path/to/data \
+  --year 2007 \
+  --train_image_set train \
+  --valid_image_set val \
+  --multipos --fusion \
+  --freeze_text_encoder \
+  --fusion_gate_mode scalar \
+  --output_dir diagnosis_model/vl_classifier/voc_pipeline/outputs/voc2007_multipos_fusion
+```
+
+支援模式：
+
+- paired baseline：不加 `--multipos`、不加 `--fusion`
 - multipos：`--multipos`
 - fusion：`--fusion`
 - multipos + fusion：`--multipos --fusion`
 
-### 1. baseline
+fusion gate mode 與主線 lesion classifier 一致：
+
+- `scalar`：production-style scalar context gate
+- `film`：input-conditioned per-channel gate
+- `xattn`：local query 對 whole-image patch tokens 做 cross-attention
+
+### 一次跑完整 VOC 比較
 
 ```bash
-python train.py \
-  --voc_root /path/to/data \
+python -m diagnosis_model.vl_classifier.voc_pipeline.run_all_voc \
+  --voc_root diagnosis_model/vl_classifier/voc_pipeline/data \
   --year 2007 \
-  --train_image_set train \
-  --valid_image_set val \
-  --output_dir ./voc2007_baseline
-```
+  --label_bank_json diagnosis_model/vl_classifier/voc_pipeline/voc_label_bank.json \
+  --output_root diagnosis_model/vl_classifier/voc_pipeline/outputs/voc2007_suite \
+  --freeze_text_encoder
 
-### 2. multipos
-
-```bash
-python train.py \
-  --multipos \
-  --voc_root /path/to/data \
+python -m diagnosis_model.vl_classifier.voc_pipeline.run_all_voc \
+  --voc_root diagnosis_model/vl_classifier/voc_pipeline/data \
   --year 2007 \
-  --train_image_set train \
-  --valid_image_set val \
-  --output_dir ./voc2007_multipos
+  --label_bank_json diagnosis_model/vl_classifier/voc_pipeline/voc_label_bank.json \
+  --output_root diagnosis_model/vl_classifier/voc_pipeline/outputs/voc2007_suite_class \
+  --freeze_text_encoder \
+  --text_mode class_name
 ```
 
-### 3. fusion
+完整 suite 會評估：
 
-```bash
-python train.py \
-  --fusion \
-  --voc_root /path/to/data \
-  --year 2007 \
-  --train_image_set train \
-  --valid_image_set val \
-  --output_dir ./voc2007_fusion
-```
+- `zeroshot=google/siglip2-base-patch16-224`
+- paired finetune
+- multipos finetune
+- fusion finetune
+- multipos + fusion finetune
 
-### 4. multipos + fusion
+### VOC2007 Suite Results
 
-```bash
-python train.py \
-  --multipos --fusion \
-  --voc_root /path/to/data \
-  --year 2007 \
-  --train_image_set train \
-  --valid_image_set val \
-  --output_dir ./voc2007_multipos_fusion
-```
+以下結果使用 VOC2007 test split，`--freeze_text_encoder`，`n=14976`。
 
-## 常用訓練參數
+`--text_mode captions`，輸出到 `outputs/voc2007_suite`：
 
-```bash
---model_name google/siglip2-base-patch16-224
---crop_mode bbox            # bbox 或 square
---batch_size 128
---num_epochs 10
---learning_rate 1e-4
---fusion_base_lr 3e-5
---fusion_head_lr 1e-4
---max_length 64
---num_workers 8
---skip_difficult_train
---skip_difficult_valid
---eval_test_after_train
---download
-```
+| setting | acc | macro-F1 | weighted-F1 | balanced acc |
+| --- | ---: | ---: | ---: | ---: |
+| zeroshot | 0.7595 | 0.7777 | 0.7623 | 0.8450 |
+| baseline | 0.8816 | 0.8504 | 0.8838 | 0.8682 |
+| multipos | 0.9146 | 0.8873 | 0.9147 | 0.8856 |
+| fusion | 0.9328 | 0.9167 | 0.9335 | 0.9220 |
+| multipos_fusion | 0.9403 | 0.9217 | 0.9405 | 0.9199 |
 
-### 裁切模式
+`--text_mode class_name`，輸出到 `outputs/voc2007_suite_class`：
 
-- `bbox`：直接使用 VOC bbox 裁切
-- `square`：以 bbox 為中心補成正方形，超出部分以黑底補齊
+| setting | acc | macro-F1 | weighted-F1 | balanced acc |
+| --- | ---: | ---: | ---: | ---: |
+| zeroshot | 0.7772 | 0.7882 | 0.7771 | 0.8806 |
+| baseline | 0.9209 | 0.8944 | 0.9213 | 0.8972 |
+| multipos | 0.9107 | 0.8803 | 0.9107 | 0.8737 |
+| fusion | 0.9429 | 0.9227 | 0.9433 | 0.9263 |
+| multipos_fusion | 0.9447 | 0.9282 | 0.9445 | 0.9220 |
 
-## 評估
+## 輸出
 
-`eval.py` 支援同時比較多個模型，`--model` 可重複指定，格式為：
+evaluation 會輸出：
 
-```bash
---model tag=path_or_repo
-```
-
-例如：
-
-```bash
-python eval.py \
-  --voc_root /path/to/data \
-  --year 2007 \
-  --image_set test \
-  --output_dir ./eval_voc2007 \
-  --model zeroshot=google/siglip2-base-patch16-224 \
-  --model baseline=./voc2007_baseline \
-  --model multipos=./voc2007_multipos \
-  --model fusion=./voc2007_fusion \
-  --model multipos_fusion=./voc2007_multipos_fusion \
-  --save_vis
-```
-
-### 常用評估參數
-
-```bash
---crop_mode bbox
---text_batch_size 256
---img_batch_size 64
---max_length 64
---skip_difficult
---save_vis
---download
-```
-
-### 評估輸出
-
-`eval.py` 會在 `--output_dir` 下輸出：
-
+- `summary_metrics.json`：accuracy、macro-F1、weighted-F1、balanced accuracy
+- `report_<tag>.txt` 和 `report_<tag>.json`
 - `confusion_matrix_<tag>.png`
 - `confusion_matrix_<tag>_norm.png`
-- `report_<tag>.txt`
-- `vis/`：每張圖的預測可視化結果（使用 `--save_vis` 時）
+- `vis/`：若啟用 `--save_vis`
 
-若 checkpoint 目錄內存在 `wrapper_state.pt`，評估時會自動以 fusion wrapper 載入；否則以一般 dual encoder 載入。
+## 解讀方式
 
-## 一鍵執行完整流程
+VOC 要被當成固定詞彙的 controlled benchmark。closed-set classifier 在 VOC 上比 semantic VLM 更強是合理的，這不代表魚病方法失敗。
 
-```bash
-python run_all_voc.py \
-  --voc_root /path/to/data \
-  --year 2007 \
-  --output_root ./outputs_voc2007 \
-  --download
-```
-
-這會依序執行：
-
-- baseline 訓練
-- multipos 訓練
-- fusion 訓練
-- multipos + fusion 訓練
-- 統一評估
-
-### 常用參數
-
-```bash
---model_name google/siglip2-base-patch16-224
---crop_mode bbox
---train_image_set train
---valid_image_set val
---eval_image_set test
---batch_size 128
---fusion_batch_size 64
---num_epochs 10
---learning_rate 1e-4
---base_learning_rate 3e-5
---fusion_learning_rate 1e-4
---save_vis
---skip_difficult_train
---skip_difficult_eval
---download
-```
-
-## Label Bank
-
-若未指定 `--label_bank_json`，程式會自動建立預設的 VOC label bank。
-
-格式如下：
-
-```json
-{
-  "label_map": {
-    "0": {"en": "aeroplane", "zh": "飛機"}
-  },
-  "data": {
-    "0": {
-      "captions_en": [
-        "aeroplane",
-        "an aeroplane",
-        "a photo of an aeroplane"
-      ]
-    }
-  }
-}
-```
-
-## voc_heatmap.ipynb
-
-`voc_heatmap.ipynb` 使用 VOC2012 的物件分割資料做 heatmap 檢查，流程包含：
-
-1. 讀取 VOC2012 detection annotation 與 segmentation mask
-2. 針對指定物件 bbox 產生 local crop heatmap
-3. 將 heatmap 映射回原圖座標
-4. 與對應類別的 semantic segmentation mask 比較
-5. 顯示下列指標與視覺化差異：
-   - IoU
-   - Precision
-   - Recall
-   - F1
-   - TP / FP / FN overlay
-
-注意事項：
-
-- VOC2012 提供的是 **semantic segmentation**，不是 instance segmentation
-- 因此 notebook 比較的是「該類別在 bbox 範圍內的語意遮罩」，不是單一 instance mask
-- 建議使用 `year=2012` 並搭配 `val` split 進行測試
-
-## 建議指令
-
-### VOC2007 訓練 + 測試集評估
-
-```bash
-python run_all_voc.py \
-  --voc_root /path/to/data \
-  --year 2007 \
-  --train_image_set train \
-  --valid_image_set val \
-  --eval_image_set test \
-  --output_root ./outputs_voc2007
-```
-
-### VOC2012 訓練 + 驗證集評估
-
-```bash
-python run_all_voc.py \
-  --voc_root /path/to/data \
-  --year 2012 \
-  --train_image_set train \
-  --valid_image_set val \
-  --eval_image_set val \
-  --output_root ./outputs_voc2012
-```
+魚病 pipeline 的核心主張不同：RF-DETR 先提出異常區域後，VLM stage 可以對可擴充的症狀 / 疾病文字描述打分，也可以在不替換 final classification head 的情況下評估 unseen labels。
