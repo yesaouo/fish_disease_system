@@ -73,12 +73,32 @@ def _load_labels_txt(path: Path) -> tuple[dict[int, int], list[dict]]:
     return id_map, new_categories
 
 
+def _default_detection_labels(full_categories: list[dict]) -> tuple[dict[int, int], list[dict]]:
+    """Default detection view: drop category id 0 and merge all other ids as ABNORMAL."""
+    id_map: dict[int, int] = {}
+    for category in full_categories:
+        cat_id = int(category["id"])
+        if cat_id == 0:
+            continue
+        id_map[cat_id] = 0
+    categories = [{"id": 0, "name": "ABNORMAL", "supercategory": "ABNORMAL"}]
+    return id_map, categories
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--output", type=Path, default=Path("data/processed"))
     p.add_argument("--annotation-root", type=Path, default=Path("data/annotation"))
-    p.add_argument("--symptoms-json", type=Path, default=Path("data/raw/symptoms.json"))
-    p.add_argument("--labels-txt", type=Path, default=Path("data/raw/labels.txt"))
+    p.add_argument("--symptoms-json", type=Path, default=Path("data/annotation/symptoms.json"))
+    p.add_argument(
+        "--labels-txt",
+        type=Path,
+        default=None,
+        help=(
+            "Optional labels.txt override. By default, detection view filters category id 0 "
+            "and maps every other symptoms.json category id to ABNORMAL."
+        ),
+    )
     p.add_argument("--version-tag", default=None)
     p.add_argument("--split-ratios", type=float, nargs=3, default=[8, 1, 1], metavar=("TRAIN", "VALID", "TEST"))
     p.add_argument("--strict-categories", action="store_true")
@@ -137,13 +157,20 @@ def main() -> int:
 
     if not args.symptoms_json.is_file():
         sys.exit(f"symptoms.json not found: {args.symptoms_json}")
-    if not args.labels_txt.is_file():
+    if args.labels_txt is not None and not args.labels_txt.is_file():
         sys.exit(f"labels.txt not found: {args.labels_txt}")
     if not args.annotation_root.is_dir():
         sys.exit(f"annotation root not found: {args.annotation_root}")
 
     full_categories, name_to_cat_id = _load_symptoms(args.symptoms_json)
-    labels_id_map, detection_categories = _load_labels_txt(args.labels_txt)
+    if args.labels_txt is not None:
+        labels_id_map, detection_categories = _load_labels_txt(args.labels_txt)
+        labels_sha = sha256_file(args.labels_txt)
+        detection_label_mode = "labels_txt"
+    else:
+        labels_id_map, detection_categories = _default_detection_labels(full_categories)
+        labels_sha = None
+        detection_label_mode = "auto_abnormal_except_id0"
 
     sources = find_datasets(args.annotation_root)
     if not sources:
@@ -177,7 +204,8 @@ def main() -> int:
             command=" ".join(sys.argv),
             sources=[],
             symptoms_sha=sha256_file(args.symptoms_json),
-            labels_sha=sha256_file(args.labels_txt),
+            labels_sha=labels_sha,
+            detection_label_mode=detection_label_mode,
             split_ratios=args.split_ratios,
             strict_categories=True,
             require_submit=args.require_submit,
@@ -193,7 +221,8 @@ def main() -> int:
 
     version_dir.mkdir(parents=True, exist_ok=False)
     shutil.copy2(args.symptoms_json, version_dir / "symptoms.json")
-    shutil.copy2(args.labels_txt, version_dir / "labels.txt")
+    if args.labels_txt is not None:
+        shutil.copy2(args.labels_txt, version_dir / "labels.txt")
 
     registry = ImageRegistry.load(output_root / "image_registry.json")
     first_new_id: int | None = None
@@ -262,7 +291,8 @@ def main() -> int:
         command=" ".join(sys.argv),
         sources=sources_meta,
         symptoms_sha=sha256_file(args.symptoms_json),
-        labels_sha=sha256_file(args.labels_txt),
+        labels_sha=labels_sha,
+        detection_label_mode=detection_label_mode,
         split_ratios=args.split_ratios,
         strict_categories=args.strict_categories,
         require_submit=args.require_submit,

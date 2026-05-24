@@ -16,13 +16,15 @@ $PY -m dataset_pipeline.db_pipeline.build
 $PY -m dataset_pipeline.db_pipeline.build \
     --output data/processed \                 # 預設
     --annotation-root data/annotation \       # 預設
-    --symptoms-json data/raw/symptoms.json \  # 預設
-    --labels-txt data/raw/labels.txt \        # 預設
+    --symptoms-json data/annotation/symptoms.json \  # 預設
+    [--labels-txt data/raw/labels.txt] \      # optional override
     --split-ratios 8 1 1 \                    # 預設
     --version-tag v_paper_camera_ready \      # 預設用 YYYY-MM-DD_HHMM
     [--strict-categories] \
     [--require-submit | --require-expert-submit]
 ```
+
+預設不讀 `labels.txt`：`detection/` view 會排除 `symptoms.json` 內 `id=0` 的類別，並把其他所有類別合併成單一 `ABNORMAL`（COCO `category_id=0`）。只有需要自訂 detection 類別空間時才傳 `--labels-txt`。
 
 ## 輸出結構
 
@@ -33,7 +35,7 @@ data/processed/
   2026-05-17_1430/
     MANIFEST.json                  ← 版本元資料 + filter stats
     symptoms.json                  ← snapshot
-    labels.txt                     ← snapshot
+    labels.txt                     ← 只有傳入 --labels-txt 時才會 snapshot
     image_index.json               ← 本版本實際包含的 image ID（依 split 分組）
     category_diff.txt              ← 只在有 unknown label 或 --strict 時寫出
     full/{train,valid,test}/
@@ -41,7 +43,7 @@ data/processed/
       _annotations.coco.json       ← symptoms.json 完整類別空間
     detection/{train,valid,test}/
       <id>.jpg                     ← symlink 到 ../../full/<split>/<id>.jpg
-      _annotations.coco.json       ← labels.txt 重編號後的類別
+      _annotations.coco.json       ← 預設排除 id=0，其餘全併為 ABNORMAL；或依 --labels-txt 重編號
 ```
 
 ## Filter 規則（順序）

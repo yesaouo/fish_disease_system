@@ -33,7 +33,8 @@ def write_manifest(
     command: str,
     sources: list[dict],
     symptoms_sha: str,
-    labels_sha: str,
+    labels_sha: str | None,
+    detection_label_mode: str,
     split_ratios: list,
     strict_categories: bool,
     require_submit: bool,
@@ -53,6 +54,7 @@ def write_manifest(
         "config": {
             "symptoms_json_sha256": symptoms_sha,
             "labels_txt_sha256": labels_sha,
+            "detection_label_mode": detection_label_mode,
             "split_ratios": split_ratios,
             "strict_categories": strict_categories,
             "require_submit": require_submit,
