@@ -88,7 +88,7 @@ def main():
     ap.add_argument("--top_k_cases", type=int, default=20)
     ap.add_argument("--alpha_global", type=float, default=0.25)
     ap.add_argument("--beta_lesion", type=float, default=0.75)
-    ap.add_argument("--lesion_match", type=str, default="hungarian")
+    ap.add_argument("--lesion_match", type=str, default="max_mean")
     ap.add_argument("--diversify_threshold", type=float, default=0.95)
     ap.add_argument("--text_kind", type=str, default="medical")
     ap.add_argument("--gamma", type=float, default=0.5,

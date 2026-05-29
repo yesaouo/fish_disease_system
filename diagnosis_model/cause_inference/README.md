@@ -232,7 +232,7 @@ $PY -m diagnosis_model.cause_inference.preprocessing.recluster_causes baseline \
 
 1. 跟所有 train case 算組合相似度
    - `sim(q, c) = α · cos(q.global, c.global) + β · lesion-set cosine`
-   - 預設 α=0.25, β=0.75；lesion-set 預設 hungarian matching
+   - 預設 α=0.25, β=0.75；lesion-set 預設 **max_mean** matching（2026-05-26 從 hungarian 翻成 max_mean，向量化 GPU `scatter_reduce`、~90× 快；fish 上 R@K/MRR 全部 |Δ| ≤ 0.5pp 且 max_mean 微勝，見 [ablations/lesion_match_ranking_equiv](ablations/lesion_match_ranking_equiv.py)；hungarian 只在重現 paper 舊數字或 train bank ≤ ~10k 時用）
 2. 取 sim > 0 的 top-K cases（預設 K=20），權重 sum-to-1 標準化
 3. 候選池 = 這 K 個 case 的去重病因（~87 個候選）
 4. 候選打分（embedding-space）：
@@ -246,7 +246,7 @@ $PY -m diagnosis_model.cause_inference.phase1_baseline \
   --output_dir outputs/phase1_final \
   --top_k_cases 20 --alpha_global 0.25 --beta_lesion 0.75 \
   --diversify_threshold 0.95 --semantic_threshold 0.95 \
-  --lesion_match hungarian \
+  --lesion_match max_mean \
   --cluster_json outputs/cause_clusters_llm.json
 ```
 
@@ -295,8 +295,10 @@ $PY -m diagnosis_model.cause_inference.phase1_baseline \
   --output_dir outputs/phase1_raw \
   --cluster_json outputs/cause_clusters_llm.json \
   --top_k_cases 20 --alpha_global 0.25 --beta_lesion 0.75 \
-  --lesion_match hungarian --diversify_threshold 0.95 --semantic_threshold 0.95
+  --lesion_match max_mean --diversify_threshold 0.95 --semantic_threshold 0.95
 ```
+
+> 註：下方表中 hungarian 標的數字是 paper 報的原值（4.4% sem R@10）；2026-05-26 之後 default 為 max_mean，max_mean 在同樣 case_db_raw 上 sem R@10 = **46.05%**（hungarian = 45.62%），全 metric |Δ| ≤ 0.5pp 且 max_mean 微勝（見 [ablations/lesion_match_ranking_equiv/metrics.json](outputs/ablations/lesion_match_ranking_equiv/metrics.json)）。
 
 **結果（1573 valid，LLM 466 cluster）：**
 
@@ -922,6 +924,23 @@ compressed residual reranker 預測 Δ；`loss = listwise_KL(s_final, s_dense) +
 → 拆掉 buffer 後壓縮**真傷**（6144× dense → RVQ-only −14.8 pp sem R@10），compressed residual reranker **真救**（M4K256 +2.6 pp 回到接近 dense、回收率 ~79% 與 retrieval-only proxy 吻合；M1K16 +2.9 pp sem / +2.3 pp cl）。**這就是 compressed residual reranker 唯一的 niche：buffer-free 部署，不是 FaCE-R 的 production cascade。**
 
 > **讀法**：production（Regime A）壓縮免費、residual correction 多餘；buffer-free（Regime B）壓縮傷、compressed residual reranker 有效。reranker 的價值**完全條件於 aggregation buffer 缺席**。本文據此把 reranker 定位成 buffer-free 部署的 conditional fallback，不是 production 方法。caveat：Regime A 的 <1 pp 差異都在 noise（SE ~1.26 pp）內——「在 noise 內」正是 free-lunch 的證據；Regime B 的 15 pp 損害與 2–3 pp 回收都在 noise 之上。
+
+#### 結果 — 端到端 CEAH 主張（cross-dataset：DDXPlus）
+
+fish 的端到端在 production（γ=0，純 CEAH）下 reranker 多餘。DDXPlus 是 **coarse-dominant 的 γ=0.75** production 點，所以我們掃 γ 並經 CEAH 重打分，看 reranker 在「CEAH 丟掉 coarse 順序」與「CEAH 吃進 coarse 順序」兩種 regime 各自的端到端影響。腳本 [ddxplus/eval_ceah_compressed.py](ddxplus/eval_ceah_compressed.py)（fish `eval_ceah_compressed.py` 的 DDXPlus 版），M4K256 768×、5000 valid、`text_kind=none`。
+
+| γ | dense | rvq_only | **light** | full（oracle） | 讀法 |
+|---|---|---|---|---|---|
+| 0.00（純 CEAH） | 0.878 | 0.876 | 0.877 | 0.876 | **壓縮全隱形**，dense/rvq/light/oracle 全塌成同值（±0.16 pp noise）——CEAH 重打分把 coarse 順序丟掉，reranker 修的東西不存在 |
+| 0.50 | 0.954 | 0.971 | 0.966 | 0.966 | |
+| **0.75（production）** | 0.954 | **0.981** | 0.974 | 0.973 | rvq_only **贏 dense +2.7 pp**；light **拖回 −0.7 pp**；**oracle 也 −0.9 pp** |
+| 1.00（純 Phase1） | 0.525 | 0.666 | 0.604 | 0.627 | rvq_only +14 pp；light −6.2 pp |
+
+（pathology R@1。soft DDX NDCG@5 在 γ=0.75 reranker 給 +0.5 pp（0.826→0.831），量級小、嚴格 pathology metric 主導。）
+
+→ **DDXPlus 端到端兩個 γ regime 各自獨立地殺掉 reranker，機制不同**：(A) γ=0 純 CEAH 把 coarse 順序丟掉，壓縮與 reranker 全隱形；(B) γ=0.75 coarse 主導時，RVQ 是 **implicit regularizer**（rvq_only 贏 dense），reranker 學 `Δ≈qᵀe` 把分數**拉回較差的 dense**，所以有害——**連 full analytic oracle（完美 Δ）都 −0.9 pp**，徹底排除架構問題。
+
+> **Cross-dataset 收斂**：reranker 修的量 = 「回補 dense case 排序」。fish production（γ=0）下被 aggregation buffer + CEAH 丟順序吃光 → 多餘；DDXPlus production（γ=0.75）下 dense 本身比 RVQ 差 → 回補 dense 即有害。**兩個資料集、兩種機制、同一結論：reranker 在 production cascade 永遠不幫忙，唯一 niche 是 buffer-free single-case 部署。** 架構非瓶頸（oracle 印證），故定位為設計空間對照點，production 不掛。
 
 #### 結果 — RVQ 壓縮率 sweep（retrieval-side proxy，Regime A, top_k_cases=20, 1573 valid）
 

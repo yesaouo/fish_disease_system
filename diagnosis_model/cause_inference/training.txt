@@ -186,14 +186,14 @@ python train.py \
 為每個 train case 用 leave-one-out retrieval 預先建立 candidate pool 與 hard
 negatives。輸出 train_candidate_pool.pt（一次性，~3 分鐘）。
 
-最佳參數: K=20, α=0.25, β=0.75, hungarian, semantic_threshold=0.95
+最佳參數: K=20, α=0.25, β=0.75, max_mean (default 2026-05-26+), semantic_threshold=0.95
 
 /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.build_train_candidate_pool \
   --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
   --output_path diagnosis_model/cause_inference/outputs/case_db/train_candidate_pool.pt \
   --top_k_cases 20 \
   --alpha_global 0.25 --beta_lesion 0.75 \
-  --lesion_match hungarian \
+  --lesion_match max_mean \
   --semantic_threshold 0.95
 
 ================================================================================
@@ -264,6 +264,10 @@ CC=/usr/bin/gcc-12。
 為 12780 個 train case 之間預算 full pairwise Phase 1 hungarian score，作為
 listwise KL distillation 的監督信號。
 輸出：teacher_train_train.pt（~312 MB fp16，gitignored）
+
+註：build_teacher_table.py 的 --lesion_match default 2026-05-26 起為 max_mean
+（跟 phase1_baseline 一致），但下方仍顯式傳 hungarian 以保持 paper-reported
+Phase 3 distillation 數字可重現（既有 teacher_train_train.pt 就是 hungarian 版）。
 
 /home/lab603/anaconda3/envs/SDM/bin/python \
   -m diagnosis_model.cause_inference.preprocessing.build_teacher_table \

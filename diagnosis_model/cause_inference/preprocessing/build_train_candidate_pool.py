@@ -36,8 +36,9 @@ import torch.nn.functional as F
 from diagnosis_model.cause_inference.phase1_baseline import (
     build_candidate_pool,
     compute_case_similarities,
+    load_train_bank,
+    offsets_to_case_ids,
     select_positive_top_cases,
-    stack_train_lesions,
 )
 
 
@@ -48,45 +49,76 @@ def main():
     ap.add_argument("--top_k_cases", type=int, default=20)
     ap.add_argument("--alpha_global", type=float, default=0.25)
     ap.add_argument("--beta_lesion", type=float, default=0.75)
-    ap.add_argument("--lesion_match", type=str, default="hungarian",
-                    choices=["hungarian", "max_mean"])
+    ap.add_argument("--lesion_match", type=str, default="max_mean",
+                    choices=["hungarian", "max_mean", "max_mean_normalized"])
     ap.add_argument("--semantic_threshold", type=float, default=0.95)
+    ap.add_argument("--bank_dtype", type=str, default="fp32",
+                    choices=["fp32", "fp16", "bf16"],
+                    help="On-device storage dtype of the train bank. Default "
+                         "'fp32' preserves the historic fish workflow; pass "
+                         "'bf16' for DDXPlus (1M-case bank in fp32 is ~60 GB "
+                         "lesion stack and won't fit on a 32 GB GPU).")
+    ap.add_argument("--max_train_cases", type=int, default=0,
+                    help="Cap on retained train-bank cases via uniform random "
+                         "per-shard subsampling. Applies to BOTH the bank and "
+                         "the query set (LOO requires query[i] == bank[i]). "
+                         "Default 0 = full bank (correct for fish 12,780-case "
+                         "case_dbs). For DDXPlus pass 200000 — the full 1M bank "
+                         "requires ~75 GB CPU RAM in load_cases (fp32 upcast of "
+                         "all per-case fields) AND ~30 GB GPU bf16 lesion stack, "
+                         "neither of which fits on a 62 GB / 32 GB machine. "
+                         "200k × top_k=20 = 4M (q, retrieved_case) pairs leaves "
+                         "~4k cases per of 49 DDXPlus conditions for CEAH training.")
+    ap.add_argument("--sample_seed", type=int, default=42)
     ap.add_argument("--device", type=str,
                     default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+
+    bank_dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+    bank_dtype = bank_dtype_map[args.bank_dtype]
+    max_train_cases = args.max_train_cases if args.max_train_cases > 0 else None
 
     out_path = Path(args.output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     device = args.device
 
     case_db_dir = Path(args.case_db_dir)
-    train_cases = torch.load(case_db_dir / "train_cases.pt", weights_only=False)
     cause_pack = torch.load(case_db_dir / "cause_text_embs.pt", weights_only=False)
     # Match phase1_baseline.py: explicitly L2-normalize so dot products are cosine.
-    cause_table_embs = F.normalize(cause_pack["embeddings"].to(device), dim=-1)
-    print(f"[load] train={len(train_cases)}  causes={cause_table_embs.size(0)}")
+    # .float() upcasts DDXPlus bf16/fp16 storage; no-op for fp32 fish builds.
+    cause_table_embs = F.normalize(cause_pack["embeddings"].to(device).float(), dim=-1)
 
-    train_global_stack = F.normalize(
-        torch.stack([c["global_emb"] for c in train_cases]).to(device), dim=-1,
+    # Load bank with subsample + bf16 storage. ``train_cases`` contains
+    # ``cause_emb_indices`` / ``causes`` per case; query embeddings are pulled
+    # from train_global_stack / train_lesion_stack directly (already L2-normalized,
+    # already on device in bank_dtype) — no second CPU pass needed.
+    train_cases, train_global_stack, train_lesion_stack, train_offsets = load_train_bank(
+        case_db_dir, device,
+        bank_dtype=bank_dtype,
+        max_cases=max_train_cases, sample_seed=args.sample_seed,
     )
-    train_lesion_stack, train_offsets = stack_train_lesions(train_cases)
-    train_lesion_stack = F.normalize(train_lesion_stack.to(device), dim=-1)
+    n = len(train_cases)
+    print(f"[load] train={n}  causes={cause_table_embs.size(0)}  "
+          f"bank_dtype={train_global_stack.dtype}")
     print(f"[stack] global={tuple(train_global_stack.shape)}  "
           f"lesions={tuple(train_lesion_stack.shape)}")
 
     case_pool: List[dict] = []
-    n = len(train_cases)
+    train_case_ids = offsets_to_case_ids(train_offsets, train_lesion_stack.device)
     t0 = time.time()
 
     for qi, q in enumerate(train_cases):
-        q_global = F.normalize(q["global_emb"].to(device), dim=-1)
-        q_lesions = F.normalize(q["lesion_embs"].to(device), dim=-1)
+        # Pull query embeddings from the already-normalized bank — avoids
+        # holding a parallel CPU copy of every case's emb fields.
+        q_global = train_global_stack[qi]
+        q_lesions = train_lesion_stack[train_offsets[qi]:train_offsets[qi + 1]]
 
         sims = compute_case_similarities(
             q_global, q_lesions,
             train_global_stack, train_lesion_stack, train_offsets,
             args.alpha_global, args.beta_lesion,
             lesion_match=args.lesion_match,
+            train_case_ids=train_case_ids,
         )
         sims[qi] = -np.inf  # leave-one-out: exclude self (filtered by select_positive_top_cases)
 
@@ -106,7 +138,18 @@ def main():
 
         cand_idx_t = torch.tensor(candidate_indices, device=device, dtype=torch.long)
         cand_embs = cause_table_embs.index_select(0, cand_idx_t)         # [P, D]
-        gt_idx = q["cause_emb_indices"]
+        # CEAH positive_mask uses the STRICT pathology GT (not the expanded
+        # cause_emb_indices which now includes DDX alternatives), so CEAH
+        # learns to discriminate pathology from DDX-alternatives-and-other-
+        # conditions — the hardest decision boundary. DDX alternatives in the
+        # pool become hard negatives. Fish builds without pathology_emb_idx
+        # fall back to cause_emb_indices (fish has always treated all GT
+        # causes as strict positives).
+        pidx = q.get("pathology_emb_idx")
+        if pidx is not None:
+            gt_idx = [int(pidx)]
+        else:
+            gt_idx = list(q["cause_emb_indices"])
         gt_idx_t = torch.tensor(gt_idx, device=device, dtype=torch.long)
         gt_embs = cause_table_embs.index_select(0, gt_idx_t)             # [G, D]
 

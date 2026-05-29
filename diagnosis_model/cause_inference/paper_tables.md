@@ -14,7 +14,8 @@
 > ```
 >
 > 詳細逐節說明見 [README.md](README.md)；逐指令記錄見 [inference.txt](inference.txt) / [training.txt](training.txt)。
-> 全部 1573 valid queries、cluster 用 `cause_clusters_llm.json`（466 topics）除非另註。
+> A–F 表均跑在 fish 1573 valid queries、cluster 用 `cause_clusters_llm.json`（466 topics）除非另註。
+> **G 表為 DDXPlus 跨域驗證**（200k bank × 132,448 valid，metric 改 pathology R@K + DDX NDCG）—— 詳見 G 章節導言與 [ddxplus/README.md](ddxplus/README.md)。
 
 ---
 
@@ -88,6 +89,12 @@ for db in case_db case_db_raw; do
     --lesion_match hungarian --diversify_threshold 0.95 --semantic_threshold 0.95
 done
 ```
+
+> Note: 上表數字是 `lesion_match=hungarian` 的歷史 paper 值，所以命令顯式傳
+> `--lesion_match hungarian`。2026-05-26 起 phase1_baseline default 為 `max_mean`
+> （向量化 GPU、~90× 快，fish 上 R@K/MRR 全 |Δ| ≤ 0.5pp 且 max_mean 微勝；
+> 詳見 [ablations/lesion_match_ranking_equiv](../ablations/lesion_match_ranking_equiv.py)
+> + Table M.1 ranking-equivalence ablation）。
 
 ### Table B2 — Phase 2 CEAH faithfulness：fine-tuned vs raw case_db（反轉）
 
@@ -653,4 +660,162 @@ cd diagnosis_model/vl_classifier && python train.py \
 cd /mnt/ssd/YJ/fish_disease_system
 # 用 CLSC/LSCFT ckpt 各自 build_case_database --vlm_lesion <ckpt> → case_db_<tag>/
 # 再對每個 case_db 跑 faithfulness_eval（同 Table C3/C4 指令，改 --case_db_dir）
+```
+
+---
+
+## G. DDXPlus 跨域驗證
+
+DDXPlus 是 FaCE-R 跨域擴展：把魚的視覺 lesion 替換成 49-class clinical evidence tokens，整套 framework 原封不動套用。**Phase 1 / Phase 2 (CEAH) 數字**見 [`ddxplus/README.md`](ddxplus/README.md) v2 schema 段落（pathology R@1 53.83% / γ=0.75 CEAH 95.64% / DDX NDCG@5 0.853 / no_top_evidence drop +80×）。本章節聚焦 Phase 3/4 跨域結果及 ABQ 在 DDXPlus 上展現的**第二個面向**——同一 absorption framework 在不同資料集呈現「免費壓縮」與「implicit regularizer」兩種角色。
+
+所有 G 表均跑在 `--max_train_cases 200000 --sample_seed 42` 子採樣 bank × full 132,448 valid，top_k_cases=20。
+
+> **為何 G 表的 ranking metric 與 fish (A–F) 不同 —— cause-ranking 機制相同、評估指標隨 GT 結構而變。** DDXPlus 與 fish 都用同一條病因排序流程（`build_candidate_pool → score_candidates → argsort`，呼叫同一個 `score_candidates`）；差異純粹在報哪些 metric，因兩資料集的 GT 結構不同：
+>
+> | Metric | Fish (A–F) | DDXPlus (G) | 原因 |
+> |---|---|---|---|
+> | exact / **pathology R@K** | exact 幾乎全 miss（56k free-text 病因，94.7% singleton，GT 字串獨一無二） | **pathology R@K**（嚴格 49-class index 命中） | DDXPlus 49 離散 pathology 有確定 string→emb，exact-index 比對乾淨且嚴格 |
+> | **semantic R@K** (cos≥0.95) | ✅ 主指標（放寬 exact 才有可比性） | ❌ 不報 | 49 離散類不需 cosine 放寬；pathology R@K 已扮演 fish semantic R@K 的角色 |
+> | **cluster R@K** (LLM/HDBSCAN 466/100 topics) | ✅ 主指標（把 56k singleton 歸群才可排） | ❌ 不報 | 49-class taxonomy 本身即乾淨語意單位，再 cluster 會退化（每類自成一群，cluster R@K ≡ pathology R@K） |
+> | **DDX NDCG@K** (graded relevance) | ❌ 無（GT 為 binary） | ✅ 主指標 | DDXPlus 提供帶機率的 DIFFERENTIAL_DIAGNOSIS，可對 graded 排序算 NDCG —— 比 fish 的 binary cluster membership 更豐富的病因排序評估 |
+>
+> 一句話：fish 的三層放寬式排序（exact/semantic/cluster）是被 56k singleton free-text 逼出來的補救；DDXPlus GT 乾淨，排序評估反而更直接（pathology exact-index）也更嚴格，並用 DDX NDCG 取代 cluster 做 graded 排序。
+
+### Table G1 — Phase 3 encoder on DDXPlus（與 Phase 1 同等品質、~100× 加速）
+
+| Method | path R@1 | path R@5 | path R@10 | NDCG@5 | pool mean | per-q latency |
+|---|---:|---:|---:|---:|---:|---:|
+| Phase 1 (`α·cos(g) + β·max_mean(L)`) | 53.83% | 93.92% | 98.52% | 0.824 | 16.34 | ~63 ms |
+| **Phase 3 DeepSets dual-target** | **52.98%** | **94.58%** | **98.16%** | **0.827** | **16.15** | **~0.6 ms** |
+
+> Phase 3 single-vec encoder matches Phase 1's explicit lesion-aware scoring within 0.85 pp R@1 (within bf16 / subsample noise) and edges out on R@5 and NDCG@5. Cosine retrieval is ~100× faster than Hungarian/max_mean over the lesion stack — this is the deployable coarse path.
+
+> Training rationale (`--temp_target 0.05 --infonce_positives pathology` vs the fish-style defaults that under-fit on DDXPlus by ~25 pp R@1) is in [ddxplus/README.md §"Phase 3 training rationale: harder teacher target"](ddxplus/README.md). **取得指令** also lives there to keep this table clean.
+
+### Table G2 — Phase 4 ABQ on DDXPlus（倒 U 型 absorption, 200k bank × full 132k valid）
+
+| RVQ config | 壓縮 | Method | path R@1 | path R@5 | path R@10 | MRR | NDCG@5 | pool | Δ R@1 vs dense |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| Dense fp32 | 1× | reference | 52.98% | 94.58% | 98.16% | 0.7086 | 0.8274 | 16.15 | — |
+| M=4 K=256 | 768× | rvq_only | 67.19% | 97.86% | 99.35% | 0.8096 | 0.8027 | 17.28 | **+14.21 pp** |
+| | | + Light rerank | 60.48% | 97.25% | 98.91% | 0.7696 | 0.8064 | 17.07 | +7.50 pp |
+| | | full_analytic | 62.48% | 97.62% | 99.00% | 0.7837 | 0.8090 | 17.15 | +9.50 pp |
+| **M=2 K=64** | **2048×** | **rvq_only** ⭐ | **76.11%** | **99.55%** | **99.85%** | **0.8671** | 0.7959 | 17.55 | **+23.13 pp** |
+| | | full_analytic | 71.41% | 98.51% | 99.80% | 0.8377 | 0.8040 | 17.38 | +18.43 pp |
+| M=1 K=16 | 6144× | rvq_only | 23.53% | 49.47% | 66.78% | 0.3623 | 0.4755 | 25.36 | −29.45 pp |
+| | | full_analytic | 47.24% | 76.75% | 84.35% | 0.6027 | 0.6346 | 22.02 | −5.74 pp |
+
+> **Sweet spot 在 M=2 K=64 (2048× 壓縮)**：rvq_only 比 dense 高 +23.13 pp path R@1、MRR +0.158。768× 壓縮 +14.2 pp、6144× 翻成 −29.5 pp，呈乾淨的倒 U 型。**這個 +23 pp 不是 sample noise**：5K subsample 5,000 query 的對應 Δ = +23.14 pp，full 132k vs 5K 差 0.01 pp，遠小於效應本身。
+
+> **DDX NDCG@5 略傷**（dense 0.827 → M2K64 rvq_only 0.796, −0.031）—— RVQ 把 pathology Top-1 推高、犧牲 DDX 細粒度排序。consistent 物理意義：codebook prototype ≈ condition manifold center，pull z 回 condition centroid 等於 sharpens pathology, blurs DDX。
+
+> **full_analytic 落在 dense 和 rvq_only 之間**：top-50 用 q·e 解析重排（理論上等價 dense 重排 top-K），驗證 rvq_only 的高 R@1 不是 reranker 引入的；codebook 本身就把 +23 pp 帶進來。
+
+> **Light reranker 在 DDXPlus 上反向有害**（M=4 K=256 只在 768× 列出一行 ablation；M=2/M=1 不額外訓，已從 v1 結果與 framework 預測得知）：reranker 訓練目標是 `Δ ≈ q·e` → 把 rvq_only 推回 dense ranking。Fish 上 dense ≥ rvq_only 所以 reranker 把 RVQ 損害補回 dense（**「buffer-free deployment 唯一 niche」見 D5/[project_phase4_ceah_endtoend](../../../memory/project_phase4_ceah_endtoend.md)**）。DDXPlus 上 rvq_only > dense（implicit regularization sweet spot），reranker 預測「拉回 dense」反而把 R@1 從 67.19% 拉回 60.48%（−6.71 pp）、MRR 從 0.8096 拉到 0.7696。再次驗證 **reranker = buffer-free deployment ablation, not production component**。
+
+**取得指令：**
+```bash
+# 1. fit 3 個 RVQ codebook（每個 ~1 min）
+for MK in "4 256" "2 64" "1 16"; do
+  M=$(echo $MK | cut -d' ' -f1); K=$(echo $MK | cut -d' ' -f2)
+  $PY -m diagnosis_model.cause_inference.rvq_rerank.fit_rvq \
+    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+    --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
+    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2 \
+    --M $M --K $K --max_train_cases 200000 --sample_seed 42
+done
+
+# 2. eval 3 個 (M, K) 全 valid（每個 ~10 min；dense + rvq_only + full_analytic）
+for MK_DIR in "M4_K256" "M2_K64" "M1_K16"; do
+  $PY -m diagnosis_model.cause_inference.ddxplus.eval_phase4 \
+    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+    --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_$MK_DIR \
+    --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
+    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_v2_full_$MK_DIR \
+    --methods dense rvq_only full_analytic \
+    --max_train_cases 200000 --sample_seed 42 --max_query_cases -1
+done
+
+# 3. (optional, M=4 K=256 only) Light reranker ablation row — confirms
+#    reranker pulls rvq_only back toward suboptimal dense (~30 min train + 10 min eval)
+$PY -m diagnosis_model.cause_inference.rvq_rerank.train_reranker \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+  --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
+  --rvq_M 4 --rvq_K 256 \
+  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_M4_K256 \
+  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/reranker_M4_K256_light \
+  --variant light --K_top 50 --batch_size 64 --epochs 30 \
+  --max_train_cases 200000 --max_valid_cases 5000 --sample_seed 42 \
+  --eval_top_k_cases 1
+$PY -m diagnosis_model.cause_inference.ddxplus.eval_phase4 \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_M4_K256 \
+  --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/reranker_M4_K256_light/best.pt \
+  --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
+  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_v2_full_M4_K256_with_light \
+  --methods dense rvq_only light full_analytic \
+  --max_train_cases 200000 --sample_seed 42 --max_query_cases -1 \
+  --top_k_cases 20 --K_top 50
+```
+
+### Table G3 — Cross-domain ABQ absorption：fish 平坦 vs DDXPlus 倒 U 型
+
+兩個資料集均跑 top_k_cases=20、relevant retrieval metric 報 `Δ vs dense`（fish 報 sem R@10，DDXPlus 報 pathology R@1）。
+
+| (M, K) | 壓縮 | Fish dense | Fish rvq | **Fish Δ** | DDXPlus dense | DDXPlus rvq | **DDXPlus Δ** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| (none) | 1× | 44.72% (R@10) | — | — | 52.98% (R@1) | — | — |
+| M=4 K=256 | 768× | 44.72% | 45.48% | **+0.76 pp** | 52.98% | 67.19% | **+14.21 pp** |
+| M=2 K=64 | 2048× | 44.72% | 43.51% | **−1.21 pp** | 52.98% | 76.11% | **+23.13 pp** ⭐ |
+| M=1 K=16 | 6144× | 44.72% | 43.92% | −0.80 pp | 52.98% | 23.53% | −29.45 pp |
+
+> **Fish 完全平坦**（三點全在 ±1.2 pp 內），對應「lossless regime」：aggregation buffer (top_k=20) 把 codebook quantization 噪音完全吸收。RVQ 在 production 域是免費的壓縮。
+
+> **DDXPlus 倒 U 型**：在 mild-to-moderate 壓縮帶（768×, 2048×）顯著正向 +14 / +23 pp，6144× 翻負 −29 pp。對應「regularization regime」：49-class structured taxonomy 形成天然 condition manifold，**RVQ codebook K=64 個 prototype ≈ 49 conditions 中心點**，pull z 回 prototype = sharpens pathology Top-1。過頭（K=16）prototype < condition 數，info loss 主導。
+
+> Figure：[outputs/abq_crossdomain_absorption.png](outputs/abq_crossdomain_absorption.png)（fish 藍線平坦在 0 / DDXPlus 紅線倒 U）。
+
+### Table G4 — Two-faceted ABQ framework（理論 framing）
+
+ABQ scaling law `D ≈ c·ε^p/K^q`（魚側 fit 在 Table D7）描述 quantization error ε 經 aggregation buffer 吸收後的殘留 damage D。DDXPlus 結果顯示 ABQ 不只是「補償壓縮」、可以「ADD signal」。
+
+| Regime | 觸發條件 | Fish 行為 | DDXPlus 行為 | 機制 |
+|---|---|---|---|---|
+| **Lossless** | encoder 已校準 + buffer 足 | 三個 (M,K) 全 ≈0 pp | 不進入此 regime | aggregation 完全吸收量化噪音 |
+| **Regularization** | over-fit headroom + structured taxonomy | 不進入（well-calibrated） | M4K256 / M2K64 高 +14/+23 pp | codebook prototype ≈ class manifold center, ADD signal |
+| **Info-loss** | K ≪ effective class count | 6144× 仍未撞 | M1K16 −29 pp（K=16 < 49 classes） | prototype < condition 數，分辨力崩潰 |
+
+> **論文 framing 要點**：DDXPlus 揭示 ABQ 的第二面向不是 Phase 4 設計的副作用，而是 absorption framework 的 corollary —— 當 (a) encoder 對 task taxonomy 有 residual over-fit、(b) codebook resolution 與 class count 有合理 ratio，aggregation buffer 容納的不只是「噪音」，而是「對齊 manifold 的 useful denoising」。Fish 沒展現此面向因為 Phase 3 v2-style harder teacher 已把 over-fit 收掉。
+
+**取得指令：**fish 的 Δ 數字來自既有 `outputs/rvq_rerank/final_eval_report.json`（Table D3）；DDXPlus 來自 G2。Figure 由 `outputs/abq_crossdomain_absorption.png` 重繪。
+
+### Table G5 — Reproducibility：5K subsample vs full 132k
+
+確認 sweet spot 與整體形狀不是 5K subsample 變異。
+
+| (M, K) | 5K Δ R@1 | full Δ R@1 | \|Δ\| sample variance |
+|---|---:|---:|---:|
+| M=4 K=256 | +14.04 pp | +14.21 pp | 0.17 pp |
+| **M=2 K=64** | **+23.14 pp** | **+23.13 pp** | **0.01 pp** ⭐ |
+| M=1 K=16 | −28.90 pp | −29.45 pp | 0.55 pp |
+
+> 5K subsample 的 +23.14 跟 full 132k 的 +23.13 在小數第二位才偏差，subsample variance ≤ 0.55 pp ≪ effect size 14-29 pp。整個倒 U 型在統計上 robust。
+
+### 未來工作（B：absorption surface scaling-law fit）
+
+目前 G2/G3 只掃 3 點 (M, K)，足以辨識倒 U 型 + sweet spot；要完整擬合 DDXPlus 上的 scaling law `D ≈ c·ε^p/K^q`（如 Table D7 fish 版本），需擴掃 M={1,2,4,8} × K={16,64,256,1024} 共 16 點。預估 ~2 hr。Reviewer 通常會問 scaling law fit，建議 camera-ready 前補。
+
+**取得指令草稿：**
+```bash
+for M in 1 2 4 8; do
+  for K in 16 64 256 1024; do
+    $PY -m diagnosis_model.cause_inference.rvq_rerank.fit_rvq \
+      --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+      --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
+      --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2 \
+      --M $M --K $K --max_train_cases 200000 --sample_seed 42
+  done
+done
+# 之後寫 ddxplus/eval_absorption_surface.py（複用 rvq_rerank/eval_absorption_surface.py
+# 邏輯，但 metric 改 pathology R@1）整合 fit
 ```

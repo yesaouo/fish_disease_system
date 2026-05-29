@@ -35,6 +35,8 @@ from diagnosis_model.cause_inference.phase1_baseline import (
     add_recall_at_ks,
     build_candidate_pool,
     compute_case_similarities,
+    load_cases,
+    offsets_to_case_ids,
     select_positive_top_cases,
     stack_train_lesions,
     summarize_rank_metric,
@@ -63,6 +65,12 @@ class CEAHDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         c = self.cases[idx]
         p = self.pool[idx]
+        # Soft-label GT mirrors positive_mask semantics: strict pathology only
+        # for DDXPlus (so high-cosine to DDX alternatives doesn't get treated
+        # as positive), fall back to the expanded cause_emb_indices for fish
+        # (all GT causes are strict positives).
+        pidx = c.get("pathology_emb_idx")
+        gt_cause_indices = [int(pidx)] if pidx is not None else c["cause_emb_indices"]
         return {
             "case_idx": idx,
             "global_emb": c["global_emb"],
@@ -71,7 +79,7 @@ class CEAHDataset(Dataset):
             "lesion_embs": c["lesion_embs"],
             "candidate_indices": p["candidate_cause_indices"],
             "positive_mask": p["positive_mask"],
-            "gt_cause_indices": c["cause_emb_indices"],
+            "gt_cause_indices": gt_cause_indices,
         }
 
 
@@ -165,19 +173,30 @@ def eval_valid_with_ceah(
     ks=(1, 5, 10, 20),
     alpha_global: float = 0.25,
     beta_lesion: float = 0.75,
+    lesion_match: str = "max_mean",
+    bank_dtype: torch.dtype = torch.float32,
 ) -> Dict[str, float]:
     """Phase 1 retrieval → CEAH re-rank → semantic recall metrics.
 
     Mirrors phase1_baseline.py / eval_ceah.py contract: L2-normalize, drop
     non-positive-sim cases, raw ranking for metrics, miss=+inf.
+
+    ``bank_dtype`` controls the on-device dtype of the validation Phase 1 bank
+    (mirrors :func:`load_train_bank`'s parameter). fp32 keeps the historic fish
+    path; bf16 is needed for DDXPlus 200k subsample to fit comfortably on a
+    32 GB GPU alongside CEAH forward.
     """
     ceah.eval()
     cause_table_embs = F.normalize(cause_table_embs, dim=-1)
     train_global_stack = F.normalize(
-        torch.stack([c["global_emb"] for c in train_cases]).to(device), dim=-1,
+        torch.stack([c["global_emb"] for c in train_cases]).to(device, dtype=bank_dtype),
+        dim=-1,
     )
     train_lesion_stack, train_offsets = stack_train_lesions(train_cases)
-    train_lesion_stack = F.normalize(train_lesion_stack.to(device), dim=-1)
+    train_lesion_stack = F.normalize(
+        train_lesion_stack.to(device, dtype=bank_dtype), dim=-1,
+    )
+    train_case_ids = offsets_to_case_ids(train_offsets, train_lesion_stack.device)
 
     queries = valid_cases if max_queries <= 0 else valid_cases[:max_queries]
     sem_ranks: List[float] = []
@@ -192,7 +211,8 @@ def eval_valid_with_ceah(
         sims = compute_case_similarities(
             q_global, q_lesions,
             train_global_stack, train_lesion_stack, train_offsets,
-            alpha_global, beta_lesion, lesion_match="hungarian",
+            alpha_global, beta_lesion, lesion_match=lesion_match,
+            train_case_ids=train_case_ids,
         )
         top_k_idx, _, _ = select_positive_top_cases(sims, top_k_cases)
         candidate_indices = build_candidate_pool(top_k_idx, train_cases)
@@ -299,12 +319,42 @@ def main():
     ap.add_argument("--eval_top_k_cases", type=int, default=20)
     ap.add_argument("--eval_max_queries", type=int, default=300)
     ap.add_argument("--eval_text_kind", type=str, default="medical")
+    ap.add_argument("--eval_lesion_match", type=str, default="max_mean",
+                    choices=["hungarian", "max_mean", "max_mean_normalized"],
+                    help="Lesion-set match for validation Phase 1 retrieval. "
+                         "Default 'max_mean' is the new global default (vectorized GPU, "
+                         "≤0.5pp from hungarian on fish per ablations/lesion_match_ranking_equiv; "
+                         "hungarian retained for paper-reproduction runs only).")
 
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--bank_dtype", type=str, default="fp32",
+                    choices=["fp32", "fp16", "bf16"],
+                    help="On-device storage dtype of the validation train bank. "
+                         "Default 'fp32' preserves the historic fish workflow; "
+                         "pass 'bf16' for DDXPlus (200k subsample is ~12 GB fp32 "
+                         "/ ~6 GB bf16 — bf16 leaves more headroom for CEAH "
+                         "forward and per-query buffers).")
+    ap.add_argument("--max_train_cases", type=int, default=0,
+                    help="Cap on retained train cases for both the CEAH training "
+                         "set (CEAHDataset) and the validation Phase 1 bank. "
+                         "Default 0 = full train (correct for fish). For DDXPlus "
+                         "pass 200000 — the full 1M train ~64 GB CPU RAM in "
+                         "load_cases (fp32 upcast) blows past 62 GB. MUST equal "
+                         "the --max_train_cases used when building train_pool, "
+                         "and share --sample_seed, so CEAHDataset[idx] case "
+                         "aligns with train_pool[idx] candidate set.")
+    ap.add_argument("--sample_seed", type=int, default=42,
+                    help="Must match build_train_candidate_pool's --sample_seed "
+                         "to keep CEAHDataset[idx] case aligned with "
+                         "train_pool[idx] candidate set.")
     ap.add_argument("--device", type=str,
                     default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num_workers", type=int, default=0)
     args = ap.parse_args()
+
+    bank_dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+    bank_dtype = bank_dtype_map[args.bank_dtype]
+    max_train_cases = args.max_train_cases if args.max_train_cases > 0 else None
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -314,15 +364,30 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     device = args.device
 
-    # Load data
+    # Load data. Subsample train cases iff --max_train_cases is set — uses the
+    # same per-shard rng.choice as build_train_candidate_pool / load_train_bank
+    # with the same sample_seed, so the kept 200k subset is identical across
+    # the three scripts (preserves CEAHDataset[idx] ↔ train_pool[idx] alignment).
     case_db_dir = Path(args.case_db_dir)
-    train_cases = torch.load(case_db_dir / "train_cases.pt", weights_only=False)
-    valid_cases = torch.load(case_db_dir / "valid_cases.pt", weights_only=False)
+    train_cases = load_cases(
+        case_db_dir, "train",
+        max_cases=max_train_cases, sample_seed=args.sample_seed,
+    )
+    valid_cases = load_cases(case_db_dir, "valid")
     cause_pack = torch.load(case_db_dir / "cause_text_embs.pt", weights_only=False)
-    cause_table_embs_cpu = cause_pack["embeddings"]
+    # .float() upcasts DDXPlus bf16/fp16 storage so CEAH's fp32 nn.Linear is
+    # dtype-compatible; no-op for fp32 fish builds.
+    cause_table_embs_cpu = cause_pack["embeddings"].float()
     cause_table_embs = cause_table_embs_cpu.to(device)
     pool_payload = torch.load(args.train_pool_path, weights_only=False)
     train_pool = pool_payload["case_pool"]
+    if len(train_cases) != len(train_pool):
+        raise ValueError(
+            f"train_cases ({len(train_cases)}) and train_pool ({len(train_pool)}) "
+            f"size mismatch — CEAHDataset[idx] assumes positional alignment. "
+            f"Pass --max_train_cases / --sample_seed matching the values used "
+            f"when running build_train_candidate_pool (default seed=42)."
+        )
     print(f"[load] train={len(train_cases)}  valid={len(valid_cases)}  "
           f"causes={cause_table_embs.size(0)}  pool_entries={len(train_pool)}")
 
@@ -474,6 +539,8 @@ def main():
                 top_k_cases=args.eval_top_k_cases,
                 max_queries=args.eval_max_queries,
                 use_text_kind=args.eval_text_kind,
+                lesion_match=args.eval_lesion_match,
+                bank_dtype=bank_dtype,
             )
             log_row.update(metrics)
             log_row["eval_seconds"] = time.time() - t_eval

@@ -6,7 +6,11 @@ FaCE-R 推論 / 評估指令
 Python env: /home/lab603/anaconda3/envs/SDM/bin/python
 
 論文最終 retrieval 配方（best）：
-  Phase 1 retrieval: K=20, α_global=0.25, β_lesion=0.75, lesion_match=hungarian
+  Phase 1 retrieval: K=20, α_global=0.25, β_lesion=0.75, lesion_match=max_mean
+                     (2026-05-26 起 default 翻成 max_mean；向量化 GPU、~90× 快、
+                      fish 上 R@K/MRR 全 |Δ| ≤ 0.5pp 且 max_mean 微勝。原 hungarian
+                      仍可顯式 --lesion_match hungarian 重現論文舊數字；ablation
+                      證據見 ablations/lesion_match_ranking_equiv/metrics.json)
   Diversification:   threshold=0.95
   CEAH:              softmax + multiplicative,  best_ceah.pt
   Scoring:           cascade ≡ γ=0（fine stage 純 CEAH；γ-scan 上 sem/cluster R@10 最強點）
@@ -19,8 +23,8 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
 ================================================================================
 [A] Phase 1 zero-training baseline（論文對照組）
 ================================================================================
-最佳參數：K=20, hungarian, diversify=0.95
-時間: ~50 秒（1573 valid queries）
+最佳參數：K=20, max_mean (default 2026-05-26+), diversify=0.95
+時間: ~15 秒（1573 valid queries with max_mean GPU vectorization；hungarian 約 50 秒）
 
 /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.phase1_baseline \
   --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
@@ -28,9 +32,11 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
   --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
   --top_k_cases 20 \
   --alpha_global 0.25 --beta_lesion 0.75 \
-  --lesion_match hungarian \
+  --lesion_match max_mean \
   --diversify_threshold 0.95 \
   --semantic_threshold 0.95
+
+# 加 --lesion_match hungarian 可重現下方論文舊數字（差距 ≤ 0.5pp 且 max_mean 微勝）
 
 論文 Phase 1 baseline 報告數字（K=20, hungarian，1573 valid，LLM 466 cluster）：
   semantic R@1=22.3%, R@5=34.8%, R@10=44.4%, R@20=58.9%, MRR=0.298
@@ -50,11 +56,12 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
   --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
   --top_k_cases 20 \
   --alpha_global 0.25 --beta_lesion 0.75 \
-  --lesion_match hungarian \
+  --lesion_match max_mean \
   --diversify_threshold 0.95 \
   --semantic_threshold 0.95
 
-論文報告數字（1573 valid，LLM 466 cluster）：
+論文報告數字（1573 valid，LLM 466 cluster，lesion_match=hungarian 的歷史值；
+2026-05-26 後 default 為 max_mean，數字 |Δ| ≤ 0.5pp 且 max_mean 微勝）：
   Fine-tuned VLMs:  sem R@1=22.3%  R@10=44.4%  R@20=58.9%  MRR=0.298  cl_R@10=35.8%
   Raw SigLIP2:      sem R@1=22.2%  R@10=45.6%  R@20=59.2%  MRR=0.300  cl_R@10=35.8%
 
@@ -132,7 +139,7 @@ Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
   --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \
   --output_path diagnosis_model/cause_inference/outputs/case_db_raw/train_candidate_pool.pt \
   --top_k_cases 20 --alpha_global 0.25 --beta_lesion 0.75 \
-  --lesion_match hungarian --semantic_threshold 0.95
+  --lesion_match max_mean --semantic_threshold 0.95
 
 /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.train_ceah \
   --case_db_dir diagnosis_model/cause_inference/outputs/case_db_raw \

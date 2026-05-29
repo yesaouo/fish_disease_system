@@ -644,9 +644,7 @@ def list_dispatch_state(
     """
     settings = _ensure_settings(settings)
     dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
-    db_path = get_db_path(dataset_dir, settings)
-    if not db_path.exists():
-        return []
+    db_path = ensure_db(dataset_dir, settings)
     conn = _connect(db_path)
     try:
         return conn.execute(
@@ -666,9 +664,7 @@ def list_task_rows(
     """Return raw DB rows for a dataset (ordered by sort_index)."""
     settings = _ensure_settings(settings)
     dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
-    db_path = get_db_path(dataset_dir, settings)
-    if not db_path.exists():
-        return []
+    db_path = ensure_db(dataset_dir, settings)
     conn = _connect(db_path)
     try:
         return conn.execute(

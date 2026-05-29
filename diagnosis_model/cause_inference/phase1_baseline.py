@@ -36,10 +36,11 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -51,14 +52,526 @@ from scipy.optimize import linear_sum_assignment
 # Loading
 # ---------------------------------------------------------------------------
 
+# Embedding fields that DDXPlus builds may store as fp16/bf16 to halve shard
+# disk; downstream code (CEAH's fp32 nn.Linear, F.normalize, dot products) is
+# fp32-native, so upcast at load time. No-op for legacy fp32 fish case_dbs.
+_EMB_KEYS = ("global_emb", "text_colloquial_emb", "text_medical_emb", "lesion_embs")
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _upcast_case_dict(c: dict) -> None:
+    for k in _EMB_KEYS:
+        t = c.get(k)
+        if isinstance(t, torch.Tensor) and t.dtype in _HALF_DTYPES:
+            c[k] = t.float()
+
+
+def _upcast_tensor(t: torch.Tensor) -> torch.Tensor:
+    return t.float() if t.dtype in _HALF_DTYPES else t
+
+
+def load_cases(
+    case_db_dir: Path,
+    split: str,
+    max_cases: Optional[int] = None,
+    sample_seed: int = 42,
+) -> List[dict]:
+    """Load all cases for a split, transparently handling sharded layouts.
+
+    Sharded layout (DDXPlus large builds): meta.json lists ``{split}_shards``
+    pointing to per-shard ``.pt`` files. Legacy layout: a single
+    ``{split}_cases.pt`` next to ``meta.json``.
+
+    ``max_cases`` enables uniform per-shard random subsampling (proportional
+    fraction = ``max_cases / n_{split}_cases`` from meta.json). Sampling
+    happens **before** :func:`_upcast_case_dict` so dropped cases never pay
+    the bf16→fp32 cost. Same RNG construction (seeded by ``sample_seed``,
+    called once per shard via ``np.random.default_rng(seed).choice``) as
+    :func:`load_train_bank` — passing the same ``sample_seed`` to both
+    produces identical case subsets in identical order, which keeps
+    :class:`train_ceah.CEAHDataset` aligned with ``train_candidate_pool.pt``
+    indices. For 200k DDXPlus subsample this drops peak CPU RAM from
+    ~64 GB (fp32 full-train upcast) to ~5 GB (per-shard ~300 MB peak).
+
+    ``None`` (default) loads everything — fish workflows are unchanged.
+    """
+    meta_path = case_db_dir / "meta.json"
+    shards: List[str] = []
+    n_split_meta: Optional[int] = None
+    if meta_path.exists():
+        meta = json.load(meta_path.open())
+        shards = meta.get(f"{split}_shards") or []
+        n_split_meta = meta.get(f"n_{split}_cases")
+        if isinstance(n_split_meta, int) and n_split_meta <= 0:
+            n_split_meta = None
+
+    keep_frac: Optional[float] = None
+    if (
+        max_cases is not None
+        and n_split_meta is not None
+        and max_cases < n_split_meta
+    ):
+        keep_frac = float(max_cases) / float(n_split_meta)
+    rng = np.random.default_rng(sample_seed) if keep_frac is not None else None
+
+    def _maybe_subsample(cases: List[dict]) -> List[dict]:
+        if keep_frac is None:
+            return cases
+        n_shard = len(cases)
+        k = max(1, int(round(n_shard * keep_frac)))
+        sel = rng.choice(n_shard, size=k, replace=False)
+        sel.sort()
+        return [cases[int(i)] for i in sel]
+
+    if shards:
+        out: List[dict] = []
+        for shard in shards:
+            cases = torch.load(case_db_dir / shard, weights_only=False)
+            cases = _maybe_subsample(cases)
+            for c in cases:
+                _upcast_case_dict(c)
+            out.extend(cases)
+            del cases
+            gc.collect()
+        return out
+
+    cases = torch.load(case_db_dir / f"{split}_cases.pt", weights_only=False)
+    cases = _maybe_subsample(cases)
+    for c in cases:
+        _upcast_case_dict(c)
+    return cases
+
+
+@torch.no_grad()
+def load_train_bank(
+    case_db_dir: Path,
+    device: str,
+    keep_keys: Sequence[str] = ("cause_emb_indices", "causes", "pathology_emb_idx"),
+    bank_dtype: Optional[torch.dtype] = None,
+    max_cases: Optional[int] = None,
+    sample_seed: int = 42,
+) -> Tuple[List[dict], torch.Tensor, torch.Tensor, List[int]]:
+    """Memory-efficient train-bank loader for Phase 1 / CEAH eval.
+
+    Streams shards (or a single legacy file), stacks ``global_emb`` and
+    ``lesion_embs`` on ``device`` (L2-normalized), and reduces each case dict
+    to ``keep_keys``. Per-case fields outside ``keep_keys`` — including the
+    source embedding tensors, ``text_*_emb`` duplicates, ``lesion_boxes_xywh``
+    zeros, and verbose strings (``evidence_texts`` / ``global_text`` / ``ddx``)
+    — are dropped so they don't pin CPU RAM during eval. Returns
+    ``(minimal_cases, global_stack, lesion_stack, offsets)``; offsets match
+    ``stack_train_lesions``.
+
+    For a ~130k DDXPlus train bank this drops the resident train-list cost
+    from ~5 GB of dicts to ~10–20 MB (stacks live on ``device``). Required
+    fields for the existing scoring loop (``cause_emb_indices``, ``causes``)
+    are the default; pass extra ``keep_keys`` if you also need ``image_id``
+    or other debug fields in per-query output.
+
+    ``bank_dtype`` controls the on-device storage dtype of the stacked
+    embeddings. ``None`` (default) keeps the legacy behavior of upcasting
+    half-precision storage (DDXPlus bf16/fp16) to fp32 — required for fish
+    case_dbs whose downstream consumers assume fp32. Pass ``torch.bfloat16`` /
+    ``torch.float16`` for DDXPlus banks where fp32 (~63 GB lesion stack at 1M
+    cases) does not fit on a single 32 GB GPU. The bank is only used by
+    :func:`compute_case_similarities` (cosine matmul, dtype-agnostic on
+    modern GPUs) and by :func:`build_candidate_pool` / :func:`score_candidates`
+    which read per-case ``cause_emb_indices`` int lists, not embedding tensors,
+    so half-precision banks do not affect CEAH's fp32 path.
+
+    ``max_cases`` caps the retained train-bank size via uniform random per-shard
+    subsampling (proportional fraction = ``max_cases / n_train_cases`` from
+    meta.json). At full 1M DDXPlus scale even bf16 (~31 GB) overflows a 32 GB
+    GPU; ``max_cases=200000`` keeps the per-condition stratification intact
+    (DDXPlus has 49 conditions, ~20k cases each — 200k leaves ~4k per
+    condition) while halving bank VRAM. ``None`` keeps all cases. Sampling
+    happens inside the shard-load loop so the dropped cases never reach the
+    stack/cat path.
+    """
+    meta_path = case_db_dir / "meta.json"
+    shards: List[str] = []
+    n_train_meta: Optional[int] = None
+    if meta_path.exists():
+        meta = json.load(meta_path.open())
+        shards = list(meta.get("train_shards") or [])
+        n_train_meta = meta.get("n_train_cases")
+        if isinstance(n_train_meta, int) and n_train_meta <= 0:
+            n_train_meta = None
+    sources = (
+        [case_db_dir / s for s in shards]
+        if shards else [case_db_dir / "train_cases.pt"]
+    )
+
+    keep_frac: Optional[float] = None
+    if (
+        max_cases is not None
+        and n_train_meta is not None
+        and max_cases < n_train_meta
+    ):
+        keep_frac = float(max_cases) / float(n_train_meta)
+    rng = np.random.default_rng(sample_seed) if keep_frac is not None else None
+
+    minimal_cases: List[dict] = []
+    global_chunks: List[torch.Tensor] = []
+    lesion_chunks: List[torch.Tensor] = []
+    offsets: List[int] = [0]
+
+    def _to_bank(t: torch.Tensor) -> torch.Tensor:
+        if bank_dtype is not None:
+            return t.to(device=device, dtype=bank_dtype, non_blocking=True)
+        return _upcast_tensor(t).to(device, non_blocking=True)
+
+    for src in sources:
+        shard = torch.load(src, weights_only=False)
+        if keep_frac is not None:
+            n_shard = len(shard)
+            k = max(1, int(round(n_shard * keep_frac)))
+            sel = rng.choice(n_shard, size=k, replace=False)
+            sel.sort()
+            shard = [shard[int(i)] for i in sel]
+        # Stack/cat on CPU, then move to device immediately so the CPU-side
+        # copies are GC-able by next iteration. Without the eager .to(device),
+        # chunks accumulate on CPU and the final torch.cat doubles peak RAM.
+        g_chunk = _to_bank(torch.stack([c["global_emb"] for c in shard]))
+        l_chunk = _to_bank(torch.cat([c["lesion_embs"] for c in shard], dim=0))
+        for c in shard:
+            offsets.append(offsets[-1] + int(c["lesion_embs"].size(0)))
+            minimal_cases.append({k: c[k] for k in keep_keys if k in c})
+        global_chunks.append(g_chunk)
+        lesion_chunks.append(l_chunk)
+        del shard, g_chunk, l_chunk
+        gc.collect()
+
+    global_stack = F.normalize(torch.cat(global_chunks, dim=0), dim=-1)
+    del global_chunks
+    lesion_stack = F.normalize(torch.cat(lesion_chunks, dim=0), dim=-1)
+    del lesion_chunks
+    if str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
+    gc.collect()
+    return minimal_cases, global_stack, lesion_stack, offsets
+
+
+@torch.no_grad()
+def load_train_cases_minimal(
+    case_db_dir: Path,
+    keep_keys: Sequence[str] = ("cause_emb_indices", "causes", "pathology_emb_idx"),
+) -> List[dict]:
+    """Load per-case metadata (``cause_emb_indices`` / ``causes``) without
+    materializing any embedding tensor on GPU.
+
+    Pairs with :func:`stream_top_k_cases`: streaming retrieval bypasses
+    :func:`load_train_bank` (which won't fit when the lesion stack exceeds
+    GPU VRAM), but downstream :func:`build_candidate_pool` /
+    :func:`score_candidates` still need the per-case cause-index lists. This
+    loader provides exactly that — for 1M DDXPlus cases it produces ~100 MB
+    of CPU dicts, compared with ~30 GB of GPU embeddings from load_train_bank.
+    """
+    meta_path = case_db_dir / "meta.json"
+    shards: List[str] = []
+    if meta_path.exists():
+        meta = json.load(meta_path.open())
+        shards = list(meta.get("train_shards") or [])
+    sources = (
+        [case_db_dir / s for s in shards]
+        if shards else [case_db_dir / "train_cases.pt"]
+    )
+    out: List[dict] = []
+    for src in sources:
+        shard = torch.load(src, weights_only=False)
+        for c in shard:
+            out.append({k: c[k] for k in keep_keys if k in c})
+        del shard
+        gc.collect()
+    return out
+
+
+@torch.no_grad()
+def stream_top_k_cases(
+    queries: List[dict],
+    case_db_dir: Path,
+    top_k_cases: int,
+    alpha: float,
+    beta: float,
+    lesion_match: str = "max_mean",
+    device: str = "cuda",
+    bank_dtype: torch.dtype = torch.bfloat16,
+    query_batch_size: int = 64,
+    verbose: bool = False,
+    max_cases: Optional[int] = None,
+    sample_seed: int = 42,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+    """Shard-streaming top-K case retrieval for banks larger than GPU VRAM.
+
+    Replaces the per-query :func:`compute_case_similarities` +
+    :func:`select_positive_top_cases` flow when the full bank does not fit on
+    a single GPU (the DDXPlus 1M-case bank is ~30 GB in bf16, exceeding a
+    32 GB GPU after accounting for query / working buffers).
+
+    Algorithm (outer shard, inner query batch — each shard loaded exactly once
+    per call; total PCIe transfer = bank size in ``bank_dtype``):
+
+      1. Pre-stack queries on GPU (``q_global``, ``q_lesion_stack``).
+         ~5 GB for 132K DDXPlus valid queries in bf16.
+      2. For each shard ``s``:
+         a. Load shard global + lesion stacks to GPU (~2 GB).
+         b. For each query batch of size ``query_batch_size``:
+            - Compute ``α·g_sim + β·max_mean(lesion_sim)`` per
+              (query, shard_case) — fully vectorized scatter_reduce.
+            - Top-K-merge per query into a running ``[N_q, K]`` accumulator
+              (sims + globally-numbered case indices).
+         c. Free shard.
+      3. Filter top-K to strictly positive sims per query (matches
+         :func:`select_positive_top_cases` semantics) and normalize weights.
+
+    Numerically equivalent to a monolithic-bank
+    :func:`compute_case_similarities` call within bf16 precision (cosine
+    matmul in bf16 is accurate to ~1e-3; ranking impact on top-K is
+    negligible since case-similarity gaps are typically >> 0.01).
+
+    Returns ``(top_k_idx_list, top_k_w_list, top_k_raw_w_list)`` with one
+    entry per query; arrays may be shorter than ``top_k_cases`` if fewer
+    positive-similarity cases were found.
+
+    Only ``lesion_match='max_mean'`` is supported — Hungarian needs a
+    per-pair scipy LP loop and is incompatible with batched scatter_reduce
+    (and is anyway infeasible at 1M-case bank scale).
+
+    ``max_cases`` / ``sample_seed`` mirror :func:`load_train_bank`'s
+    subsampling for apples-to-apples equivalence tests (stream-vs-non-stream
+    on the same retained subset). ``None`` (default) uses all cases.
+    """
+    if lesion_match != "max_mean":
+        raise ValueError(
+            f"stream_top_k_cases supports only lesion_match='max_mean'; "
+            f"got {lesion_match!r}. The non-streaming path supports hungarian "
+            f"but is only viable at <~10k case banks."
+        )
+    n_q = len(queries)
+    if n_q == 0:
+        return [], [], []
+
+    # ---- Pre-stack queries on GPU -----------------------------------------
+    q_global = F.normalize(
+        torch.stack([q["global_emb"] for q in queries]).to(device, dtype=bank_dtype),
+        dim=-1,
+    )  # [N_q, D]
+    q_lesion_chunks = [q["lesion_embs"] for q in queries]
+    q_offsets_py: List[int] = [0]
+    for chunk in q_lesion_chunks:
+        q_offsets_py.append(q_offsets_py[-1] + int(chunk.size(0)))
+    q_lesion_stack = F.normalize(
+        torch.cat(q_lesion_chunks, dim=0).to(device, dtype=bank_dtype),
+        dim=-1,
+    )  # [Q_total_lesions, D]
+    q_lesion_case_ids_full = offsets_to_case_ids(q_offsets_py, device)
+    del q_lesion_chunks
+
+    # ---- Running top-K accumulator ----------------------------------------
+    running_sims = torch.full(
+        (n_q, top_k_cases), float("-inf"), device=device, dtype=torch.float32,
+    )
+    running_idxs = torch.full(
+        (n_q, top_k_cases), -1, device=device, dtype=torch.long,
+    )
+
+    # ---- Resolve shard sources --------------------------------------------
+    meta_path = case_db_dir / "meta.json"
+    meta = json.load(meta_path.open()) if meta_path.exists() else {}
+    shards_list = list(meta.get("train_shards") or [])
+    sources = (
+        [case_db_dir / s for s in shards_list]
+        if shards_list else [case_db_dir / "train_cases.pt"]
+    )
+    n_train_meta = meta.get("n_train_cases")
+    if isinstance(n_train_meta, int) and n_train_meta <= 0:
+        n_train_meta = None
+    keep_frac: Optional[float] = None
+    if (
+        max_cases is not None
+        and n_train_meta is not None
+        and max_cases < n_train_meta
+    ):
+        keep_frac = float(max_cases) / float(n_train_meta)
+    rng_sub = np.random.default_rng(sample_seed) if keep_frac is not None else None
+
+    case_offset = 0
+    t0 = time.time()
+    for src_idx, src in enumerate(sources):
+        shard = torch.load(src, weights_only=False)
+        if keep_frac is not None:
+            n_full = len(shard)
+            k = max(1, int(round(n_full * keep_frac)))
+            sel = rng_sub.choice(n_full, size=k, replace=False)
+            sel.sort()
+            shard = [shard[int(i)] for i in sel]
+        n_shard = len(shard)
+        shard_global = F.normalize(
+            torch.stack([c["global_emb"] for c in shard]).to(device, dtype=bank_dtype),
+            dim=-1,
+        )
+        shard_lesion_list = [c["lesion_embs"] for c in shard]
+        shard_offsets_py: List[int] = [0]
+        for chunk in shard_lesion_list:
+            shard_offsets_py.append(shard_offsets_py[-1] + int(chunk.size(0)))
+        shard_lesion = F.normalize(
+            torch.cat(shard_lesion_list, dim=0).to(device, dtype=bank_dtype),
+            dim=-1,
+        )
+        m_shard = shard_lesion.size(0)
+        shard_case_ids = offsets_to_case_ids(shard_offsets_py, device)
+        del shard, shard_lesion_list
+        gc.collect()
+
+        if verbose:
+            elapsed = time.time() - t0
+            print(
+                f"[stream] shard {src_idx+1}/{len(sources)} loaded "
+                f"n_shard={n_shard} m_shard={m_shard} elapsed={elapsed:.1f}s"
+            )
+
+        for qs in range(0, n_q, query_batch_size):
+            qe = min(qs + query_batch_size, n_q)
+            B = qe - qs
+            q_les_start = q_offsets_py[qs]
+            q_les_end = q_offsets_py[qe]
+
+            # g_sim: [B, n_shard], fp32 for accumulation
+            g_sim = (q_global[qs:qe] @ shard_global.T).float()
+
+            q_les_subset = q_lesion_stack[q_les_start:q_les_end]
+            q_local_ids = q_lesion_case_ids_full[q_les_start:q_les_end] - qs
+            B_les_total = q_les_subset.size(0)
+
+            if B_les_total == 0 or m_shard == 0:
+                les_score = torch.zeros((B, n_shard), device=device, dtype=torch.float32)
+            else:
+                # les_sim [B_les_total, m_shard] in bank dtype — the largest
+                # transient buffer. Sized by query_batch_size to fit VRAM.
+                les_sim = q_les_subset @ shard_lesion.T
+
+                # Step 1: max over each train-case's lesions for each query-lesion row.
+                #   t_max_per_row[i, t] = max_{j in t_case lesions} les_sim[i, j]
+                t_max_per_row = torch.full(
+                    (B_les_total, n_shard), float("-inf"),
+                    device=device, dtype=les_sim.dtype,
+                )
+                shard_case_ids_exp = shard_case_ids.unsqueeze(0).expand(B_les_total, -1)
+                t_max_per_row.scatter_reduce_(
+                    1, shard_case_ids_exp, les_sim,
+                    reduce="amax", include_self=False,
+                )
+                t_max_per_row = torch.where(
+                    t_max_per_row == float("-inf"),
+                    torch.zeros_like(t_max_per_row),
+                    t_max_per_row,
+                )
+
+                # Step 2a (forward direction): mean over q's lesions of t_max_per_row,
+                # grouped by q_case (q_local_ids).
+                forward_sum = torch.zeros(
+                    (B, n_shard), device=device, dtype=torch.float32,
+                )
+                q_local_exp_T = q_local_ids.unsqueeze(-1).expand(-1, n_shard)
+                forward_sum.scatter_add_(0, q_local_exp_T, t_max_per_row.float())
+                q_counts = torch.zeros(B, device=device, dtype=torch.float32)
+                q_counts.scatter_add_(
+                    0, q_local_ids,
+                    torch.ones_like(q_local_ids, dtype=torch.float32),
+                )
+                forward_mean = forward_sum / q_counts.clamp_min(1.0).unsqueeze(-1)
+
+                # Step 2b (backward direction): max over q's lesions per t_lesion,
+                # then mean over t's lesions per t_case.
+                q_max_per_col = torch.full(
+                    (B, m_shard), float("-inf"),
+                    device=device, dtype=les_sim.dtype,
+                )
+                q_local_exp_M = q_local_ids.unsqueeze(-1).expand(-1, m_shard)
+                q_max_per_col.scatter_reduce_(
+                    0, q_local_exp_M, les_sim,
+                    reduce="amax", include_self=False,
+                )
+                q_max_per_col = torch.where(
+                    q_max_per_col == float("-inf"),
+                    torch.zeros_like(q_max_per_col),
+                    q_max_per_col,
+                )
+                backward_sum = torch.zeros(
+                    (B, n_shard), device=device, dtype=torch.float32,
+                )
+                shard_case_ids_exp_B = shard_case_ids.unsqueeze(0).expand(B, -1)
+                backward_sum.scatter_add_(
+                    1, shard_case_ids_exp_B, q_max_per_col.float(),
+                )
+                t_counts = torch.zeros(n_shard, device=device, dtype=torch.float32)
+                t_counts.scatter_add_(
+                    0, shard_case_ids,
+                    torch.ones_like(shard_case_ids, dtype=torch.float32),
+                )
+                backward_mean = backward_sum / t_counts.clamp_min(1.0).unsqueeze(0)
+
+                les_score = 0.5 * (forward_mean + backward_mean)
+                del les_sim, t_max_per_row, forward_sum, q_counts, forward_mean
+                del q_max_per_col, backward_sum, t_counts, backward_mean
+
+            sim_block = alpha * g_sim + beta * les_score  # [B, n_shard]
+            del g_sim, les_score
+
+            # Top-K-within-shard, then merge with running.
+            top_k_in_shard = min(top_k_cases, n_shard)
+            shard_top_sims, shard_top_local = sim_block.topk(top_k_in_shard, dim=1)
+            shard_top_global = shard_top_local + case_offset
+            del sim_block, shard_top_local
+
+            combined_sims = torch.cat([running_sims[qs:qe], shard_top_sims], dim=1)
+            combined_idxs = torch.cat([running_idxs[qs:qe], shard_top_global], dim=1)
+            top_sims, top_pos = combined_sims.topk(top_k_cases, dim=1)
+            top_idxs = torch.gather(combined_idxs, 1, top_pos)
+            running_sims[qs:qe] = top_sims
+            running_idxs[qs:qe] = top_idxs
+            del shard_top_sims, shard_top_global, combined_sims, combined_idxs
+            del top_sims, top_pos, top_idxs
+
+        case_offset += n_shard
+        del shard_global, shard_lesion, shard_case_ids
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    # ---- Extract per-query results (positive-similarity filter) ----------
+    sims_np = running_sims.detach().cpu().numpy()
+    idxs_np = running_idxs.detach().cpu().numpy()
+    top_k_idx_list: List[np.ndarray] = []
+    top_k_w_list: List[np.ndarray] = []
+    top_k_raw_w_list: List[np.ndarray] = []
+    for qi in range(n_q):
+        sims = sims_np[qi]
+        idxs = idxs_np[qi]
+        # topk preserves descending order — keep it.
+        mask = (sims > 0) & (idxs >= 0)
+        sims_kept = sims[mask].astype(np.float32)
+        idxs_kept = idxs[mask].astype(np.int64)
+        if sims_kept.size > 0:
+            w = sims_kept / (sims_kept.sum() + 1e-8)
+        else:
+            w = np.empty(0, dtype=np.float32)
+        top_k_idx_list.append(idxs_kept)
+        top_k_w_list.append(w.astype(np.float32))
+        top_k_raw_w_list.append(sims_kept)
+    return top_k_idx_list, top_k_w_list, top_k_raw_w_list
+
+
 def load_case_db(case_db_dir: Path, query_split: str = "valid"):
     """Load train + query split cases. `query_split` selects which `<split>_cases.pt`
     is returned in the 2nd slot (default `valid` preserves prior behavior)."""
     if query_split not in ("valid", "test"):
         raise ValueError(f"query_split must be 'valid' or 'test', got {query_split!r}")
-    train = torch.load(case_db_dir / "train_cases.pt", weights_only=False)
-    queries = torch.load(case_db_dir / f"{query_split}_cases.pt", weights_only=False)
+    train = load_cases(case_db_dir, "train")
+    queries = load_cases(case_db_dir, query_split)
     cause = torch.load(case_db_dir / "cause_text_embs.pt", weights_only=False)
+    if isinstance(cause, dict) and isinstance(cause.get("embeddings"), torch.Tensor):
+        cause["embeddings"] = _upcast_tensor(cause["embeddings"])
     meta = json.load((case_db_dir / "meta.json").open())
     return train, queries, cause, meta
 
@@ -125,31 +638,121 @@ _LESION_MATCH_FNS = {
     "max_mean_normalized": max_mean_normalized_set_score,
 }
 
+_BATCHED_LESION_MATCHES = {"max_mean", "max_mean_normalized"}
+
+
+def offsets_to_case_ids(train_offsets: Sequence[int], device) -> torch.Tensor:
+    """Expand per-case offsets into a ``[total_lesions]`` long tensor mapping
+    each lesion/evidence row to its train-case index. Pre-compute once and
+    reuse across queries in tight loops (``build_train_candidate_pool`` /
+    eval scripts) to skip the ~10 ms/query setup cost."""
+    n_train = len(train_offsets) - 1
+    lengths = torch.tensor(
+        [int(train_offsets[i + 1] - train_offsets[i]) for i in range(n_train)],
+        device=device, dtype=torch.long,
+    )
+    return torch.arange(n_train, device=device, dtype=torch.long).repeat_interleave(lengths)
+
+
+@torch.no_grad()
+def _batched_max_mean(
+    les_sim: torch.Tensor,    # [N_q, L]
+    case_ids: torch.Tensor,   # [L] long
+    n_train: int,
+    normalized: bool,
+) -> torch.Tensor:
+    """Fully vectorized GPU implementation of ``max_mean_set_score`` (and the
+    ``max_mean_normalized`` variant) across all train cases simultaneously.
+
+    Replaces the per-case Python loop in ``compute_case_similarities`` —
+    critical for 1M-scale banks where the loop alone is days/weeks.
+    """
+    N_q, L = les_sim.shape
+    device = les_sim.device
+    dtype = les_sim.dtype
+    neg_inf = float("-inf")
+
+    # Forward direction: max over evidences belonging to each case, per query.
+    forward_max = les_sim.new_full((N_q, n_train), neg_inf)
+    case_ids_exp = case_ids.unsqueeze(0).expand(N_q, -1)
+    forward_max.scatter_reduce_(1, case_ids_exp, les_sim, reduce="amax", include_self=False)
+    forward_max = torch.where(
+        forward_max == neg_inf, torch.zeros_like(forward_max), forward_max,
+    )
+    forward_sums = forward_max.sum(dim=0)  # [n_train], sum over queries
+
+    # Backward direction: max over queries per evidence, then aggregate per case.
+    evidence_max = les_sim.amax(dim=0)     # [L]
+    backward_sums = torch.zeros(n_train, device=device, dtype=dtype)
+    backward_sums.scatter_add_(0, case_ids, evidence_max)
+
+    counts = torch.zeros(n_train, device=device, dtype=dtype)
+    counts.scatter_add_(0, case_ids, torch.ones(L, device=device, dtype=dtype))
+    valid = counts > 0
+
+    if normalized:
+        max_ne = torch.maximum(counts, counts.new_full((n_train,), float(N_q))).clamp_min(1.0)
+        score = 0.5 * (forward_sums + backward_sums) / max_ne
+    else:
+        forward_mean = forward_sums / float(N_q)
+        backward_mean = backward_sums / counts.clamp_min(1.0)
+        score = 0.5 * (forward_mean + backward_mean)
+    return torch.where(valid, score, torch.zeros_like(score))
+
 
 def compute_case_similarities(
     q_global: torch.Tensor,           # [D], already normalized
     q_lesions: torch.Tensor,          # [N_q, D], already normalized
     train_global_stack: torch.Tensor, # [n_train, D], already normalized
     train_lesion_stack: torch.Tensor, # [total_lesions, D], already normalized
-    train_offsets: List[int],
+    train_offsets: Sequence[int],
     alpha: float,
     beta: float,
-    lesion_match: str = "hungarian",
+    lesion_match: str = "max_mean",
+    train_case_ids: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
     """Return [n_train] combined similarity scores.
 
-    Because all embeddings are L2-normalized before this function is called,
-    matrix multiplication is cosine similarity.
+    All embeddings are L2-normalized before this is called, so matmul =
+    cosine. For ``lesion_match in {max_mean, max_mean_normalized}`` the lesion
+    score is computed fully vectorized on the lesion stack's device (the
+    1M-case-bank fast path). ``hungarian`` falls back to the per-case Python
+    loop because ``scipy.linear_sum_assignment`` cannot be vectorized.
+
+    Pass ``train_case_ids`` (from :func:`offsets_to_case_ids`) when calling in
+    a tight loop to avoid recomputing the mapping per query.
     """
-    match_fn = _LESION_MATCH_FNS[lesion_match]
-    g_sim = (q_global.unsqueeze(0) @ train_global_stack.T).squeeze(0)
+    # Cast queries to the bank's dtype so half-precision banks (DDXPlus bf16/
+    # fp16, used to fit the 1M-case lesion stack in 32 GB VRAM) match the
+    # matmul operand dtype. fp32 banks (fish) are a no-op cast.
+    bank_dtype = train_global_stack.dtype
+    if q_global.dtype != bank_dtype:
+        q_global = q_global.to(bank_dtype)
+    if q_lesions.dtype != bank_dtype:
+        q_lesions = q_lesions.to(bank_dtype)
+
+    g_sim = (q_global.unsqueeze(0) @ train_global_stack.T).squeeze(0).float()
+    n_train = len(train_offsets) - 1
 
     if q_lesions.size(0) == 0 or train_lesion_stack.size(0) == 0:
-        les_sim = np.empty((q_lesions.size(0), train_lesion_stack.size(0)), dtype=np.float32)
-    else:
-        les_sim = (q_lesions @ train_lesion_stack.T).detach().cpu().numpy()
+        return (alpha * g_sim.detach().cpu().numpy()
+                + np.zeros(n_train, dtype=np.float32))
 
-    n_train = len(train_offsets) - 1
+    if lesion_match in _BATCHED_LESION_MATCHES:
+        if train_case_ids is None:
+            train_case_ids = offsets_to_case_ids(train_offsets, train_lesion_stack.device)
+        les_sim = q_lesions @ train_lesion_stack.T
+        l_score_t = _batched_max_mean(
+            les_sim, train_case_ids, n_train,
+            normalized=(lesion_match == "max_mean_normalized"),
+        )
+        del les_sim
+        l_score = l_score_t.float().detach().cpu().numpy()
+        return alpha * g_sim.detach().cpu().numpy() + beta * l_score
+
+    # Hungarian fallback (per-case Python loop). Only viable at <~10k cases.
+    match_fn = _LESION_MATCH_FNS[lesion_match]
+    les_sim = (q_lesions @ train_lesion_stack.T).float().detach().cpu().numpy()
     l_score = np.zeros(n_train, dtype=np.float32)
     for i in range(n_train):
         s, e = train_offsets[i], train_offsets[i + 1]
@@ -349,7 +952,7 @@ def main():
     ap.add_argument("--top_n_causes", type=int, default=20)
     ap.add_argument("--alpha_global", type=float, default=0.25)
     ap.add_argument("--beta_lesion", type=float, default=0.75)
-    ap.add_argument("--lesion_match", type=str, default="hungarian",
+    ap.add_argument("--lesion_match", type=str, default="max_mean",
                     choices=["hungarian", "max_mean", "max_mean_normalized"],
                     help="lesion-set matching mode for case similarity")
     ap.add_argument("--device", type=str,

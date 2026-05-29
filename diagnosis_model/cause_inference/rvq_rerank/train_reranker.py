@@ -33,7 +33,9 @@ import torch
 import torch.nn.functional as F
 
 from diagnosis_model.cause_inference.eval_phase1_aligned import evaluate
-from diagnosis_model.cause_inference.phase1_baseline import load_case_db
+from diagnosis_model.cause_inference.phase1_baseline import (
+    load_case_db, load_cases,
+)
 from diagnosis_model.cause_inference.train_case_encoder import encode_all
 from diagnosis_model.cause_inference.rvq_rerank.fit_rvq import load_encoder
 from diagnosis_model.cause_inference.rvq_rerank.rvq import RVQCodebook
@@ -164,6 +166,19 @@ def main():
                     help="Regime B (no-aggregation) is the default; "
                          "use 20 to early-stop on Regime A.")
     ap.add_argument("--eval_semantic_threshold", type=float, default=0.95)
+    # DDXPlus scale: case-db is sharded and may be too large for full load.
+    ap.add_argument("--max_train_cases", type=int, default=-1,
+                    help="Cap retained train cases (RVQ + reranker training "
+                         "set) via uniform per-shard subsampling. -1 loads "
+                         "all (fish). DDXPlus: use 200000 to match the "
+                         "Phase 1/2 convention.")
+    ap.add_argument("--max_valid_cases", type=int, default=-1,
+                    help="Cap valid set used for early-stop sem R@K eval. "
+                         "-1 loads all (fish 3k). DDXPlus 130k valid is "
+                         "intractable for the [Nv, Nt] sim matrix used here; "
+                         "use e.g. 5000.")
+    ap.add_argument("--sample_seed", type=int, default=42,
+                    help="Subsample RNG seed; match train_case_encoder.py.")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -175,10 +190,26 @@ def main():
 
     # ---- Load encoder + data ----
     encoder, _ = load_encoder(Path(args.encoder_ckpt), device)
-    train_cases, valid_cases, cause_pkg, meta = load_case_db(
-        Path(args.case_db_dir),
+    case_db_dir = Path(args.case_db_dir)
+    max_train = args.max_train_cases if args.max_train_cases > 0 else None
+    max_valid = args.max_valid_cases if args.max_valid_cases > 0 else None
+    train_cases = load_cases(
+        case_db_dir, "train",
+        max_cases=max_train, sample_seed=args.sample_seed,
     )
+    valid_cases = load_cases(
+        case_db_dir, "valid",
+        max_cases=max_valid, sample_seed=args.sample_seed,
+    )
+    cause_pkg = torch.load(
+        case_db_dir / "cause_text_embs.pt", weights_only=False, map_location="cpu",
+    )
+    # Upcast bf16/fp16 cause embs to fp32 (DDXPlus storage halves disk; the
+    # reranker eval consumes them as fp32 via evaluate()'s F.normalize path).
     cause_embs = cause_pkg["embeddings"]
+    if cause_embs.dtype in (torch.float16, torch.bfloat16):
+        cause_embs = cause_embs.float()
+    meta = json.load((case_db_dir / "meta.json").open())
     D = meta["global_dim"]
     print(f"[data] train={len(train_cases)}  valid={len(valid_cases)}  D={D}")
 

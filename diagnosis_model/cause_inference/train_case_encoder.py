@@ -1,8 +1,21 @@
 """Train the Phase 3 case encoder via Phase 1 distillation.
 
-Listwise-KL distillation against the precomputed Phase 1 hungarian teacher
-score table (teacher_train_train.pt). For each batch of B train cases, the
-student must reproduce per-anchor row-softmax of teacher case-similarities.
+Listwise-KL distillation against a Phase 1 teacher case-similarity table.
+For each batch of B train cases, the student must reproduce per-anchor
+row-softmax of teacher case-similarities.
+
+Two teacher modes:
+
+- ``--teacher_mode precomputed`` (default, fish): loads the N×N
+  ``teacher_train_train.pt`` produced by ``build_teacher_table.py`` and
+  slices per batch. Storage = N² × 2 bytes (fp16) — 311 MiB at fish 12,780
+  cases; infeasible at DDXPlus 200k (~80 GB).
+- ``--teacher_mode on_the_fly`` (DDXPlus): caches normalized global +
+  lesion stacks on GPU in ``--bank_dtype`` and computes the BxB intra-batch
+  teacher block per step via vectorized scatter_reduce. Only ``max_mean``
+  / ``max_mean_normalized`` lesion-match are supported on this path
+  (hungarian's scipy LP loop has no batched equivalent and is anyway
+  infeasible at the case bank sizes that motivate this mode).
 
 The encoder consumes (global_emb, lesion_embs sorted by area DESC) and emits
 one L2-normed h_final ∈ R^768 per case so that retrieval becomes a single
@@ -14,7 +27,7 @@ choice lives under diagnosis_model.cause_inference.mamba_ablation and
 requires the mamba3 conda env + CC=/usr/bin/gcc-12; build_encoder() lazy-
 imports it only when requested.
 
-CLI quickstart from repo root (SDM env, default deepsets):
+CLI quickstart from repo root (SDM env, default deepsets, fish):
     /home/lab603/anaconda3/envs/SDM/bin/python \
         -m diagnosis_model.cause_inference.train_case_encoder \
         --case_db_dir diagnosis_model/cause_inference/outputs/case_db \
@@ -23,11 +36,23 @@ CLI quickstart from repo root (SDM env, default deepsets):
         --encoder_type deepsets \
         --batch_size 256 --epochs 50 \
         --use_infonce --infonce_weight 0.5 --infonce_temp 0.07
+
+DDXPlus 200k subsample (on-the-fly teacher, bf16 bank):
+    /home/lab603/anaconda3/envs/SDM/bin/python \
+        -m diagnosis_model.cause_inference.train_case_encoder \
+        --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
+        --output_dir diagnosis_model/cause_inference/outputs/ddxplus_encoder \
+        --encoder_type deepsets \
+        --teacher_mode on_the_fly --bank_dtype bf16 \
+        --max_train_cases 200000 --max_valid_cases 5000 --sample_seed 42 \
+        --batch_size 256 --epochs 30 \
+        --use_infonce --infonce_weight 0.5 --infonce_temp 0.07
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import time
@@ -47,7 +72,18 @@ from diagnosis_model.cause_inference.models.case_encoder import (
     pairwise_mse_loss,
     case_cause_infonce_loss,
 )
-from diagnosis_model.cause_inference.phase1_baseline import load_case_db
+from diagnosis_model.cause_inference.phase1_baseline import (
+    load_case_db,
+    load_cases,
+    offsets_to_case_ids,
+)
+
+
+_BANK_DTYPES = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -65,13 +101,34 @@ class CaseEncoderDataset(Dataset):
     """One sample = one train case. Lesions are pre-sorted by area DESC.
 
     Per-case dict keys returned:
-        case_id            : int (= index into teacher table)
+        case_id            : int (= positional index in ``cases`` list,
+                                  used to slice the teacher block)
         global_emb         : [D] L2-normed
         lesion_embs        : [N, D] L2-normed, sorted by area DESC (largest first)
         cause_emb_indices  : list[int] indices into cause_text_embs (for dual-target loss)
+
+    Note: positional rather than ``c["case_id"]`` so subsample (DDXPlus path)
+    indexing into the same ordered teacher table / on-the-fly bank works.
+    For fish (no subsample) ``c["case_id"]`` equals the position anyway.
+
+    ``free_source``: at DDXPlus scale, the source ``train_cases`` already holds
+    ~8-18 GB of CPU tensors (200k cases × ~40 KB fp32). Copying normalized
+    versions into ``self.records`` doubles this. With ``free_source=True``
+    each source dict is stripped of its embedding fields immediately after
+    the normalized copy is appended, so peak CPU stays at one-copy. Caller
+    must have already snapshotted whatever it needs from the source first
+    (e.g. constructed the on-the-fly teacher bank). ``causes`` and
+    ``cause_emb_indices`` are preserved — ``retrieval_metrics`` still
+    needs them.
     """
 
-    def __init__(self, cases: list):
+    _DROP_KEYS = (
+        "global_emb", "lesion_embs",
+        "text_colloquial_emb", "text_medical_emb",
+        "lesion_boxes_xywh",
+    )
+
+    def __init__(self, cases: list, free_source: bool = False):
         self.cases = cases
         self.records = []
         for ci, c in enumerate(cases):
@@ -83,12 +140,19 @@ class CaseEncoderDataset(Dataset):
                 areas = _lesion_areas(c["lesion_boxes_xywh"])
                 order = torch.argsort(areas, descending=True)
                 L = L[order]
+            pathology_idx = c.get("pathology_emb_idx")
             self.records.append(dict(
-                case_id=c["case_id"],
+                case_id=int(ci),
                 global_emb=g,
                 lesion_embs=L,
                 cause_emb_indices=list(c.get("cause_emb_indices", [])),
+                # DDXPlus v2 schema only: single strict GT for stricter
+                # InfoNCE positives. None on fish (no field).
+                pathology_emb_idx=(int(pathology_idx) if pathology_idx is not None else None),
             ))
+            if free_source:
+                for k in self._DROP_KEYS:
+                    c.pop(k, None)
 
     def __len__(self):
         return len(self.records)
@@ -116,8 +180,188 @@ def make_collate(D: int):
             "lesion_pad": lesion_pad,
             "lesion_lens": lesion_lens,
             "cause_indices": [b["cause_emb_indices"] for b in batch],
+            "pathology_indices": [b.get("pathology_emb_idx") for b in batch],
         }
     return collate
+
+
+# ---------------------------------------------------------------------------
+# On-the-fly teacher (DDXPlus scale: precomputed N×N table doesn't fit)
+# ---------------------------------------------------------------------------
+
+class OnTheFlyTeacher:
+    """Computes Phase 1 case-similarity teacher blocks per training batch.
+
+    Caches normalized global + lesion stacks on GPU in ``bank_dtype`` (bf16 by
+    default for DDXPlus, fp32 for fish). Per training step extracts the BxB
+    intra-batch block via fully vectorized scatter_reduce, matching
+    ``phase1_baseline.compute_case_similarities``'s ``max_mean`` /
+    ``max_mean_normalized`` ranking up to bf16 cosine precision.
+
+    Only the symmetric max_mean family is supported; hungarian's per-pair
+    scipy LP loop has no batched equivalent (and the dataset sizes that
+    motivate this teacher mode are well past hungarian-feasible anyway).
+    """
+
+    def __init__(
+        self,
+        train_cases: List[dict],
+        device: torch.device,
+        bank_dtype: torch.dtype = torch.bfloat16,
+        alpha: float = 0.25,
+        beta: float = 0.75,
+        lesion_match: str = "max_mean",
+        case_chunk_size: int = 16384,
+    ):
+        if lesion_match not in ("max_mean", "max_mean_normalized"):
+            raise ValueError(
+                f"on_the_fly teacher supports only max_mean / "
+                f"max_mean_normalized; got {lesion_match!r}."
+            )
+        self.device = device
+        self.bank_dtype = bank_dtype
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.normalize_by_max = (lesion_match == "max_mean_normalized")
+        N = len(train_cases)
+        D = int(train_cases[0]["global_emb"].size(-1))
+
+        # Build banks chunk-by-chunk so the CPU `torch.cat` temp tensor never
+        # exceeds ``case_chunk_size`` cases at once. At 200k DDXPlus cases
+        # ×~10 lesions × 768 fp32, a single naive cat is ~6 GB CPU; chunking
+        # keeps the transient under ~500 MB per step.
+        D_ = D
+        # Pre-pass: total lesion count to size self.L exactly.
+        offsets: List[int] = [0]
+        for c in train_cases:
+            offsets.append(offsets[-1] + int(c["lesion_embs"].size(0)))
+        total_lesions = offsets[-1]
+
+        self.G = torch.empty(N, D_, device=device, dtype=bank_dtype)
+        self.L = torch.empty(total_lesions, D_, device=device, dtype=bank_dtype)
+
+        for start in range(0, N, case_chunk_size):
+            end = min(start + case_chunk_size, N)
+            G_chunk = torch.stack(
+                [train_cases[i]["global_emb"] for i in range(start, end)]
+            )
+            self.G[start:end] = G_chunk.to(device=device, dtype=bank_dtype)
+            del G_chunk
+            if total_lesions > 0:
+                lesion_chunk = [
+                    train_cases[i]["lesion_embs"]
+                    for i in range(start, end)
+                    if train_cases[i]["lesion_embs"].size(0) > 0
+                ]
+                if lesion_chunk:
+                    L_cat = torch.cat(lesion_chunk, dim=0)
+                    self.L[offsets[start]:offsets[end]] = L_cat.to(
+                        device=device, dtype=bank_dtype,
+                    )
+                    del L_cat, lesion_chunk
+
+        self.G = F.normalize(self.G, dim=-1)
+        if total_lesions > 0:
+            self.L = F.normalize(self.L, dim=-1)
+        self.offsets = offsets
+        self.case_ids_full = offsets_to_case_ids(offsets, device)  # [ΣN]
+        self.lesion_counts_full = torch.zeros(N, device=device, dtype=torch.float32)
+        if self.case_ids_full.numel() > 0:
+            self.lesion_counts_full.scatter_add_(
+                0, self.case_ids_full,
+                torch.ones_like(self.case_ids_full, dtype=torch.float32),
+            )
+
+    @torch.no_grad()
+    def batch_block(self, case_ids: torch.Tensor) -> torch.Tensor:
+        """Return BxB teacher score block for the given positional case_ids.
+
+        Diagonal set to NaN (matches build_teacher_table.py's convention so the
+        existing listwise-KL row-softmax masks self consistently).
+        """
+        B = case_ids.size(0)
+        device = self.device
+        # Globals.
+        G_batch = self.G[case_ids]                                  # [B, D]
+        g_sim = (G_batch @ G_batch.T).float()                       # [B, B]
+        out = self.alpha * g_sim
+
+        # Lesions: pull each batch case's lesion rows into a contiguous stack,
+        # remapping their original case_id (positional in the full bank) to
+        # batch-local id in [0, B).
+        if self.L.size(0) == 0:
+            out.fill_diagonal_(float("nan"))
+            return out
+
+        sub_pieces: List[torch.Tensor] = []
+        sub_case_ids: List[torch.Tensor] = []
+        for bi, ci in enumerate(case_ids.tolist()):
+            s = self.offsets[int(ci)]
+            e = self.offsets[int(ci) + 1]
+            if e > s:
+                sub_pieces.append(self.L[s:e])
+                sub_case_ids.append(torch.full(
+                    (e - s,), bi, device=device, dtype=torch.long,
+                ))
+        if not sub_pieces:
+            out.fill_diagonal_(float("nan"))
+            return out
+
+        L_batch = torch.cat(sub_pieces, dim=0)                      # [ΣN_batch, D]
+        case_ids_local = torch.cat(sub_case_ids, dim=0)             # [ΣN_batch]
+        L_total = L_batch.size(0)
+
+        # All-pairs cosine within the batch's lesion subset.
+        les_sim = L_batch @ L_batch.T                               # [ΣN_b, ΣN_b]
+
+        # Forward: for each row p (lesion of anchor i) and candidate case j,
+        #   t_max[p, j] = max_{q in L_j} les_sim[p, q]
+        neg_inf = float("-inf")
+        t_max = torch.full(
+            (L_total, B), neg_inf, device=device, dtype=les_sim.dtype,
+        )
+        case_ids_local_exp = case_ids_local.unsqueeze(0).expand(L_total, -1)
+        t_max.scatter_reduce_(
+            1, case_ids_local_exp, les_sim,
+            reduce="amax", include_self=False,
+        )
+        t_max = torch.where(
+            t_max == neg_inf, torch.zeros_like(t_max), t_max,
+        )
+
+        # Step 2: mean over rows p grouped by anchor i.
+        forward_sum = torch.zeros(B, B, device=device, dtype=torch.float32)
+        case_ids_local_T = case_ids_local.unsqueeze(-1).expand(-1, B)
+        forward_sum.scatter_add_(0, case_ids_local_T, t_max.float())
+        counts = torch.zeros(B, device=device, dtype=torch.float32)
+        if case_ids_local.numel() > 0:
+            counts.scatter_add_(
+                0, case_ids_local,
+                torch.ones_like(case_ids_local, dtype=torch.float32),
+            )
+
+        if self.normalize_by_max:
+            # Symmetric max-mean normalized: 0.5 * (forward_sum + backward_sum)
+            # / max(N_i, N_j); used only when lesion_match == max_mean_normalized.
+            denom = torch.maximum(
+                counts.unsqueeze(-1), counts.unsqueeze(0),
+            ).clamp_min(1.0)
+            backward_sum = forward_sum.T
+            lesion_score = 0.5 * (forward_sum + backward_sum) / denom
+        else:
+            forward_mean = forward_sum / counts.clamp_min(1.0).unsqueeze(-1)
+            # backward[i,j] = forward[j,i] by symmetry of the inner construction.
+            backward_mean = forward_mean.T
+            lesion_score = 0.5 * (forward_mean + backward_mean)
+
+        valid = (counts > 0).unsqueeze(-1) & (counts > 0).unsqueeze(0)
+        lesion_score = torch.where(
+            valid, lesion_score, torch.zeros_like(lesion_score),
+        )
+
+        out = out + self.beta * lesion_score
+        out.fill_diagonal_(float("nan"))
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +369,18 @@ def make_collate(D: int):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def encode_all(encoder, cases, device, batch_size=256) -> torch.Tensor:
+def encode_all(encoder, cases_or_dataset, device, batch_size=256) -> torch.Tensor:
+    """Encode every case via the encoder; returns ``[N, D]`` fp32 CPU.
+
+    Accepts either a list of case dicts (builds a fresh
+    :class:`CaseEncoderDataset` internally — used by the small valid path
+    and by fish workflows) or an already-constructed dataset (reused
+    across eval epochs so we don't re-allocate the 8-18 GB ``records``
+    list every time on DDXPlus 200k).
+    """
     encoder.eval()
-    ds = CaseEncoderDataset(cases)
+    ds = (cases_or_dataset if isinstance(cases_or_dataset, CaseEncoderDataset)
+          else CaseEncoderDataset(cases_or_dataset))
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                         collate_fn=make_collate(D=ds.records[0]["global_emb"].size(0)),
                         num_workers=0)
@@ -150,29 +403,38 @@ def retrieval_metrics(
     valid_cases: list,
     train_cases: list,
     Ks: List[int] = (1, 5, 10, 20, 100),
+    query_batch: int = 512,
 ) -> dict:
     """Semantic exact-match recall @ K. A retrieved case is "correct" if any of
     its GT causes is also a GT cause of the valid query (string match).
+
+    Batched over queries: only the top-``max(Ks)`` rows are kept per chunk,
+    so peak memory is ``query_batch × Nt`` (not ``Nv × Nt``). Required at
+    DDXPlus scale where ``Nv × Nt`` exceeds VRAM (130k × 200k fp32 = 100 GB).
     """
-    sims = H_valid @ H_train.T                                    # [Nv, Nt]
-    ranks = sims.argsort(dim=1, descending=True)                  # [Nv, Nt]
     Nv = H_valid.size(0)
+    Ks_max = max(Ks)
     train_causes = [set(c["causes"]) for c in train_cases]
 
     recalls = {k: 0 for k in Ks}
     mrr_total = 0.0
-    Ks_max = max(Ks)
-    for vi in range(Nv):
-        gt = set(valid_cases[vi]["causes"])
-        if not gt:
-            continue
-        for r, ti in enumerate(ranks[vi, :Ks_max].tolist()):
-            if train_causes[ti] & gt:
-                mrr_total += 1.0 / (r + 1)
-                for k in Ks:
-                    if r < k:
-                        recalls[k] += 1
-                break
+    H_train_T = H_train.T
+    for vs in range(0, Nv, query_batch):
+        ve = min(vs + query_batch, Nv)
+        sims_b = H_valid[vs:ve] @ H_train_T                       # [bv, Nt]
+        top_idx_b = sims_b.topk(Ks_max, dim=1).indices.cpu()      # [bv, K]
+        for bi in range(top_idx_b.size(0)):
+            vi = vs + bi
+            gt = set(valid_cases[vi]["causes"])
+            if not gt:
+                continue
+            for r, ti in enumerate(top_idx_b[bi].tolist()):
+                if train_causes[ti] & gt:
+                    mrr_total += 1.0 / (r + 1)
+                    for k in Ks:
+                        if r < k:
+                            recalls[k] += 1
+                    break
 
     out = {f"sem_R@{k}": recalls[k] / Nv for k in Ks}
     out["sem_MRR"] = mrr_total / Nv
@@ -190,6 +452,44 @@ def main():
     ap.add_argument("--teacher_path", type=str,
                     default="diagnosis_model/cause_inference/outputs/case_db/"
                             "teacher_train_train.pt")
+    ap.add_argument("--teacher_mode", type=str,
+                    choices=["precomputed", "on_the_fly"],
+                    default="precomputed",
+                    help="precomputed (default, fish): load N×N table from "
+                         "--teacher_path. on_the_fly (DDXPlus): compute the "
+                         "BxB intra-batch block per step from cached "
+                         "globals/lesions stacks on GPU.")
+    ap.add_argument("--teacher_alpha", type=float, default=0.25,
+                    help="α for on-the-fly teacher case-similarity "
+                         "(matches build_teacher_table.py --alpha_global).")
+    ap.add_argument("--teacher_beta", type=float, default=0.75,
+                    help="β for on-the-fly teacher case-similarity.")
+    ap.add_argument("--teacher_lesion_match", type=str,
+                    choices=["max_mean", "max_mean_normalized"],
+                    default="max_mean",
+                    help="Lesion-match used by the on-the-fly teacher. "
+                         "hungarian unsupported — no batched equivalent and "
+                         "infeasible at the bank sizes this mode targets.")
+    ap.add_argument("--bank_dtype", type=str,
+                    choices=["fp32", "fp16", "bf16"], default="fp32",
+                    help="Storage dtype for the on-the-fly teacher's "
+                         "pre-stacked globals/lesions. fp32 = fish default; "
+                         "bf16 = DDXPlus (halves VRAM, matches case_db "
+                         "storage). Ignored when teacher_mode=precomputed.")
+    ap.add_argument("--max_train_cases", type=int, default=-1,
+                    help="Cap retained train cases via uniform per-shard "
+                         "subsampling. -1 (default) loads all. Required for "
+                         "DDXPlus (200000 mirrors Phase 1/2 convention).")
+    ap.add_argument("--max_valid_cases", type=int, default=-1,
+                    help="Cap retained valid cases via per-shard subsampling "
+                         "for the early-stop sem R@K eval. -1 loads all.")
+    ap.add_argument("--sample_seed", type=int, default=42,
+                    help="Seed for the per-shard subsample RNG. Must match "
+                         "the seed used elsewhere (Phase 2 train_pool, etc.) "
+                         "if you want aligned indices.")
+    ap.add_argument("--eval_query_batch", type=int, default=512,
+                    help="Query batch size for retrieval_metrics; controls "
+                         "peak query×bank sim memory.")
     ap.add_argument("--output_dir", type=str, required=True)
     # Encoder config
     ap.add_argument("--encoder_type", type=str, default="deepsets",
@@ -215,6 +515,19 @@ def main():
                     help="Add SupCon-style InfoNCE between h_final and GT cause text embs.")
     ap.add_argument("--infonce_weight", type=float, default=0.5)
     ap.add_argument("--infonce_temp", type=float, default=0.07)
+    ap.add_argument("--infonce_positives", type=str,
+                    choices=["cause_emb_indices", "pathology"],
+                    default="cause_emb_indices",
+                    help="Which cause-table rows are positives for the "
+                         "dual-target InfoNCE. Default 'cause_emb_indices' "
+                         "treats every entry of the per-case GT list as a "
+                         "positive (fish: 1 cause; DDXPlus v2: pathology + "
+                         "5 DDX = 6 positives — relatively easy). "
+                         "'pathology' restricts positives to a single "
+                         "strict pathology cause-table index "
+                         "(``pathology_emb_idx``, DDXPlus v2 only) for a "
+                         "harder distillation target. Errors if any case "
+                         "is missing the field.")
     # Hard-case mining (option b)
     ap.add_argument("--miss_weight", type=float, default=1.0,
                     help="Upweight hard cases (teacher miss >=1 GT) in sampler. "
@@ -235,8 +548,6 @@ def main():
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", type=str, default="cuda")
-    ap.add_argument("--max_train_cases", type=int, default=-1,
-                    help="Cap train set (for sanity / overfit tests).")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -247,18 +558,57 @@ def main():
     np.random.seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # Data
-    train_cases, valid_cases, _, meta = load_case_db(Path(args.case_db_dir))
-    if args.max_train_cases > 0:
-        train_cases = train_cases[:args.max_train_cases]
+    # Data — load_cases routes through the shared sharded loader so DDXPlus
+    # and fish case_dbs both work; per-shard subsample fires when
+    # max_{train,valid}_cases is set.
+    case_db_dir = Path(args.case_db_dir)
+    max_train = args.max_train_cases if args.max_train_cases > 0 else None
+    max_valid = args.max_valid_cases if args.max_valid_cases > 0 else None
+    train_cases = load_cases(
+        case_db_dir, "train",
+        max_cases=max_train, sample_seed=args.sample_seed,
+    )
+    valid_cases = load_cases(
+        case_db_dir, "valid",
+        max_cases=max_valid, sample_seed=args.sample_seed,
+    )
+    meta = json.load((case_db_dir / "meta.json").open())
     D = meta["global_dim"]
     print(f"train={len(train_cases)} valid={len(valid_cases)} D={D}")
 
     # Teacher
-    teacher_pkg = torch.load(args.teacher_path, weights_only=False, map_location="cpu")
-    teacher_full = teacher_pkg["scores"]                              # fp16 [Nt, Nt]
-    teacher_full = teacher_full[:len(train_cases), :len(train_cases)]
-    print(f"teacher table: {tuple(teacher_full.shape)}  config={teacher_pkg['config']}")
+    teacher_full = None
+    teacher_on_the_fly = None
+    if args.teacher_mode == "precomputed":
+        teacher_pkg = torch.load(
+            args.teacher_path, weights_only=False, map_location="cpu",
+        )
+        teacher_full = teacher_pkg["scores"]                          # fp16 [Nt, Nt]
+        if teacher_full.size(0) < len(train_cases):
+            raise ValueError(
+                f"precomputed teacher table is {teacher_full.size(0)}×"
+                f"{teacher_full.size(0)} but train has {len(train_cases)} "
+                f"cases — rebuild the teacher or use --teacher_mode on_the_fly."
+            )
+        teacher_full = teacher_full[:len(train_cases), :len(train_cases)]
+        print(
+            f"teacher table: {tuple(teacher_full.shape)}  "
+            f"config={teacher_pkg['config']}"
+        )
+    else:
+        bank_dtype = _BANK_DTYPES[args.bank_dtype]
+        teacher_on_the_fly = OnTheFlyTeacher(
+            train_cases, device=device, bank_dtype=bank_dtype,
+            alpha=args.teacher_alpha, beta=args.teacher_beta,
+            lesion_match=args.teacher_lesion_match,
+        )
+        print(
+            f"teacher: on_the_fly  bank_dtype={args.bank_dtype}  "
+            f"α={args.teacher_alpha} β={args.teacher_beta}  "
+            f"lesion_match={args.teacher_lesion_match}  "
+            f"G={tuple(teacher_on_the_fly.G.shape)} "
+            f"L={tuple(teacher_on_the_fly.L.shape)}"
+        )
 
     # Cause text embeddings for InfoNCE (frozen, L2-normed, kept on GPU)
     cause_text_embs = None
@@ -271,7 +621,14 @@ def main():
         print(f"cause_text_embs: [{V}, {D}]  (InfoNCE on, weight={args.infonce_weight}, "
               f"T={args.infonce_temp})")
 
-    train_ds = CaseEncoderDataset(train_cases)
+    # Build the training Dataset with ``free_source=True`` so per-case
+    # embedding tensors are dropped from ``train_cases`` immediately after
+    # being normalized into ``train_ds.records``. Keeping both lists costs
+    # 8-18 GB CPU on DDXPlus 200k. Source teacher bank (on GPU) and
+    # downstream metadata (``causes`` / ``cause_emb_indices``) are
+    # unaffected — only the embedding tensors are freed.
+    train_ds = CaseEncoderDataset(train_cases, free_source=True)
+    gc.collect()
     collate = make_collate(D)
 
     sampler = None
@@ -370,7 +727,12 @@ def main():
             lens = batch["lesion_lens"].to(device)
 
             z = encoder(g, L, lens)                                   # [B, D]
-            teacher_block = teacher_full[case_ids][:, case_ids].to(device).float()
+            if teacher_on_the_fly is not None:
+                teacher_block = teacher_on_the_fly.batch_block(
+                    case_ids.to(device),
+                )
+            else:
+                teacher_block = teacher_full[case_ids][:, case_ids].to(device).float()
 
             if args.loss_type == "listwise_kl":
                 loss_distill = listwise_kl_loss(z, teacher_block,
@@ -383,10 +745,24 @@ def main():
                 B = z.size(0)
                 V = cause_text_embs.size(0)
                 pos_mask = torch.zeros(B, V, dtype=torch.bool, device=device)
-                for i, cidxs in enumerate(batch["cause_indices"]):
-                    if cidxs:
-                        pos_mask[i, torch.tensor(cidxs, dtype=torch.long,
-                                                 device=device)] = True
+                if args.infonce_positives == "pathology":
+                    for i, pidx in enumerate(batch["pathology_indices"]):
+                        if pidx is None:
+                            raise ValueError(
+                                "--infonce_positives pathology requires "
+                                "pathology_emb_idx on every case "
+                                "(DDXPlus v2 schema). Case at batch index "
+                                f"{i} (case_id={int(batch['case_ids'][i])}) "
+                                "is missing it — rebuild the case_db with "
+                                "the v2 schema or use "
+                                "--infonce_positives cause_emb_indices."
+                            )
+                        pos_mask[i, int(pidx)] = True
+                else:
+                    for i, cidxs in enumerate(batch["cause_indices"]):
+                        if cidxs:
+                            pos_mask[i, torch.tensor(cidxs, dtype=torch.long,
+                                                     device=device)] = True
                 loss_infonce = case_cause_infonce_loss(
                     z, cause_text_embs, pos_mask, temp=args.infonce_temp,
                 )
@@ -417,9 +793,17 @@ def main():
 
         if (epoch + 1) % args.eval_every_epochs == 0:
             t1 = time.time()
-            H_train = encode_all(encoder, train_cases, device)
+            # Reuse train_ds (records list lives in RAM with normalized
+            # embeddings) instead of rebuilding the dataset from
+            # train_cases — train_cases no longer holds the embedding
+            # tensors after free_source=True.
+            H_train = encode_all(encoder, train_ds, device)
             H_valid = encode_all(encoder, valid_cases, device)
-            metrics = retrieval_metrics(H_valid, H_train, valid_cases, train_cases)
+            metrics = retrieval_metrics(
+                H_valid.to(device), H_train.to(device),
+                valid_cases, train_cases,
+                query_batch=args.eval_query_batch,
+            )
             log_row.update(metrics)
             log_row["eval_time_s"] = time.time() - t1
 

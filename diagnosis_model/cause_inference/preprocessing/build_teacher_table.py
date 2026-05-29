@@ -46,7 +46,7 @@ def main():
                             "teacher_train_train.pt")
     ap.add_argument("--alpha_global", type=float, default=0.25)
     ap.add_argument("--beta_lesion", type=float, default=0.75)
-    ap.add_argument("--lesion_match", type=str, default="hungarian",
+    ap.add_argument("--lesion_match", type=str, default="max_mean",
                     choices=["hungarian", "max_mean"])
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--report_every", type=int, default=200)

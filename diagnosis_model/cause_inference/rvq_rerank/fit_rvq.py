@@ -29,7 +29,9 @@ import torch.nn.functional as F
 from diagnosis_model.cause_inference.models.case_encoder import (
     EncoderConfig, build_encoder,
 )
-from diagnosis_model.cause_inference.phase1_baseline import load_case_db
+from diagnosis_model.cause_inference.phase1_baseline import (
+    load_case_db, load_cases,
+)
 from diagnosis_model.cause_inference.train_case_encoder import encode_all
 from diagnosis_model.cause_inference.rvq_rerank.rvq import RVQCodebook
 
@@ -56,6 +58,14 @@ def main():
     ap.add_argument("--kmeans_iters", type=int, default=25)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--max_train_cases", type=int, default=-1,
+                    help="Cap retained train cases via uniform per-shard "
+                         "subsampling. -1 (default) loads all (fish). "
+                         "200000 mirrors the Phase 1/2 DDXPlus convention.")
+    ap.add_argument("--sample_seed", type=int, default=42,
+                    help="Subsample RNG seed. Should match the seed used in "
+                         "train_case_encoder.py so z_train is fitted on the "
+                         "same subset of cases that the encoder was trained on.")
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -66,10 +76,19 @@ def main():
     encoder, enc_cfg = load_encoder(Path(args.encoder_ckpt), device)
     print(f"[encoder] type={enc_cfg.encoder_type}  D={enc_cfg.d_model}")
 
-    # 2. Load case database
-    train_cases, valid_cases, _, meta = load_case_db(Path(args.case_db_dir))
+    # 2. Load case database — sharded layout handled by load_cases. Only
+    # train cases are needed (RVQ fits codebooks on z_train).
+    case_db_dir = Path(args.case_db_dir)
+    max_train = args.max_train_cases if args.max_train_cases > 0 else None
+    train_cases = load_cases(
+        case_db_dir, "train",
+        max_cases=max_train, sample_seed=args.sample_seed,
+    )
+    meta = json.load((case_db_dir / "meta.json").open())
     D = meta["global_dim"]
-    print(f"[data] train={len(train_cases)}  valid={len(valid_cases)}  D={D}")
+    print(f"[data] train={len(train_cases)}  D={D}")
+    if args.max_train_cases > 0:
+        print(f"[data] subsample seed={args.sample_seed} max_train_cases={args.max_train_cases}")
 
     # 3. Encode train cases -> z [Nt, D]
     z_train = encode_all(encoder, train_cases, device).to(device).float()
