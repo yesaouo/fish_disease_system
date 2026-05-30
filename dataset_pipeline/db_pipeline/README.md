@@ -37,7 +37,7 @@ data/processed/
     symptoms.json                  ← snapshot
     labels.txt                     ← 只有傳入 --labels-txt 時才會 snapshot
     image_index.json               ← 本版本實際包含的 image ID（依 split 分組）
-    category_diff.txt              ← 只在有 unknown label 或 --strict 時寫出
+    category_diff.txt              ← 有用到任何類別就寫出：已用類別+數量 / 定義未用 / 未知類別+數量
     full/{train,valid,test}/
       <id>.jpg                     ← 實體檔，命名為 image_registry 內的 ID
       _annotations.coco.json       ← symptoms.json 完整類別空間

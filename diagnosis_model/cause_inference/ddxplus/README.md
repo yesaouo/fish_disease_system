@@ -675,7 +675,7 @@ Effect on pathology eval (200k bank × 5,000 valid, top_k_cases=20):
 ```bash
 $PY -m diagnosis_model.cause_inference.train_case_encoder \
   --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2 \
+  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_encoder \
   --teacher_mode on_the_fly --bank_dtype bf16 \
   --teacher_alpha 0.25 --teacher_beta 0.75 --teacher_lesion_match max_mean \
   --max_train_cases 200000 --max_valid_cases 5000 --sample_seed 42 \
@@ -700,9 +700,9 @@ is a training proxy — final paper numbers come from
 ```bash
 # Full 132k valid (paper-grade); drop --max_query_cases for full split.
 $PY -m diagnosis_model.cause_inference.ddxplus.eval_phase3 \
-  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
   --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase3_eval_v2_full \
+  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase3_eval_full \
   --query_split valid \
   --max_train_cases 200000 --sample_seed 42 \
   --max_query_cases -1 \
@@ -729,9 +729,9 @@ Phase 4 table as an explicit ablation that the reranker hurts here.
 for MK in "4 256" "2 64" "1 16"; do
   M=$(echo $MK | cut -d' ' -f1); K=$(echo $MK | cut -d' ' -f2)
   $PY -m diagnosis_model.cause_inference.rvq_rerank.fit_rvq \
-    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
     --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2 \
+    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq \
     --M $M --K $K --kmeans_iters 25 \
     --max_train_cases 200000 --sample_seed 42
 done
@@ -739,11 +739,11 @@ done
 # 2. (Optional) Train Light reranker on M=4 K=256 for ablation.
 #    Regime B (top_k_cases=1) early-stop, same as fish.
 $PY -m diagnosis_model.cause_inference.rvq_rerank.train_reranker \
-  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
   --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
   --rvq_M 4 --rvq_K 256 \
-  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_M4_K256 \
-  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/reranker_M4_K256_light \
+  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq/rvq_M4_K256 \
+  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq/reranker_M4_K256_light \
   --variant light --K_top 50 \
   --batch_size 64 --epochs 30 \
   --max_train_cases 200000 --max_valid_cases 5000 --sample_seed 42 \
@@ -763,10 +763,10 @@ point — see §"Cross-domain ABQ" / paper_tables.md Table G3).
 # Absorption sweep (3 codebooks × {dense, rvq_only, full_analytic})
 for MK_DIR in "M4_K256" "M2_K64" "M1_K16"; do
   $PY -m diagnosis_model.cause_inference.ddxplus.eval_phase4 \
-    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
-    --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_$MK_DIR \
+    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
+    --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq/rvq_$MK_DIR \
     --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_v2_full_$MK_DIR \
+    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_full_$MK_DIR \
     --methods dense rvq_only full_analytic \
     --max_train_cases 200000 --sample_seed 42 --max_query_cases -1 \
     --top_k_cases 20 --top_n_causes 20 --K_top 50 \
@@ -775,11 +775,11 @@ done
 
 # Optional Light reranker row (M=4 K=256 only)
 $PY -m diagnosis_model.cause_inference.ddxplus.eval_phase4 \
-  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
-  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_M4_K256 \
-  --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/reranker_M4_K256_light/best.pt \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
+  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq/rvq_M4_K256 \
+  --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq/reranker_M4_K256_light/best.pt \
   --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_v2_full_M4_K256_with_light \
+  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_full_M4_K256_with_light \
   --methods dense rvq_only light full_analytic \
   --max_train_cases 200000 --sample_seed 42 --max_query_cases -1 \
   --top_k_cases 20 --top_n_causes 20 --K_top 50 \
@@ -806,9 +806,9 @@ be read across the curve.
 
 ```bash
 $PY -m diagnosis_model.cause_inference.ddxplus.eval_ceah_compressed \
-  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
-  --rvq_dir      diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_M4_K256 \
-  --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/reranker_M4_K256_light/best.pt \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
+  --rvq_dir      diagnosis_model/cause_inference/outputs/ddxplus_rvq/rvq_M4_K256 \
+  --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq/reranker_M4_K256_light/best.pt \
   --case_db_dir  diagnosis_model/cause_inference/outputs/ddxplus_case_db \
   --ceah_ckpt    diagnosis_model/cause_inference/outputs/ddxplus_ceah/best_ceah.pt \
   --output_dir   diagnosis_model/cause_inference/outputs/ddxplus_ceah_compressed_eval \

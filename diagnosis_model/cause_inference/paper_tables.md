@@ -719,19 +719,19 @@ DDXPlus 是 FaCE-R 跨域擴展：把魚的視覺 lesion 替換成 49-class clin
 for MK in "4 256" "2 64" "1 16"; do
   M=$(echo $MK | cut -d' ' -f1); K=$(echo $MK | cut -d' ' -f2)
   $PY -m diagnosis_model.cause_inference.rvq_rerank.fit_rvq \
-    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
     --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2 \
+    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq \
     --M $M --K $K --max_train_cases 200000 --sample_seed 42
 done
 
 # 2. eval 3 個 (M, K) 全 valid（每個 ~10 min；dense + rvq_only + full_analytic）
 for MK_DIR in "M4_K256" "M2_K64" "M1_K16"; do
   $PY -m diagnosis_model.cause_inference.ddxplus.eval_phase4 \
-    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
-    --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_$MK_DIR \
+    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
+    --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq/rvq_$MK_DIR \
     --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_v2_full_$MK_DIR \
+    --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_full_$MK_DIR \
     --methods dense rvq_only full_analytic \
     --max_train_cases 200000 --sample_seed 42 --max_query_cases -1
 done
@@ -739,20 +739,20 @@ done
 # 3. (optional, M=4 K=256 only) Light reranker ablation row — confirms
 #    reranker pulls rvq_only back toward suboptimal dense (~30 min train + 10 min eval)
 $PY -m diagnosis_model.cause_inference.rvq_rerank.train_reranker \
-  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
   --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
   --rvq_M 4 --rvq_K 256 \
-  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_M4_K256 \
-  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/reranker_M4_K256_light \
+  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq/rvq_M4_K256 \
+  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq/reranker_M4_K256_light \
   --variant light --K_top 50 --batch_size 64 --epochs 30 \
   --max_train_cases 200000 --max_valid_cases 5000 --sample_seed 42 \
   --eval_top_k_cases 1
 $PY -m diagnosis_model.cause_inference.ddxplus.eval_phase4 \
-  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
-  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_M4_K256 \
-  --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/reranker_M4_K256_light/best.pt \
+  --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
+  --rvq_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq/rvq_M4_K256 \
+  --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq/reranker_M4_K256_light/best.pt \
   --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_v2_full_M4_K256_with_light \
+  --output_dir diagnosis_model/cause_inference/outputs/ddxplus_phase4_eval_full_M4_K256_with_light \
   --methods dense rvq_only light full_analytic \
   --max_train_cases 200000 --sample_seed 42 --max_query_cases -1 \
   --top_k_cases 20 --K_top 50
@@ -810,9 +810,9 @@ ABQ scaling law `D ≈ c·ε^p/K^q`（魚側 fit 在 Table D7）描述 quantizat
 for M in 1 2 4 8; do
   for K in 16 64 256 1024; do
     $PY -m diagnosis_model.cause_inference.rvq_rerank.fit_rvq \
-      --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
+      --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
       --case_db_dir diagnosis_model/cause_inference/outputs/ddxplus_case_db \
-      --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2 \
+      --output_dir diagnosis_model/cause_inference/outputs/ddxplus_rvq \
       --M $M --K $K --max_train_cases 200000 --sample_seed 42
   done
 done

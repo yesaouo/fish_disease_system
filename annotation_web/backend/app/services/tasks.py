@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
@@ -88,7 +87,14 @@ def select_next_task(
     if not candidates:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="沒有可用任務")
 
-    task_id = random.choice(candidates)
+    # Resume from the editor's last submission: dispatch the first un-edited
+    # task after it (in /images order), wrapping to the start once the editor
+    # has reached the end. Falls back to the first candidate if the editor has
+    # not submitted anything in this dataset yet. `candidates` preserves the
+    # /images ordering, so a single forward scan suffices.
+    last_submitted = storage_service.get_last_submitted_task_id(dataset, editor_name, settings)
+    anchor_index = index_map[last_submitted][0] if last_submitted in index_map else 0
+    task_id = next((t for t in candidates if index_map[t][0] > anchor_index), candidates[0])
     index, image_filename = index_map[task_id]
 
     storage_service.ensure_task_for_image(dataset, task_id, image_filename, settings)

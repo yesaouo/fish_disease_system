@@ -657,6 +657,38 @@ def list_dispatch_state(
         conn.close()
 
 
+def get_last_submitted_task_id(
+    dataset: str,
+    editor_name: str,
+    settings: Settings | None = None,
+) -> str | None:
+    """Return the task_id the editor most recently submitted, or None.
+
+    Used by /api/tasks/next to dispatch the task right after the editor's last
+    submission (in /images order) instead of a random one. Reads the `history`
+    table, which records one row per `submit` with `updated_by` + `updated_at`.
+    """
+    settings = _ensure_settings(settings)
+    dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
+    db_path = get_db_path(dataset_dir, settings)
+    if not db_path.exists():
+        return None
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT task_id FROM history
+            WHERE updated_by = ? AND action = 'submit'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1;
+            """,
+            (editor_name,),
+        ).fetchone()
+        return str(row["task_id"]) if row is not None else None
+    finally:
+        conn.close()
+
+
 def list_task_rows(
     dataset: str,
     settings: Settings | None = None,

@@ -261,7 +261,7 @@ def main() -> int:
     registry.save()
     write_image_index(version_dir / "image_index.json", version, tasks_per_split)
 
-    if stats.skipped_bboxes_unknown_label:
+    if stats.used_labels or stats.skipped_bboxes_unknown_label:
         write_category_diff(
             version_dir / "category_diff.txt",
             stats.skipped_bboxes_unknown_label,

@@ -20,13 +20,13 @@ DDX NDCG. Decisive comparisons at the production point (gamma=0.75, top_k=20):
   (b) light    vs rvq_only    -> does the reranker recover/hurt after CEAH?
   (c) full_analytic vs light  -> is the gap an architecture limit (oracle Delta)?
 
-Coarse sims mirror eval_phase4.py exactly (encoder_v2 z, F.normalize, RVQ encode).
+Coarse sims mirror eval_phase4.py exactly (encoder z, F.normalize, RVQ encode).
 
 Run (repo root, SDM env):
   $PY -m diagnosis_model.cause_inference.ddxplus.eval_ceah_compressed \
-    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder_v2/best_encoder.pt \
-    --rvq_dir      diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/rvq_M4_K256 \
-    --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq_v2/reranker_M4_K256_light/best.pt \
+    --encoder_ckpt diagnosis_model/cause_inference/outputs/ddxplus_encoder/best_encoder.pt \
+    --rvq_dir      diagnosis_model/cause_inference/outputs/ddxplus_rvq/rvq_M4_K256 \
+    --reranker_ckpt diagnosis_model/cause_inference/outputs/ddxplus_rvq/reranker_M4_K256_light/best.pt \
     --case_db_dir  diagnosis_model/cause_inference/outputs/ddxplus_case_db \
     --ceah_ckpt    diagnosis_model/cause_inference/outputs/ddxplus_ceah/best_ceah.pt \
     --output_dir   diagnosis_model/cause_inference/outputs/ddxplus_ceah_compressed_eval \

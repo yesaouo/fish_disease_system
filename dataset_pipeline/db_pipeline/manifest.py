@@ -64,6 +64,13 @@ def write_manifest(
             "dropped_by_comments": filter_stats.dropped_by_comments,
             "dropped_by_submit_filter": filter_stats.dropped_by_submit_filter,
             "dropped_by_missing_image": filter_stats.dropped_by_missing_image,
+            "used_labels": [
+                {"label": k, "count": v}
+                for k, v in sorted(
+                    filter_stats.used_labels.items(),
+                    key=lambda x: (-x[1], x[0]),
+                )
+            ],
             "skipped_bboxes_unknown_label": [
                 {"label": k, "count": v}
                 for k, v in sorted(
@@ -102,9 +109,14 @@ def write_category_diff(
     used = set(used_names.keys()) | set(unknown_in_data.keys())
     unused = sorted(defined_names - used)
     unknown = sorted(unknown_in_data.keys())
+    used_sorted = sorted(used_names.items(), key=lambda x: (-x[1], x[0]))
 
     lines: list[str] = []
     lines.append("# Category diff report")
+    lines.append("")
+    lines.append(f"## Used in data (defined in symptoms.json) ({len(used_sorted)})")
+    for name, count in used_sorted:
+        lines.append(f"  - {name}  (count={count})")
     lines.append("")
     lines.append(f"## Defined in symptoms.json but never used in data ({len(unused)})")
     for name in unused:
