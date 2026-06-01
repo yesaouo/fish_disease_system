@@ -24,39 +24,6 @@ def _ensure_settings(settings: Settings | None) -> Settings:
     return settings or _settings
 
 
-def _is_blank(value: str) -> bool:
-    return not (value or "").strip()
-
-
-def _required_fields_ok(doc) -> bool:
-    try:
-        dets = getattr(doc, "detections", []) or []
-        is_healthy = (len(dets) == 0) or all((getattr(d, "label", "") or "").strip() == HEALTHY_LABEL for d in dets)
-        # Healthy: no required fields.
-        if is_healthy:
-            return True
-
-        if _is_blank(getattr(doc.overall, "colloquial_zh", "")):
-            return False
-        if _is_blank(getattr(doc.overall, "medical_zh", "")):
-            return False
-        if not (getattr(doc, "detections", []) or []):
-            return False
-        for det in doc.detections:
-            label = (getattr(det, "label", "") or "").strip()
-            if _is_blank(label):
-                return False
-            if label != HEALTHY_LABEL and getattr(det, "evidence_index", None) is None:
-                return False
-        if not (getattr(doc, "global_causes_zh", []) or []):
-            return False
-        if not (getattr(doc, "global_treatments_zh", []) or []):
-            return False
-        return True
-    except Exception:
-        return False
-
-
 def _compute_stats(dataset: str, settings: Settings) -> StatsResponse:
     image_filenames = storage_service.list_images(dataset, settings)
     task_ids = [Path(fn).stem for fn in image_filenames]

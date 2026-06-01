@@ -9,7 +9,17 @@
 1. 傳統的 closed-vocabulary multi-label classification **無法應用**
 2. 為了符合實際的診斷應用需求，系統必須具備「**lesion-grounded explainability**」——預測必須能對應到具體病灶
 
-FaCE-R 把問題重構成 **case-based 檢索 + lesion-attribution**，兩階段對 VLM 的依賴不對稱：
+FaCE-R 把問題重構成 **case-based 檢索 + lesion-attribution**。論文層級上，整個系統 = **兩個 model** + 中間一層**非參數 case bank**，流程 **GRACE（Case Encoding）→ case bank 檢索 → CEAH（Cause Inference）**：
+
+- **GRACE**（*Grounded Region Aggregated Case Encoder*，part 1）：image(+text) → 單一 **Matryoshka case 向量** + 結構化 findings（box / anomaly / lesion）。一個 model、一次 forward（子模組分階段訓練、SigLIP2 凍結）。內含兩個貢獻——**GROD**（grounding 前端：偵測 + semantic head，faithfulness-by-construction）與 **Aggregator**（pooling 後端：set→case 向量，對外稱 Aggregator，DeepSets 實作）。
+- **case bank 檢索**（兩 model 之間，**非參數**＝case-based 記憶，不是第三個 model）：case 向量 → top-k cases → 候選病因池 + 檢索 prior。
+- **CEAH**（part 2）：step 2 唯一的學習元件，與檢索 prior 經 γ 融合 → faithful 病因排序 + α。（γ 隨資料集翻、非調參：fish γ=0 純 CEAH、DDXPlus γ=0.75 prior 扛大半，別讓「model 2 = CEAH」蓋掉 prior 份量。）
+
+**三個掛牌貢獻 = GROD / ABQ / CEAH**。其中 **ABQ** 已從「模組」改述為「Aggregator 輸出向量的壓縮-robustness 性質」：該向量經 Matryoshka 維度截斷或 RVQ 量化都不掉，因為檢索時的 aggregation buffer 吸收損害（scaling law `D≈c·ε/K^{0.84}`）——是跨介面 claim，不是架構圖上的 box；RVQ 是部署期壓縮實作。Matryoshka 同樣是輸出向量的*性質*（nested 前綴 + 各自 L2-norm），不是一層。
+
+> 程式仍以 Phase 0–4 + [`../grod/`](../grod/) 組織：GRACE = `grod/`(GROD) + Phase 3 Aggregator（`train_case_encoder.py`, DeepSets）的論文級合稱，CEAH = Phase 2；**Matryoshka 輸出尚未實作（目標）**，目前 Phase 3 仍吐 dense z。
+
+下面的 Phase 流程是 offline/online 的實作對照，兩階段對 VLM 的依賴不對稱：
 
 ```
 Query 影像
