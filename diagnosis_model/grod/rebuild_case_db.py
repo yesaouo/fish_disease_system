@@ -112,6 +112,11 @@ def main():
     cause_pack = torch.load(src / "cause_text_embs.pt", weights_only=False)
     out_dim = cause_pack["embeddings"].size(-1)
 
+    # carry forward the dims downstream consumers read (train_case_encoder reads
+    # meta["global_dim"]). global_emb is copied verbatim from source, so the
+    # source meta's dims still hold.
+    src_meta = json.load(open(src / "meta.json"))
+
     if args.from_joint:
         head = None
         hidden_dim = None
@@ -147,6 +152,8 @@ def main():
         "from_joint": bool(args.from_joint),
         "hidden_dim": hidden_dim,
         "out_dim": out_dim,
+        "global_dim": src_meta["global_dim"],
+        "lesion_dim": src_meta["lesion_dim"],
         "note": ("lesion_embs replaced by trained joint pred_semantic z"
                  if args.from_joint else
                  "lesion_embs replaced by frozen-probe semantic-head z (RF-DETR hs routing)")

@@ -202,12 +202,19 @@ class CEAH(nn.Module):
         lesion_mask: torch.Tensor,          # [B, max_N]
         cause_emb: torch.Tensor,            # [B, D_g]
         force_mask: Optional[torch.Tensor] = None,   # [B, max_Ne]: AND'ed with ev_mask
+        lesion_weights: Optional[torch.Tensor] = None,  # [B, max_N]: soft objectness
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (score [B], alpha [B, max_Ne], evidence_mask [B, max_Ne]).
 
         `force_mask` (if provided) is AND'ed with the internal ev_mask before
         alpha is computed — used at eval time to ablate evidence types
         (e.g., zero out global to verify the score depends on lesion).
+
+        `lesion_weights` [B, max_N] (optional): per-lesion soft weight in [0,1]
+        (detector objectness). Added as a log-bias to the support logits so the
+        attribution gates lesions by confidence: background (w≈0) → log(w)≈-inf
+        → α≈0. Reduces bytes-exactly to the hard path when omitted (log 1 = 0)
+        and to a hard mask when weights ∈ {0,1}.
         """
         B = global_emb.size(0)
         E, ev_mask = self.project_evidence(
@@ -223,7 +230,14 @@ class CEAH(nn.Module):
         # Per-evidence support: input = [c, e, c⊙e]
         feats = torch.cat([c_b, E, c_b * E], dim=-1)                        # [B, max_Ne, 3D]
         s_logits = self.support(feats).squeeze(-1)                          # [B, max_Ne]
-        s_logits = s_logits.masked_fill(~ev_mask, -1e9)
+        # Evidence weight: valid mask, with lesion positions scaled by objectness.
+        # Token layout: 0=global, 1=text, 2..=lesions.
+        ev_w = ev_mask.to(s_logits.dtype)
+        if lesion_weights is not None:
+            ev_w = ev_w.clone()
+            ev_w[:, 2:] = ev_w[:, 2:] * lesion_weights.to(s_logits.dtype)
+        s_logits = s_logits + torch.log(ev_w.clamp_min(1e-9))
+        s_logits = s_logits.masked_fill(ev_w <= 0, -1e9)
 
         if self.attribution_mode == "sigmoid":
             alpha = torch.sigmoid(s_logits)                                  # [B, max_Ne]

@@ -121,9 +121,14 @@ def write_views(
                 full_ann_id += 1
                 new_cat_id = labels_id_map.get(orig_cat_id)
                 if new_cat_id is not None:
-                    det_coco["annotations"].append(
-                        _annotation_entry(det_ann_id, task.image_id, det, new_cat_id)
-                    )
+                    det_ann = _annotation_entry(det_ann_id, task.image_id, det, new_cat_id)
+                    # Per-box symptom category for GROD joint training's loss_semantic
+                    # (the fork's coco loader reads this field, falls back to -1 when
+                    # absent). category_id stays class-agnostic (ABNORMAL); this extra
+                    # field lets train_joint consume the detection view directly, so no
+                    # separate build_merged_coco / _merged_semantic join is needed.
+                    det_ann["symptom_category_id"] = orig_cat_id
+                    det_coco["annotations"].append(det_ann)
                     det_ann_id += 1
 
         (full_split / "_annotations.coco.json").write_text(

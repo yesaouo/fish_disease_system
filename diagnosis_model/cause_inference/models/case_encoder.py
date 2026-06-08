@@ -134,7 +134,7 @@ class MeanPoolEncoder(nn.Module):
         else:
             self.head = nn.Identity()
 
-    def forward(self, global_emb, lesion_pad, lesion_lens):
+    def forward(self, global_emb, lesion_pad, lesion_lens, lesion_weights=None):
         seq = self.token_builder(global_emb, lesion_pad, lesion_lens)  # [B, L, D]
         # mask: token 0 is always real; tokens 1..max_N follow lesion_lens.
         max_N = lesion_pad.size(1)
@@ -142,11 +142,14 @@ class MeanPoolEncoder(nn.Module):
         lesion_mask = (
             torch.arange(max_N, device=device).unsqueeze(0) < lesion_lens.unsqueeze(1)
         )
-        full_mask = torch.cat(
-            [torch.ones(seq.size(0), 1, device=device, dtype=torch.bool),
-             lesion_mask], dim=1
-        ).unsqueeze(-1).to(seq.dtype)
-        h = (seq * full_mask).sum(1) / full_mask.sum(1).clamp(min=1.0)
+        les_w = lesion_mask.to(seq.dtype)
+        if lesion_weights is not None:
+            les_w = les_w * lesion_weights.to(seq.dtype)
+        full_w = torch.cat(
+            [torch.ones(seq.size(0), 1, device=device, dtype=seq.dtype), les_w],
+            dim=1,
+        ).unsqueeze(-1)
+        h = (seq * full_w).sum(1) / full_w.sum(1).clamp(min=1e-6)
         z = self.head(h)
         z = F.normalize(z, dim=-1)
         return z
@@ -167,25 +170,29 @@ class DeepSetsEncoder(nn.Module):
             nn.Linear(cfg.head_hidden, cfg.d_model),
         )
 
-    def forward(self, global_emb, lesion_pad, lesion_lens):
+    def forward(self, global_emb, lesion_pad, lesion_lens, lesion_weights=None):
+        """``lesion_weights`` [B, max_N] (optional): per-lesion soft weight in
+        [0,1] (e.g. detector objectness). When given, mean/max/sum pooling use
+        it as a continuous mask; the global token keeps weight 1. Reduces
+        bytes-exactly to the hard path when weights ∈ {0,1} (and is omitted)."""
         seq = self.token_builder(global_emb, lesion_pad, lesion_lens)  # [B, L, D]
         max_N = lesion_pad.size(1)
         device = lesion_pad.device
         lesion_mask = (
             torch.arange(max_N, device=device).unsqueeze(0) < lesion_lens.unsqueeze(1)
         )
-        full_mask = torch.cat(
-            [torch.ones(seq.size(0), 1, device=device, dtype=torch.bool),
-             lesion_mask], dim=1
-        ).unsqueeze(-1)
-        # mean
-        m_sum = (seq * full_mask.to(seq.dtype)).sum(1)
-        m_cnt = full_mask.sum(1).clamp(min=1.0).to(seq.dtype)
-        h_mean = m_sum / m_cnt
-        # max (set masked positions to very-neg before max)
-        seq_for_max = seq.masked_fill(~full_mask, float("-inf"))
+        les_w = lesion_mask.to(seq.dtype)
+        if lesion_weights is not None:
+            les_w = les_w * lesion_weights.to(seq.dtype)
+        # full weight: global token = 1, lesions = (soft) mask
+        full_w = torch.cat(
+            [torch.ones(seq.size(0), 1, device=device, dtype=seq.dtype), les_w],
+            dim=1,
+        ).unsqueeze(-1)                                          # [B, L, 1]
+        m_sum = (seq * full_w).sum(1)                            # weighted sum
+        h_mean = m_sum / full_w.sum(1).clamp(min=1e-6)           # weighted mean
+        seq_for_max = seq.masked_fill(full_w < 1e-4, float("-inf"))
         h_max = seq_for_max.max(dim=1).values
-        # sum
         h_sum = m_sum
         h = torch.cat([h_mean, h_max, h_sum], dim=-1)
         z = self.head(h)

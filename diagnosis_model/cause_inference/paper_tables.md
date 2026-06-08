@@ -819,3 +819,130 @@ done
 # 之後寫 ddxplus/eval_absorption_surface.py（複用 rvq_rerank/eval_absorption_surface.py
 # 邏輯，但 metric 改 pathology R@1）整合 fit
 ```
+
+---
+
+## H. Soft lesion evidence（no-hard-threshold）+ GROD-side abstain
+
+> 把 `gpu_infer.py` 的硬門檻 lesion 選取（`obj>det_thresh` 硬選、abstain＝零保留 box）改成
+> **soft**：GROD 一次 forward 出 300 個 query，每個帶 `w=sigmoid(objectness)`，全留、用 w 當連續
+> mask（Aggregator 加權 pooling、CEAH `α += log w` gate）。共用模型 `case_encoder.py` /
+> `ceah.py` 加可選 `lesion_weights`（不傳＝位元相同、傳 0/1＝退化回硬 mask；hard baseline 不受影響）。
+> 五步重訓全在 `diagnosis_model/grod/` 獨立 `_soft` 腳本，輸出 `encoder_grod_soft` / `bank_z_soft` /
+> `ceah_grod_soft`，不覆蓋既有產物。
+
+### Table H1 — Soft vs hard CEAH：端到端 cause 檢索持平
+
+| Method | Lesion evidence | sem R@1 | sem R@5 | sem R@10 | sem R@20 | sem MRR | coverage |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Hard CEAH（`ceah_jointDistRawP`） | det_thresh 硬選 GT-matched | 19.61% | 38.55% | 44.61% | 51.42% | 0.2894 | 90.04% |
+| **Soft CEAH（`ceah_grod_soft`）** | 300 query 軟加權，top-32 by w | 19.46% | 38.17% | **45.06%** | **52.69%** | **0.2898** | **92.07%** |
+
+> 把硬門檻拿掉、改全 300 軟加權，**cause 檢索持平（sem MRR +0.0004、R@10/R@20 微升）**。
+> 註：兩列檢索前端不同（soft＝`encoder_grod_soft`+`bank_z_soft`；hard＝GT-lesion Phase 1 max_mean），
+> 非完全受控對照，結論僅作「軟證據不退化」用。Aggregator 同 metric 亦持平（soft sem R@10 案例式
+> exact-match 3.05% ≥ hard 2.54%；絕對值低＝fish cause 94.7% singleton 本質）。
+
+### Table H2 — Soft CEAH faithfulness（top-32）守住
+
+| Condition（score drop ＝ baseline − masked） | all | global-type | lesion-type |
+|---|---:|---:|---:|
+| `no_global` | +0.0026 | −0.0098 | −0.0102 |
+| **`no_lesion`**（招牌，須為正） | **+0.0486** | +0.0551 | +0.0533 |
+| `no_top_α`（應為最大單-token 掉分） | **+0.0495** | +0.0483 | +0.0327 |
+| `no_random`（sanity，應≈0） | +0.0002 | — | — |
+
+> 軟證據**沒有破壞 lesion-grounding**：`no_lesion` 正且大、`no_top_α` 最大、`no_random`≈0。
+> 註：數值不可與 hard（`no_lesion`≈+0.016~0.018）直接比大小（soft 遮 32 token vs hard ~1.7），
+> 能比的是正負號與結構。lesion-type vs global-type 幾乎相等（0.0533 vs 0.0551），不呈現「lesion-type
+> 更依賴 lesion」的對比 → 誠實標註。
+
+### Table H3 — CEAH 證據選法 sweep（headline：retrieval flat × faithfulness K-敏感）★
+
+固定 soft 檢索（`encoder_grod_soft`+`bank_z_soft`）+ 同一顆 soft CEAH，只換餵 CEAH 的證據選法。
+
+**(a) Retrieval — 幾乎不受影響（≤0.5 pp）**
+
+| Mode | avg lesions | sem R@1 | sem R@10 | sem R@20 | sem MRR |
+|---|---:|---:|---:|---:|---:|
+| thresh@0.3（w>0.3，權重=1，模擬 hard） | 1.9 | 19.09% | 44.91% | 52.32% | 0.2864 |
+| top-16 | 16 | 19.39% | 45.06% | 52.77% | 0.2886 |
+| **top-32（production）** | 32 | 19.46% | 45.06% | 52.69% | 0.2898 |
+| top-64 | 64 | 19.31% | 44.91% | 52.54% | 0.2895 |
+| all-300 | 300 | 19.69% | 45.06% | 52.84% | **0.2916** |
+
+**(b) Faithfulness — 隨 K 單調下降，all-300 反轉**
+
+| Mode | `no_lesion`（須正） | `no_top_α` | `no_random` |
+|---|---:|---:|---:|
+| thresh@0.3 | +0.0696 | 0.0174 | 0.0093 |
+| top-16 | +0.0563 | 0.0413 | 0.0012 |
+| **top-32（production）** | **+0.0486** | **0.0495** | −0.0007 |
+| top-64 | +0.0367 | 0.0588 | −0.0004 |
+| all-300 | **−0.0062** ⚠ | 0.0689 | −0.0001 |
+
+> **經典 retrieval↑ / faithfulness↓ 取捨**（呼應 Table C7 D-i 的奇異 Pareto）。retrieval 對證據選法
+> 不敏感（all-300 邊際最佳 0.2916），但 faithfulness 隨餵入 token 數單調下降，**all-300 把
+> `no_lesion` 弄成負（−0.0062，faithfulness 反轉）**——軟 attention 被背景稀釋、global 接管。
+> **top-32 是唯一同時滿足「`no_lesion` 正 ∧ `no_top_α` 為最大單-token 掉分 ∧ `no_random`≈0」的點**，
+> 故為 production：不只是計算限制（CEAH 把 lesion 複製到 ~87 候選×batch，全 300 ~150× OOM），
+> faithfulness 角度也是 sweet spot。caveat：模型在 top-32 訓練，thresh/all 對它略 OOD（測 robustness
+> 非 per-regime 重訓對照）。
+
+### Table H4 — GROD-side abstain head vs objectness 閥值
+
+GROD 一次 forward 的 `g`(pred_global) + objectness 統計判「有沒有病」，取代 `det_thresh` 啟發式。
+
+| Abstain scorer | 輸入 | AUROC | disease recall | healthy reject |
+|---|---|---:|---:|---:|
+| objectness 閥值（`max_i w_i`） | col0 max | 0.958 | — | — |
+| objectness 總量（`Σ_i w_i`） | col0 sum | 0.978 | — | — |
+| **learned disease head** | `concat(g, max_w, Σw)`=770 | **0.991** | **99.94%** | 93.6% |
+
+> learned head（凍結 GROD probe，正＝病例影像 / 負＝`data/healthy_images` 7034 張）只**微勝**強
+> objectness baseline（Σw 0.978），實務操作點等效；價值在 robustness（g 兜底 objectness 失靈的非典型
+> 影像）。**註（重要修正）**：接線時發現三支腳本原讀 `pred_logits[:,1]`＝RF-DETR `num_classes+1`
+> 的死保留槽（focal 初始 ~0.0014、從未訓練），ABNORMAL 類在 **col 0**（cat_id 0）；已全改 `[:,0]`。
+> 早先「objectness 閥值近無效（max_w AUROC 0.79、Σw 0.15 反指標）」是測到死欄的假象，**作廢**。
+
+### Table H5 — 輕量 end-to-end co-adaptive fine-tune（negative result）
+
+GROD 凍結，warm-start enc+ceah，每 epoch：當前 enc 重編 bank → 重建 soft 候選池 → 訓 CEAH → 訓 enc（5 epochs）。
+
+| Config | sem R@1 | sem R@10 | sem MRR | `no_lesion` | `no_top_α` |
+|---|---:|---:|---:|---:|---:|
+| **Staged（ep0；production）** | 19.46% | **45.06%** | 0.2898 | **+0.0486** | +0.0495 |
+| e2e ep1 | 19.24% | 44.46% | 0.2859 | +0.0582 | 0.0312 |
+| e2e ep3 | 19.84% | 44.84% | 0.2876 | +0.0330 | 0.0313 |
+| e2e ep5（best sem_MRR） | 19.99% | 44.91% | 0.2902 | +0.0296 | 0.0365 |
+
+> **負結果：輕量 end-to-end 無 retrieval 增益、且微降 faithfulness。** sem_MRR 在 0.283–0.290 噪音帶
+> 游走（ep5「最佳」+0.0004 vs staged），R@10 微降；`no_lesion` 從 +0.0486 掉到 +0.0296（仍正、仍
+> faithful，但變弱）。`enc_loss` 幾乎不動（9.62→9.58）。**綜合最佳＝ep0 staged**（retrieval 持平、
+> faithfulness 最高）。
+> **為何梯度級 e2e 不存在**：Aggregator 的 `zq` 不被 CEAH 消費，且 top-k 選池不可微 → CEAH loss 無
+> 梯度回 enc；唯一可做的耦合是資料級（用當前 enc 的檢索刷新 CEAH 候選池）。該資料級 co-adaptation
+> 把 CEAH 往 retrieval 推、faithfulness 略退（再次呼應 retrieval↑/faithfulness↓ 取捨）。
+> **結論：採用 staged，模組不需互相 fine-tune**（現成回答「為何不 end-to-end」）。production 維持
+> `encoder_grod_soft`+`ceah_grod_soft`；`e2e_soft/` 僅作此 ablation。
+
+### 取得指令（H 全表，SDM env，repo root）
+
+```bash
+PY=/home/lab603/anaconda3/envs/SDM/bin/python
+# --- soft pipeline 五步（#1~#4） ---
+$PY -m diagnosis_model.grod.extract_soft_inputs               # #1 soft_inputs/{train,valid}.pt
+$PY -m diagnosis_model.grod.train_case_encoder_soft           # #2 encoder_grod_soft
+$PY -m diagnosis_model.grod.build_soft_bank                   # #3 bank_z_soft.pt
+$PY -m diagnosis_model.grod.train_ceah_soft                   # #4a ceah_grod_soft  -> Table H1
+$PY -m diagnosis_model.grod.faithfulness_eval_soft            # #4b                 -> Table H2
+# --- 證據選法 sweep（eval-only，Table H3） ---
+$PY -m diagnosis_model.grod.eval_ceah_soft_ksweep             # H3(a) retrieval
+$PY -m diagnosis_model.grod.eval_faithfulness_soft_sweep      # H3(b) faithfulness
+# --- abstain head（Table H4） ---
+$PY -m diagnosis_model.grod.train_disease_head                # disease_head.pt (col0)
+# --- 輕量 end-to-end co-adaptive fine-tune（Table H5，negative result） ---
+$PY -m diagnosis_model.grod.finetune_e2e_soft --epochs 5      # -> outputs/e2e_soft (ablation only)
+# --- 端到端 soft cascade（對照 gpu_infer.py hard baseline） ---
+$PY -m diagnosis_model.grod.gpu_infer_soft --image <img> --verify
+```
