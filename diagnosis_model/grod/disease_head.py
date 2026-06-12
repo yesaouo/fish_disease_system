@@ -77,3 +77,27 @@ def load_disease_head(ckpt_path, device="cuda"):
     head = ThresholdHead(**ck["head_cfg"]).to(device).eval()
     head.load_state_dict(ck["head_state"])
     return head, float(ck["tau"])
+
+
+# ---------------------------------------------------------------------------
+# Abstain (health verdict) head — concat(g[768], max_w, Σw) free head.
+# This is the head the demo loads as the 健/病 gate (verdict = p ≥ τ); trained by
+# train_abstain_head.py. Distinct from the ThresholdHead τ-selector above.
+# ---------------------------------------------------------------------------
+
+def abstain_feat(g: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Build the 770-d abstain feature for one image.
+
+    g: [768] global; w: [Q] per-query objectness sigmoids -> [770]
+    concat(g, max_i w_i, Σ_i w_i).
+    """
+    g, w = g.float(), w.float()
+    return torch.cat([g, w.amax().view(1), w.sum().view(1)])
+
+
+def load_abstain_head(ckpt_path, device="cuda"):
+    """Return (DiseaseHead[eval, on device], tau) for the 770 concat(g,max_w,Σw) head."""
+    ck = torch.load(ckpt_path, weights_only=False, map_location=device)
+    head = DiseaseHead(int(ck["dim"])).to(device).eval()
+    head.load_state_dict(ck["head_state"])
+    return head, float(ck["tau"])

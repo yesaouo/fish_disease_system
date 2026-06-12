@@ -7,7 +7,7 @@ DINO global become a CEAH attribution shortcut, restoring faithfulness — while
 still being producible from one RF-DETR forward (no SigLIP2 image tower).
 
 Inputs:
-  - DINOv2 global: dino_global_{split}.pt from extract_dino_global --tap B
+  - DINOv2 global: dino_global_{split}.pt from extract_dino_global
     (1536-d, fed verbatim; MLP d_in = its dim).
   - SigLIP2 target: <target_db>/{split}_cases.pt global_emb (768, L2-normed).
     Production target = case_db_raw (raw SigLIP2 global) -> "rawP" variant.

@@ -211,6 +211,11 @@ def load_input_texts(args: argparse.Namespace) -> List[str]:
     if args.input_texts:
         texts = _read_lines(args.input_texts)
         source = args.input_texts
+    elif args.case_db:
+        import torch
+        emb_path = Path(args.case_db) / "cause_text_embs.pt"
+        texts = list(torch.load(emb_path, weights_only=False)["texts"])
+        source = str(emb_path)
     elif args.cache_dir:
         texts = _read_cache_texts(args.cache_dir)
         source = str(Path(args.cache_dir) / "texts.json")
@@ -754,9 +759,10 @@ def _attempt_batch_once(
         return exc
 
 
-def _half_batch(batch: Sequence[str], batch_size: int) -> List[str]:
-    half_size = max(1, batch_size // 2)
-    return list(batch[: min(len(batch), half_size)])
+def _half_batch(batch: Sequence[str]) -> List[str]:
+    if len(batch) <= 1:
+        return list(batch)
+    return list(batch[: max(1, len(batch) // 2)])
 
 
 def _try_one_batch(
@@ -796,7 +802,7 @@ def _try_one_batch(
             return len(batch)
         last_error = error
 
-    reduced_batch = _half_batch(batch, args.batch_size)
+    reduced_batch = _half_batch(batch)
     print(
         f"\n[fallback] batch_start={batch_start}: "
         f"full batch failed; retrying with batch_size/2 ({len(reduced_batch)} item(s))"
@@ -1111,6 +1117,9 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--coco_files", nargs="+", default=DEFAULT_COCO_FILES)
     parser.add_argument("--cache_dir", default=None, help="Read cause strings from cache_dir/texts.json.")
+    parser.add_argument("--case_db", default=None,
+                        help="Read the current cause vocabulary from a case_db dir's "
+                             "cause_text_embs.pt['texts'] (the authoritative demo causes).")
     parser.add_argument("--input_texts", default=None, help="Read one cause string per line from txt.")
     parser.add_argument("--include_healthy", action="store_true")
     parser.add_argument("--max_items", type=int, default=0, help="Debug limit; 0 means all inputs.")

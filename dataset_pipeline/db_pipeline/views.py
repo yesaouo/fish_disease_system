@@ -85,6 +85,7 @@ def write_views(
 ) -> None:
     full_root = version_dir / "full"
     det_root = version_dir / "detection"
+    healthy_root = version_dir / "healthy_images"
 
     for split, tasks in tasks_per_split.items():
         full_split = full_root / split
@@ -99,15 +100,30 @@ def write_views(
 
         iterator = progress(tasks, desc=f"write:{split}", leave=False) if progress else tasks
         for task in iterator:
-            dst_full = full_split / f"{task.image_id}.jpg"
-            shutil.copy2(task.image_path, dst_full)
-            with Image.open(dst_full) as im:
-                width, height = im.size
+            if task.from_healthy_folder:
+                # Negative sample: single physical copy lives under healthy_images/<split>/,
+                # full/ and detection/ both symlink to it.
+                healthy_split = healthy_root / split
+                healthy_split.mkdir(parents=True, exist_ok=True)
+                dst = healthy_split / f"{task.image_id}.jpg"
+                shutil.copy2(task.image_path, dst)
+                with Image.open(dst) as im:
+                    width, height = im.size
+                for split_dir in (full_split, det_split):
+                    link = split_dir / f"{task.image_id}.jpg"
+                    if link.is_symlink() or link.exists():
+                        link.unlink()
+                    link.symlink_to(os.path.relpath(dst, split_dir))
+            else:
+                dst_full = full_split / f"{task.image_id}.jpg"
+                shutil.copy2(task.image_path, dst_full)
+                with Image.open(dst_full) as im:
+                    width, height = im.size
 
-            link = det_split / f"{task.image_id}.jpg"
-            if link.is_symlink() or link.exists():
-                link.unlink()
-            link.symlink_to(os.path.relpath(dst_full, det_split))
+                link = det_split / f"{task.image_id}.jpg"
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                link.symlink_to(os.path.relpath(dst_full, det_split))
 
             img_entry = _image_entry(task, width, height)
             full_coco["images"].append(img_entry)

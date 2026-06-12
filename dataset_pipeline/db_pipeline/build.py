@@ -22,7 +22,7 @@ from .manifest import (
     write_manifest,
 )
 from .registry import ImageRegistry
-from .sources import find_datasets, load_tasks
+from .sources import find_datasets, load_tasks, scan_healthy_folders
 
 
 def _load_symptoms(path: Path) -> tuple[list[dict], dict[str, int]]:
@@ -91,6 +91,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--annotation-root", type=Path, default=Path("data/annotation"))
     p.add_argument("--symptoms-json", type=Path, default=Path("data/annotation/symptoms.json"))
     p.add_argument(
+        "--healthy-root",
+        type=Path,
+        default=Path("data/healthy_images"),
+        help=(
+            "Top-level pool of healthy negatives (each subdir = pseudo-dataset). "
+            "Swept alongside each dataset's healthy_images/ folder."
+        ),
+    )
+    p.add_argument(
         "--labels-txt",
         type=Path,
         default=None,
@@ -132,6 +141,7 @@ def _print_summary(
     print(f"  dropped_by_comments       : {s['dropped_by_comments']}")
     print(f"  dropped_by_submit_filter  : {s['dropped_by_submit_filter']}")
     print(f"  dropped_by_missing_image  : {s['dropped_by_missing_image']}")
+    print(f"  dropped_by_healthy        : {s['dropped_by_healthy']} (DB healthy tasks; negatives now come from folders)")
     if s["skipped_bboxes_unknown_label"]:
         total_skipped = sum(x["count"] for x in s["skipped_bboxes_unknown_label"])
         print(f"  skipped_bboxes_unknown_label: {total_skipped} (see category_diff.txt)")
@@ -189,6 +199,10 @@ def main() -> int:
         require_expert_submit=args.require_expert_submit,
         progress=tqdm,
     )
+
+    taken_keys = {(t.dataset, t.image_filename) for t in tasks}
+    healthy_tasks = scan_healthy_folders(sources, args.healthy_root, taken_keys)
+    tasks.extend(healthy_tasks)
 
     if args.strict_categories and stats.skipped_bboxes_unknown_label:
         version_dir.mkdir(parents=True, exist_ok=False)

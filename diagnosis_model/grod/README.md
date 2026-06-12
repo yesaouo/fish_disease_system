@@ -280,10 +280,31 @@ python -m diagnosis_model.grod.train_joint ... \
 | `rebuild_case_db.py` | swap case_db `lesion_embs` with `z` (`--from_joint`) |
 | `extract_hs.py` | frozen-probe (rung-1 evidence): hook raw `hs` from a frozen detector |
 | `train_semantic_head.py` | frozen-probe: train a `Linear(256→768)` on cached `hs` |
+| `calibrate_thresholds.py` | two decoupled GROD objectness thresholds → `data/processed/current/thresholds.json` (abstain=Youden image-level, display=F2 per-query) |
+| `train_abstain_head.py` | **ablation / OOD-research** 健/病 abstain head → `models/disease_head/neck_disease_head.pt` (`--feat dino_neck` default = 1536 RF-DETR tap-B DINOv2 neck, beats the legacy 770 `--feat pooled`). **Not wired** — a constant objectness threshold ties it on the held-out test split incl. OOD (see `LESION_GATE.md`). Add OOD negatives to `data/healthy_images/<folder>/` + retrain. |
+| `render_anomaly_heatmap.py` | objectness-splat heatmap (zero-training report display; all 300 queries as Gaussian blobs weighted by `w`) — the demo's step-① display |
 
 The frozen-probe path (`extract_hs` → `train_semantic_head` →
 `rebuild_case_db` *without* `--from_joint`) is kept as the zero-training rung-1
 evidence, **not** a production step.
+
+## Lesion-gate display: objectness heatmap & two thresholds
+
+The demo's step-① display is an **objectness heatmap** (`render_anomaly_heatmap.py`):
+all 300 queries splatted as `w`-weighted Gaussian blobs, zero-training, smooth. It
+is the same signal as the boxes, so it does not surface detector-blind lesions —
+of GT lesions below 0.5, **77.5 % have objectness < 0.1** (a detector recall limit
+no display threshold reaches; only 12.8 % sit in the recoverable 0.3–0.5 band).
+
+**Two decoupled thresholds** (`calibrate_thresholds.py`, dataset-calibrated
+constants — a learned per-image τ ties a constant, see `train_disease_head_perquery.py`):
+`abstain_thresh` (健/病, image-level max-objectness, Youden ≈ 0.39) vs
+`display_thresh` (box display, F2 recall-leaning ≈ 0.32). The demo reads
+`thresholds.json` for its slider defaults and abstains on the constant
+`abstain_thresh` (max objectness). A learned 健/病 abstain head was tried (DINOv2
+neck, `train_abstain_head.py`) but does **not** beat the constant on the held-out
+test split incl. OOD (AUROC 0.9997 vs 0.9991, OOD reject ≤ the constant), so it is
+kept as an ablation only — see `LESION_GATE.md`.
 
 ## Notes
 

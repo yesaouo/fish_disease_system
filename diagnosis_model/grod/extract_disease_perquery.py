@@ -1,18 +1,21 @@
-"""Per-query disease/threshold cache — inputs for the τ-as-lesion-selector retrain.
+"""Per-query disease/threshold cache — the gating calibration input.
 
-For every image (diseased case_db + healthy) run GROD once and store the FULL
-soft state aligned per query, plus a per-query lesion label from GT-box IoU match:
+Reads the versioned `detection` view directly: `isHealthy:true` = healthy image
+(no GT box), anything with boxes = diseased (GT boxes from the COCO annotations).
+For every image run GROD once and store the FULL soft state aligned per query, plus
+a per-query lesion label from GT-box IoU match:
 
     g  [768]   pred_global
     w  [300]   sigmoid(pred_logits[:, 0])        — per-query objectness
     y  [300]   is_lesion_i ∈ {0,1}               — 1 iff query IoU-matched a GT box
                                                    (healthy images: all 0)
 
-This is the supervision the current image-level head never sees: it lets τ(g[,w])
-be trained to sit *between* lesion-w and background-w over ALL queries, not just
-pinned at the single max query. Reuses extract_z_joint's IoU machinery.
+Feeds the production gating defaults: compute_lesion_threshold (lesion-selection τ)
+and calibrate_thresholds (abstain / display thresholds.json). Reuses extract_z_joint's
+IoU machinery.
 
-Output: {ART}/db/disease_perquery/{train,val}.pt
+Output: {ART}/db/disease_perquery/{train,val}.pt  (val = the `valid` split; the
+filename stays `val.pt` for the existing consumers).
 Run from repo root (SDM env):
     $PY -m diagnosis_model.grod.extract_disease_perquery
 """
@@ -20,8 +23,8 @@ Run from repo root (SDM env):
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import random
 from pathlib import Path
 
 import torch
@@ -33,8 +36,6 @@ from torch.utils.data import DataLoader, Dataset
 from diagnosis_model.grod.extract_hs import (
     xywh_to_xyxy, iou_matrix, greedy_match, cxcywh_norm_to_xyxy_abs,
 )
-
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 class ImgDataset(Dataset):
@@ -91,29 +92,28 @@ class Grod:
         return g.cpu(), w.cpu(), boxes.cpu(), qfeat.cpu()
 
 
-def gather(case_db_dir, img_root, healthy_dir, val_frac, seed):
-    """split -> list of (path, gt_boxes_xywh|None, is_diseased)."""
-    img_root = Path(img_root)
-    out = {"train": [], "val": []}
-    for fname, split, coco in [("train_cases.pt", "train", "train"),
-                               ("valid_cases.pt", "val", "valid")]:
-        cases = torch.load(Path(case_db_dir) / fname, weights_only=False)
-        for c in cases:
-            p = img_root / coco / c["file_name"]
-            if p.exists():
-                gt = c["lesion_boxes_xywh"]
-                gt = gt.tolist() if torch.is_tensor(gt) else gt
-                out[split].append((str(p), gt, 1))
-    healthy = sorted(p for p in Path(healthy_dir).iterdir() if p.suffix.lower() in IMG_EXTS)
-    random.Random(seed).shuffle(healthy)
-    n_val = int(len(healthy) * val_frac)
-    for p in healthy[:n_val]:
-        out["val"].append((str(p), None, 0))
-    for p in healthy[n_val:]:
-        out["train"].append((str(p), None, 0))
-    for s in out:
-        d = sum(x[2] for x in out[s])
-        print(f"[gather] {s}: diseased={d} healthy={len(out[s])-d} total={len(out[s])}")
+def gather_from_coco(det_root):
+    """split -> list of (path, gt_boxes_xywh|None, is_diseased), from detection COCO.
+
+    Output key 'val' = the `valid` folder (kept for the existing consumers).
+    """
+    det_root = Path(det_root)
+    out = {}
+    for fold, key in [("train", "train"), ("valid", "val")]:
+        coco = json.load(open(det_root / fold / "_annotations.coco.json"))
+        by_img = {}
+        for a in coco["annotations"]:
+            by_img.setdefault(a["image_id"], []).append([float(x) for x in a["bbox"]])  # xywh
+        items = []
+        for im in coco["images"]:
+            path = str(det_root / fold / im["file_name"])
+            if im.get("isHealthy"):
+                items.append((path, None, 0))
+            else:
+                items.append((path, by_img.get(im["id"], []), 1))
+        out[key] = items
+        d = sum(x[2] for x in items)
+        print(f"[gather] {fold}: diseased={d} healthy={len(items)-d} total={len(items)}")
     return out
 
 
@@ -156,23 +156,20 @@ def main():
     ap.add_argument("--joint_ckpt", default=f"{ART}/models/joint_rfdetr/checkpoint_best_regular.pth")
     ap.add_argument("--global_sd", default=f"{ART}/models/distilled_global_rawP/global_embed_state_dict.pt")
     ap.add_argument("--anchors", default=f"{ART}/models/text_anchors.pt")
-    ap.add_argument("--case_db_dir", default=f"{ART}/db/case_db_jointDistRawP")
-    ap.add_argument("--img_root", default="data/processed/current/detection")
-    ap.add_argument("--healthy_dir", default="data/healthy_images")
+    ap.add_argument("--det_root", default="data/processed/current/detection")
     ap.add_argument("--out_dir", default=f"{ART}/db/disease_perquery")
     ap.add_argument("--iou_thresh", type=float, default=0.5)
-    ap.add_argument("--val_frac", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    items = gather(args.case_db_dir, args.img_root, args.healthy_dir, args.val_frac, args.seed)
+    items = gather_from_coco(args.det_root)
     if args.limit:
-        items = {s: v[:args.limit] + [x for x in v if x[2] == 0][:args.limit] for s, v in items.items()}
+        items = {s: [x for x in v if x[2] == 1][:args.limit] + [x for x in v if x[2] == 0][:args.limit]
+                 for s, v in items.items()}
     grod = Grod(args.joint_ckpt, args.global_sd, args.anchors, dev)
     for s in ("train", "val"):
         print(f"[extract] {s}")

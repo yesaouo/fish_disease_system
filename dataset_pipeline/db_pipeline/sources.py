@@ -11,6 +11,7 @@ from .._bbox import bbox_contains
 
 
 HEALTHY_LABEL = "healthy_region"
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 @dataclass
@@ -30,6 +31,7 @@ class TaskRecord:
     doc: dict
     image_id: int = 0
     split: str = ""
+    from_healthy_folder: bool = False
 
 
 @dataclass
@@ -37,6 +39,7 @@ class FilterStats:
     dropped_by_comments: int = 0
     dropped_by_submit_filter: int = 0
     dropped_by_missing_image: int = 0
+    dropped_by_healthy: int = 0
     skipped_bboxes_unknown_label: Counter = field(default_factory=Counter)
     used_labels: Counter = field(default_factory=Counter)
 
@@ -170,7 +173,13 @@ def load_tasks(
             doc["detections"] = valid_dets
             non_healthy = sum(1 for d in valid_dets if d["label"] != HEALTHY_LABEL)
             is_healthy = (len(valid_dets) == 0) or (non_healthy == 0)
-            doc["is_healthy"] = is_healthy
+
+            # Healthy DB tasks are dropped here; negatives come exclusively from the
+            # healthy_images/ folders via scan_healthy_folders (see build.py).
+            if is_healthy:
+                stats.dropped_by_healthy += 1
+                continue
+            doc["is_healthy"] = False
 
             out.append(
                 TaskRecord(
@@ -178,9 +187,55 @@ def load_tasks(
                     task_id=row["task_id"],
                     image_filename=row["image_filename"],
                     image_path=img_path,
-                    is_healthy=is_healthy,
+                    is_healthy=False,
                     doc=doc,
                 )
             )
 
     return out, stats
+
+
+def scan_healthy_folders(
+    sources: list[DatasetSource],
+    healthy_root: Optional[Path],
+    taken_keys: set[tuple[str, str]],
+) -> list[TaskRecord]:
+    """Collect negative samples from per-dataset healthy_images/ and a top-level
+    healthy_root (each subdir = pseudo-dataset). Skips files whose (dataset, name)
+    is already claimed by a positive task this run, and de-dups within the sweep."""
+    out: list[TaskRecord] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_folder(dataset_name: str, folder: Path) -> None:
+        if not folder.is_dir():
+            return
+        for p in sorted(folder.iterdir()):
+            if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
+                continue
+            key = (dataset_name, p.name)
+            if key in taken_keys or key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                TaskRecord(
+                    dataset=dataset_name,
+                    task_id="healthy_folder",
+                    image_filename=p.name,
+                    image_path=p,
+                    is_healthy=True,
+                    doc={"detections": [], "is_healthy": True},
+                    from_healthy_folder=True,
+                )
+            )
+
+    for src in sources:
+        add_folder(src.name, src.dir / "healthy_images")
+
+    if healthy_root and healthy_root.is_dir():
+        for child in sorted(healthy_root.iterdir()):
+            if child.is_dir():
+                add_folder(child.name, child)
+        # loose image files directly under healthy_root use its name as dataset
+        add_folder(healthy_root.name, healthy_root)
+
+    return out

@@ -12,7 +12,23 @@ A **fixed global threshold τ on objectness** `w_i = sigmoid(pred_logits[i,0])`:
 - **soft** (`gpu_infer_soft.py`): keep all queries with continuous weight `w`; abstain iff `max_i w_i < τ`.
 
 `τ = DEFAULT_LESION_THRESH = 0.5`. No learned threshold, no disease head in the
-inference path.
+`gpu_infer*.py` CLI inference path.
+
+### Demo (`demo/app_gradio.py`) — two decoupled thresholds + heatmap display
+
+The CLI keeps the single 0.5. The **demo** splits the one knob into two
+dataset-calibrated constants (one threshold did two jobs badly — selection vs
+abstain want different cuts):
+
+- `abstain_thresh` (健/病 judgement, on image-level max objectness, Youden-optimal ≈ 0.39)
+- `display_thresh` (which boxes to show → feeds the ② classification cards, F2
+  recall-leaning ≈ 0.32)
+
+Both come from `calibrate_thresholds.py` → `data/processed/current/thresholds.json`
+(the demo reads it for slider defaults; falls back to 0.5/0.35). The demo's step-①
+display is the objectness heatmap (`render_anomaly_heatmap.py`), not boxes. Note
+the detector-blind 77.5 % (objectness < 0.1) is a detector recall limit no
+threshold reaches.
 
 ## How τ is derived — `compute_lesion_threshold.py`
 
@@ -23,6 +39,8 @@ Per-query GT labels (`extract_disease_perquery.py`: IoU-match GT boxes → queri
 - F1 is flat over τ∈[0.41, 0.61] — selection is insensitive to the exact value.
 - Writes `models/disease_head/lesion_threshold.json` (the authoritative value).
 - Scope: GROD objectness only. NOT the base RF-DETR detector threshold (different score).
+- `calibrate_thresholds.py` is the two-threshold sibling (abstain + display, see the
+  demo subsection above); `compute_lesion_threshold.py` here is the single selection τ.
 
 ## Why a constant, not a learned gate (the experiments)
 
@@ -67,10 +85,47 @@ Do **not** claim "perfect separation" — 22.8% objectness overlap exists (mostl
 harmless duplicate detections). The claim is "no headroom for a learned selector
 above the constant", with the detector as the real bottleneck.
 
-## The disease head (kept as standalone code, NOT in inference)
+## Disease heads — keep them distinct
 
-`disease_head.py` (`ThresholdHead`: per-image τ(g) abstain) + `train_disease_head.py`
-remain available for experiments / true OOD work — the head reads global `g`, so it
-*might* reject non-fish inputs better than "no box clears τ" (untested; the joint
-eval used healthy fish only). It is **not** loaded by `gpu_infer*.py`. To use it,
-import and wire it explicitly in a fork.
+| Head | Feature | Role | Where used |
+|---|---|---|---|
+| `ThresholdHead` | `g[768]` → τ(g), verdict `max_w ≥ τ(g)` | per-image **lesion-selection** τ (≈ adaptive `det_thresh`) | trained by `train_disease_head.py`; **not** wired — a constant τ ties it (above) |
+| `DiseaseHead` **(1536)** | RF-DETR **tap-B DINOv2 neck** (4-scale patch-mean) → p, verdict `p ≥ τ*` | image-level **健/病 abstain** | `train_abstain_head.py --feat dino_neck`; **ablation only — not wired** (a constant ties it, below) |
+| `DiseaseHead` (770, ablation) | `concat(g[768], max_w, Σw)` → p | same role, weaker | `--feat pooled`; kept for comparison |
+
+**Why the neck, not `g`** (ablation 2026-06-10, same data/protocol): the distilled
+global `g` is SigLIP2-aligned, which *strips* pure-visual signal (see
+`distill_global_mlp.py`); the raw pre-distillation DINOv2 neck keeps it. The 1536
+neck head beats the 770 on every axis — **OOD (sashimi) 50/50 vs 49/50, disease
+recall 0.994 vs 0.983, AUROC 0.994 vs 0.986** (this is the feature-choice ablation;
+both numbers are train-set-optimistic). Current ckpt:
+`models/disease_head/neck_disease_head.pt` (dim 1536, val AUROC 0.994, τ*≈0.277).
+Putting the bit on `g` directly (a "768+1" augmented dim) is the worst option — weakest
+substrate **and** it risks CEAH faithfulness; the neck head touches neither.
+
+**Not wired anywhere (2026-06-12).** Both `gpu_infer*.py` and `demo/app_gradio.py`
+abstain on the constant objectness `abstain_thresh`. A held-out test-split A/B
+(incl. structured OOD: sashimi / SalmonScan) showed the neck head does **not** beat
+the constant — AUROC 0.9997 vs 0.9991, and OOD reject is ≤ the constant on every
+source (sashimi 11/13 vs 13/13). It is kept only as the ablation / OOD-research head.
+
+### Add OOD negatives + retrain
+
+Negatives live under `data/healthy_images/`: **top-level loose files = healthy fish;
+any sub-folder = OOD (non-fish)**. The 3-tier sampler (disease / healthy / OOD) gives
+each ⅓ of every batch, so a few OOD images drive the gradient. OOD generalization
+needs **variety, not count** (each image is repeated ~hundreds×/epoch — memorizes
+otherwise).
+
+```bash
+# 1. drop the new negatives into a named sub-folder
+mkdir -p data/healthy_images/sashimi && cp /path/to/sashimi_*.png data/healthy_images/sashimi/
+
+# 2. retrain (features recompute by default; pass --use_cache to reuse the cache)
+$PY -m diagnosis_model.grod.train_abstain_head        # --feat dino_neck is the default
+```
+
+It overwrites `models/disease_head/neck_disease_head.pt` (the ablation / OOD-research
+head; not loaded by the demo). The run prints val AUROC + per-tier reject + an `[OOD sanity]` blocked count
+(incl-train, optimistic) — watch the **held-out `val reject ood`** and **disease recall**
+for the real signal.

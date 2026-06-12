@@ -64,6 +64,7 @@ def write_manifest(
             "dropped_by_comments": filter_stats.dropped_by_comments,
             "dropped_by_submit_filter": filter_stats.dropped_by_submit_filter,
             "dropped_by_missing_image": filter_stats.dropped_by_missing_image,
+            "dropped_by_healthy": filter_stats.dropped_by_healthy,
             "used_labels": [
                 {"label": k, "count": v}
                 for k, v in sorted(

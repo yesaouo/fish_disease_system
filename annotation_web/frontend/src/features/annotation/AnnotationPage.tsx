@@ -38,6 +38,10 @@ import {
   MessageSquareQuote,
   CheckCheck,
   Images,
+  HeartPulse,
+  Ban,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
 
 const AnnotationPage: React.FC = () => {
@@ -71,6 +75,29 @@ const AnnotationPage: React.FC = () => {
   const [evidenceOptionsZh, setEvidenceOptionsZh] = useState<Record<string, string[]>>({});
   // 以 symptoms.json 派生的類別清單供應標籤；外觀敘述改為下拉選單（顯示中文、保存 index）
   const [commentDraft, setCommentDraft] = useState("");
+
+  // 頂部導覽列：捲動時自動縮起以節省版面；使用者手動切換後在捲回頂端前不再自動變動
+  const [navCollapsed, setNavCollapsed] = useState(false);
+  const navManualRef = useRef(false);
+  useEffect(() => {
+    const onScroll = () => {
+      const y = window.scrollY;
+      if (y <= 4) navManualRef.current = false; // 回到頂端後恢復自動行為
+      if (navManualRef.current) return;
+      // 遲滯（hysteresis）：收合與展開用不同門檻，避免收合改變高度後在臨界值來回抖動
+      setNavCollapsed((prev) => {
+        if (!prev && y > 96) return true;
+        if (prev && y < 32) return false;
+        return prev;
+      });
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  const toggleNav = useCallback(() => {
+    navManualRef.current = true;
+    setNavCollapsed((v) => !v);
+  }, []);
 
   // 自動在 6 秒後清除 server/network 錯誤訊息（不影響驗證錯誤 Banner）
   useEffect(() => {
@@ -499,6 +526,42 @@ const AnnotationPage: React.FC = () => {
     }
   };
 
+  // 標記為「無法使用」：自動加上一則註解後提交（沿用 comment 可跳過欄位驗證的流程）
+  const handleMarkUnusable = async () => {
+    if (!doc || !task || !dataset || !name) return;
+    const confirm = window.confirm("確定要標記為「無法使用」並提交嗎？提交後此影像將視為完成，不會再次分派。");
+    if (!confirm) return;
+    setSaving(true);
+    dispatch({ type: "RESET_ERRORS" });
+    try {
+      const submitDoc = cloneTaskDocument(doc);
+      const comments: TaskComment[] = (submitDoc as any).comments ?? [];
+      (submitDoc as any).comments = [
+        ...comments,
+        { author: name, text: "無法使用", created_at: new Date().toISOString() },
+      ];
+      await submitTask(task.task_id, {
+        full_json: submitDoc,
+        editor_name: name,
+        is_expert: isExpert,
+      });
+      const currentIdx = routeIndex != null ? routeIndex : task.index;
+      const nextIdx = (currentIdx ?? 0) + 1;
+      await runWithBypass(() => navigate(`/annotate/${nextIdx}`, { replace: true }));
+    } catch (err) {
+      const axiosErr = err as AxiosError<{ detail?: string }>;
+      if (axiosErr.response?.status === 409) {
+        setError(axiosErr.response.data?.detail || "此任務已被更新，請重新載入後再送出。");
+      } else if (axiosErr.response?.data?.detail) {
+        setError(axiosErr.response.data.detail);
+      } else {
+        setError("提交失敗，請稍後再試。");
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleSave = async () => {
     if (!doc || !task || !dataset || !name) return;
     setSaving(true);
@@ -529,6 +592,22 @@ const AnnotationPage: React.FC = () => {
       setSaving(false);
     }
   };
+
+  // 左右方向鍵切換前後張（與膠囊列的上一個 / 下一個按鈕同邏輯）
+  const handlePrevImage = useCallback(() => {
+    if (!task) return;
+    const target = (Number(gotoIndex || task.index) || 1) - 1;
+    if (target < 1) return;
+    confirmAndNavigate(`/annotate/${target}`);
+  }, [task, gotoIndex, confirmAndNavigate]);
+
+  const handleNextImage = useCallback(() => {
+    if (!task) return;
+    const total = task.total_tasks ?? 0;
+    const target = (Number(gotoIndex || task.index) || 1) + 1;
+    if (total > 0 && target > total) return;
+    confirmAndNavigate(`/annotate/${target}`);
+  }, [task, gotoIndex, confirmAndNavigate]);
 
   useEffect(() => {
     const onKeydown = (evt: KeyboardEvent) => {
@@ -578,13 +657,21 @@ const AnnotationPage: React.FC = () => {
             handleRemoveDetection();
           }
           break;
+        case "ArrowLeft":
+          evt.preventDefault();
+          handlePrevImage();
+          break;
+        case "ArrowRight":
+          evt.preventDefault();
+          handleNextImage();
+          break;
         default:
           break;
       }
     };
     window.addEventListener("keydown", onKeydown);
     return () => window.removeEventListener("keydown", onKeydown);
-  }, [handleUndo, handleRedo, handleAddDetection, handleRemoveDetection, handleSave, selectedIndex]);
+  }, [handleUndo, handleRedo, handleAddDetection, handleRemoveDetection, handleSave, handlePrevImage, handleNextImage, selectedIndex]);
 
   // ✅ 全域擋：除了我們明確放行（allowNavRef）以外，dirty 時一律跳提醒
   useNavBlocker(dirty, () => allowNavRef.current);
@@ -626,6 +713,13 @@ const AnnotationPage: React.FC = () => {
       {/* ======== Header ======== */}
       <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/70 backdrop-blur supports-[backdrop-filter]:bg-white/60">
         <div className="mx-auto max-w-7xl px-4 py-3 sm:px-6">
+          {/* 可收合區：標題與導覽（捲動時自動縮起以節省版面） */}
+          <div
+            className={`overflow-hidden transition-all duration-300 ease-in-out ${
+              navCollapsed ? "max-h-0 opacity-0" : "max-h-96 opacity-100"
+            }`}
+            aria-hidden={navCollapsed}
+          >
           {/* 上層：標題與導覽 */}
           <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             {/* 左側：任務資訊 */}
@@ -696,6 +790,7 @@ const AnnotationPage: React.FC = () => {
 
           {/* 分隔線 */}
           <div className="mt-3 hidden md:block"><Separator /></div>
+          </div>
 
           {/* 下層：工具列（Icon-only）＋ 行為按鈕 */}
           <div className="mt-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -749,6 +844,26 @@ const AnnotationPage: React.FC = () => {
               >
                 <Save className="h-4 w-4" />
               </IconButton>
+
+              <Separator vertical />
+
+              <IconButton
+                onClick={handleMoveToHealthyImages}
+                disabled={moveToHealthyDisabled}
+                label="判定為健康"
+                className="border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+              >
+                <HeartPulse className="h-4 w-4" />
+              </IconButton>
+
+              <IconButton
+                onClick={handleMarkUnusable}
+                disabled={submitDisabled}
+                label="無法使用並提交"
+                className="border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100"
+              >
+                <Ban className="h-4 w-4" />
+              </IconButton>
             </div>
 
             {/* 右側：操作按鈕與快捷鍵提示 */}
@@ -765,22 +880,19 @@ const AnnotationPage: React.FC = () => {
 
               <button
                 type="button"
-                onClick={handleMoveToHealthyImages}
-                className="inline-flex items-center justify-center rounded-md border border-emerald-400 bg-emerald-50 px-4 py-2 text-sm font-medium text-emerald-700 shadow-sm transition-colors hover:bg-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 disabled:pointer-events-none disabled:opacity-50"
-                disabled={moveToHealthyDisabled}
-                title="判定為健康"
-              >
-                判定為健康
-              </button>
-
-              <button
-                type="button"
                 onClick={handleSubmit}
                 className="inline-flex items-center justify-center rounded-md border border-transparent bg-sky-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-sky-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 disabled:pointer-events-none disabled:opacity-50"
                 disabled={submitDisabled}
               >
                 提交
               </button>
+
+              <IconButton
+                onClick={toggleNav}
+                label={navCollapsed ? "展開頂部選單" : "收起頂部選單"}
+              >
+                {navCollapsed ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
+              </IconButton>
             </div>
           </div>
           {error && (
