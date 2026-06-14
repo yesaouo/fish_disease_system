@@ -50,6 +50,7 @@ const AnnotatedListPage: React.FC = () => {
         index: item.index,
         updated_at: new Date(item.last_modified_at).toLocaleString(),
         editor:
+          item.last_editor ||
           (item.expert_editor && item.expert_editor[item.expert_editor.length - 1]) ||
           (item.general_editor && item.general_editor[item.general_editor.length - 1]) ||
           "-",

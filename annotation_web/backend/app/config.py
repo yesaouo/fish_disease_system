@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     backup_dirname: str = Field(default="backup")
     # Auth keys file (one key per line) under data_root by default
     auth_keys_filename: str = Field(default="auth_keys.txt")
+    # GROD diagnosis inference service (diagnosis_model.serve.app, SDM env, GPU).
+    # The /api/diagnose route proxies multipart uploads here.
+    inference_url: str = Field(default="http://127.0.0.1:8900")
+    # Proxy read timeout (s) — first request of a mode loads its model (cold).
+    inference_timeout_seconds: float = Field(default=180.0, ge=1.0)
 
     model_config = SettingsConfigDict(
         env_prefix="",

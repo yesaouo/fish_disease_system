@@ -9,6 +9,7 @@ import AnnotatedListPage from "./features/annotated/AnnotatedListPage";
 import CommentedListPage from "./features/commented/CommentedListPage";
 import HealthyImagesPage from "./features/healthy/HealthyImagesPage";
 import HealthyAnnotationPage from "./features/healthy/HealthyAnnotationPage";
+import DiagnosisPage from "./features/diagnosis/DiagnosisPage";
 
 const RequireAuth: React.FC<{ children: React.ReactElement }> = ({
   children
@@ -108,6 +109,14 @@ const AppRoutes = () => {
             <RequireDataset>
               <HealthyAnnotationPage />
             </RequireDataset>
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/diagnose"
+        element={
+          <RequireAuth>
+            <DiagnosisPage />
           </RequireAuth>
         }
       />

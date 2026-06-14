@@ -10,6 +10,7 @@ import type {
   SubmitTaskResponse,
   LabelMapZhResponse,
   EvidenceOptionsZhResponse,
+  DiagnoseResponse,
   SaveTaskRequest,
   SaveTaskResponse,
   AnnotatedListResponse,
@@ -198,6 +199,29 @@ export const moveHealthyImageToImages = async (
   const { data } = await http.post<{ ok: boolean }>(
     `/datasets/${encodeURIComponent(dataset)}/healthy_images/${encodeURIComponent(filename)}/move_to_images`
   );
+  return data;
+};
+
+export type DiagnoseParams = {
+  text?: string;
+  mode?: string;
+  topKCases?: number;
+  topNCauses?: number;
+};
+
+export const diagnose = async (
+  image: File,
+  params: DiagnoseParams = {}
+): Promise<DiagnoseResponse> => {
+  const form = new FormData();
+  form.append("image", image);
+  form.append("text", params.text ?? "");
+  form.append("mode", params.mode ?? "grod_soft");
+  form.append("top_k_cases", String(params.topKCases ?? 20));
+  form.append("top_n_causes", String(params.topNCauses ?? 5));
+  const { data } = await http.post<DiagnoseResponse>("/diagnose", form, {
+    headers: { "Content-Type": "multipart/form-data" }
+  });
   return data;
 };
 

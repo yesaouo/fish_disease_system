@@ -104,6 +104,7 @@ export type AnnotatedItem = {
   last_modified_at: string;
   general_editor?: string[];
   expert_editor?: string[];
+  last_editor?: string | null;
 };
 
 export type AnnotatedListResponse = {
@@ -138,4 +139,58 @@ export type LabelMapZhResponse = {
 
 export type EvidenceOptionsZhResponse = {
   evidence_options_zh: Record<string, string[]>;
+};
+
+// ===== GROD 診斷服務（/api/diagnose）回應 =====
+export type DiagnoseMeta = {
+  case_id: string;
+  timestamp: string;
+  mode: string;
+  text: string;
+  thresholds: { abstain: number; display: number };
+};
+
+export type DiagnoseLesion = {
+  idx: number;
+  bbox_xywh: number[];
+  det_score: number;
+  label_id: number;
+  label_zh: string;
+  cls_score: number;
+  top_k: { label_zh: string; score: number; prob: number }[];
+  crop: string; // data:image/png;base64,...
+};
+
+export type DiagnoseRetrieved = {
+  rank: number;
+  file_name: string;
+  similarity: number;
+  exists: boolean;
+  image: string;
+};
+
+export type DiagnoseCause = {
+  rank: number;
+  text: string;
+  score: number;
+  support: number | null;
+  members: string[];
+  alpha: number[];
+  attribution: string;
+  breakdown: string;
+};
+
+export type DiagnoseResponse = {
+  meta: DiagnoseMeta;
+  abstain: boolean;
+  pool_size: number;
+  text_used: boolean;
+  n_lesions: number;
+  image_size: [number, number];
+  heatmap: string;
+  params: { modules: { name: string; count: number }[]; total: number };
+  timings: { stage: string; ms: number }[];
+  lesions: DiagnoseLesion[];
+  retrieved: DiagnoseRetrieved[];
+  causes: DiagnoseCause[];
 };

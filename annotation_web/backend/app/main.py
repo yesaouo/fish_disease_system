@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import FastAPI
 
-from .routes import auth, datasets, stats, tasks
+from .routes import auth, datasets, diagnosis, stats, tasks
 from .config import get_settings
 from .services.backup import daily_backup_worker
 
@@ -22,6 +22,7 @@ def create_app() -> FastAPI:
     app.include_router(datasets.router)
     app.include_router(tasks.router)
     app.include_router(stats.router)
+    app.include_router(diagnosis.router)
 
     worker_task: Optional[asyncio.Task] = None
 

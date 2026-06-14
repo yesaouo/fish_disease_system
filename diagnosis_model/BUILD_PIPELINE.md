@@ -664,8 +664,15 @@ $PY -m diagnosis_model.cause_inference.preprocessing.cause_resolve_llm \
     --judge cosine --judge_cosine_tau 0.95
 ```
 
-預設 `tau=0.90 / k=32 / tau_merge=0.88`（這些 cause 向量 anisotropic，blocking floor 須高、由 `k` 上限兜成本）。
-要更激進/保守合併改 judge prompt 的主因粒度，不靠超參。
+預設 `tau=0.90 / k=32 / tau_merge=0.94`（這些 cause 向量 anisotropic，blocking floor 須高、由 `k` 上限兜成本）。
+合併階段是**單輪 medoid-anchored 合併**（`--merge_rounds` 預設 1）：重算每群 medoid 當錨、在 `tau_merge`
+內取**全部** medoid 候選（不設 top-k 窗）做一次 leader-clustering。兩個召回關鍵：(1) 錨在 medoid 而非
+round-1 leader——leader 可能偏離群中心，使同主因群（medoid cos >0.96）從沒被比到；(2) 不設 top-k 窗——
+同主因對 cos 多 ≥0.96、跨主因多 <0.94，floor 太低（如 0.88）會把跨主因全塞進候選、擠出真 anchor。
+**不要 `--merge_rounds >1`**：迭代會在每輪重算 medoid，把 LLM 的 intransitive / bridge-sentence 判決
+（如「外傷後二次細菌感染」橫跨物理↔細菌）雪球成跨類過併（實測 4 輪→細菌群吃進物理、寄生蟲吃進病毒，
+最大群衝到 20k）。單輪類別乾淨、最大群純淨；殘留同主因碎裂（如寄生蟲分數群）源於 LLM 對近同句的本質
+不一致，多迭代救不了。要更激進/保守合併改 judge prompt 的主因粒度，不靠超參。
 
 不重建也能用：Step 10 校準已把**沒對到 taxonomy 的 cause 排除在 ARI 之外**（不塞進
 單一 -1 桶汙染門檻），所以覆蓋不足也夠校準 scalar；只有想要 100% 覆蓋才需重建。

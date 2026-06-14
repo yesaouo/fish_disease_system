@@ -689,6 +689,37 @@ def get_last_submitted_task_id(
         conn.close()
 
 
+def get_last_submitters(
+    dataset: str,
+    settings: Settings | None = None,
+) -> dict[str, str]:
+    """Return {task_id: editor_name} of the most recent `submit` per task.
+
+    Reads the `history` table (one row per submit with `updated_by` +
+    `updated_at`). Unlike the `*_editors_json` arrays on `tasks` — which are
+    append-with-dedup and therefore ordered by first-seen, not recency — this
+    reflects who actually submitted last, regardless of role.
+    """
+    settings = _ensure_settings(settings)
+    dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
+    db_path = get_db_path(dataset_dir, settings)
+    if not db_path.exists():
+        return {}
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT task_id, updated_by FROM history
+            WHERE action = 'submit' AND updated_by IS NOT NULL
+            ORDER BY updated_at ASC, id ASC;
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    # Later rows overwrite earlier ones, so the last submit per task wins.
+    return {str(r["task_id"]): str(r["updated_by"]) for r in rows}
+
+
 def list_task_rows(
     dataset: str,
     settings: Settings | None = None,

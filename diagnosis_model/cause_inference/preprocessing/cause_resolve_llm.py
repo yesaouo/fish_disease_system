@@ -47,6 +47,7 @@ import hashlib
 import json
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -360,6 +361,32 @@ def judge_pairs(
 # --------------------------------------------------------------------------- #
 # Leader clustering on an index subset
 # --------------------------------------------------------------------------- #
+def _first_same_leader(
+    args: argparse.Namespace,
+    gi: int,
+    cand: List[Tuple[int, float]],
+    global_indices: List[int],
+    texts: Sequence[str],
+    cache: JudgeCache,
+) -> int | None:
+    """Judge candidates (already cosine-descending) in chunks, short-circuiting.
+
+    Returns the first (highest-cosine) candidate the LLM calls "same", or None.
+    Stopping at the first matching chunk keeps the per-node judge cost ~1 call
+    when a same-cause anchor exists (it sits near the top by cosine), while still
+    letting a genuinely distinct node fall through every candidate before
+    becoming its own leader.
+    """
+    for start in range(0, len(cand), args.pairs_per_call):
+        chunk = cand[start : start + args.pairs_per_call]
+        pair_list = [(gi, global_indices[nj], cos) for nj, cos in chunk]
+        verdicts = judge_pairs(args, pair_list, texts, cache)
+        for nj, cos in chunk:  # cosine-descending within the chunk
+            if verdicts[(gi, global_indices[nj])]:
+                return nj
+    return None
+
+
 def resolve_round(
     args: argparse.Namespace,
     global_indices: List[int],
@@ -367,14 +394,21 @@ def resolve_round(
     texts: Sequence[str],
     cache: JudgeCache,
     tau: float,
+    k: int,
     label: str,
 ) -> Dict[int, int]:
     """Medoid-anchored leader clustering over a subset.
 
     Returns global_index -> global_leader_index. Each non-leader's assignment is
     backed by one "member vs leader" verdict; leaders map to themselves.
+
+    `k` bounds the candidate fan-out per node. Round 1 (full 60k set) uses a
+    small k for cost. Round 2 (small leader set) must pass k >= len(leaders) so
+    the true same-cause anchor is never crowded out of the top-k window by
+    high-cosine cross-cause leaders -- that windowing was what split one primary
+    cause into several leader clusters.
     """
-    neighbors, density = knn_candidates(emb_subset, args.k, tau)
+    neighbors, density = knn_candidates(emb_subset, k, tau)
     order = sorted(range(len(global_indices)), key=lambda loc: (-density[loc], loc))
 
     is_leader: set[int] = set()  # local indices
@@ -384,17 +418,12 @@ def resolve_round(
     for loc in order:
         cand = [(nj, cos) for nj, cos in neighbors[loc] if nj in is_leader]
         cand.sort(key=lambda t: -t[1])
-        cand = cand[: args.pairs_per_call]  # cap fan-out; round 2 mops up the rest
 
         chosen: int | None = None
         if cand:
-            gi = global_indices[loc]
-            pair_list = [(gi, global_indices[nj], cos) for nj, cos in cand]
-            verdicts = judge_pairs(args, pair_list, texts, cache)
-            for nj, cos in cand:  # cosine-descending: first "same" wins
-                if verdicts[(gi, global_indices[nj])]:
-                    chosen = nj
-                    break
+            chosen = _first_same_leader(
+                args, global_indices[loc], cand, global_indices, texts, cache
+            )
 
         if chosen is None:
             is_leader.add(loc)
@@ -418,6 +447,29 @@ def _progress(total: int, desc: str):
         return None
 
 
+def _cluster_medoids(
+    assignment: Dict[int, int], embeddings: torch.Tensor
+) -> Tuple[Dict[int, List[int]], Dict[int, int]]:
+    """Group causes by cluster id and return each cluster's medoid global index.
+
+    Medoid = member closest to the cluster centroid (same rule as the final
+    canonical). Anchoring the merge pass on the medoid -- not on an arbitrary
+    round-1 leader, which can sit at the cluster's edge -- is what lets two
+    same-cause clusters (whose centers are near but whose leaders are far) get
+    compared at all.
+    """
+    clusters: Dict[int, List[int]] = defaultdict(list)
+    for gi, cid in assignment.items():
+        clusters[cid].append(gi)
+    medoid: Dict[int, int] = {}
+    for cid, members in clusters.items():
+        embs = embeddings[torch.tensor(members, dtype=torch.long)]
+        centroid = F.normalize(embs.mean(0, keepdim=True), dim=-1)
+        sims = (embs @ centroid.t()).squeeze(-1)
+        medoid[cid] = members[int(sims.argmax())]
+    return clusters, medoid
+
+
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
@@ -433,32 +485,48 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     # Round 1: full set at tau
     all_indices = list(range(len(texts)))
     leader1 = resolve_round(
-        args, all_indices, embeddings, texts, cache, tau=args.tau, label="round1"
+        args, all_indices, embeddings, texts, cache, tau=args.tau, k=args.k, label="round1"
     )
     leaders = sorted(set(leader1.values()))
     print(f"[round1] {len(leaders)} leaders from {len(texts)} causes")
 
-    # Round 2: merge leaders on a looser threshold
-    super_leader = {L: L for L in leaders}
-    if args.merge_rounds > 0 and len(leaders) > 1:
-        leader_emb = embeddings[torch.tensor(leaders, dtype=torch.long)]
-        super_leader = resolve_round(
-            args, leaders, leader_emb, texts, cache, tau=args.tau_merge, label="round2"
+    # Merge stage: iterative medoid-anchored merge to convergence. Each pass
+    # recomputes the medoid of every current cluster, then leader-clusters the
+    # medoids (unbounded k within tau_merge, so the central anchor is never
+    # crowded out). Re-anchoring on the medoid each pass closes the leader-edge
+    # coverage gap that left same-cause clusters (medoid cos > 0.96) uncompared.
+    assignment = dict(leader1)  # gi -> cluster id (a gi)
+    for it in range(1, args.merge_rounds + 1):
+        clusters, medoid = _cluster_medoids(assignment, embeddings)
+        if len(clusters) <= 1:
+            break
+        cids = list(clusters)
+        medoid_idx = [medoid[c] for c in cids]
+        medoid_emb = embeddings[torch.tensor(medoid_idx, dtype=torch.long)]
+        merged = resolve_round(
+            args, medoid_idx, medoid_emb, texts, cache,
+            tau=args.tau_merge, k=len(cids), label=f"merge{it}",
         )
-        n_super = len(set(super_leader.values()))
-        print(f"[round2] {len(leaders)} leaders -> {n_super} clusters")
+        medoid_to_cid = {medoid[c]: c for c in cids}
+        new_cid_of = {c: medoid_to_cid[merged[medoid[c]]] for c in cids}
+        n_merged = sum(1 for c in cids if new_cid_of[c] != c)
+        n_clusters = len(set(new_cid_of.values()))
+        print(f"[merge{it}] {len(cids)} clusters -> {n_clusters} (merged {n_merged})")
+        cache.flush()
+        if n_merged == 0:
+            break
+        assignment = {gi: new_cid_of[cid] for gi, cid in assignment.items()}
 
     cache.flush()
 
-    # Compose final leader per cause, then contiguous labels
-    final_leader = {i: super_leader[leader1[i]] for i in all_indices}
+    # Contiguous labels from the converged assignment
     label_of: Dict[int, int] = {}
     cluster_labels = np.empty(len(texts), dtype=np.int64)
     for i in all_indices:
-        fl = final_leader[i]
-        if fl not in label_of:
-            label_of[fl] = len(label_of)
-        cluster_labels[i] = label_of[fl]
+        cid = assignment[i]
+        if cid not in label_of:
+            label_of[cid] = len(label_of)
+        cluster_labels[i] = label_of[cid]
 
     clusters = assign_cause_ids(texts, embeddings, cluster_labels)
     save_clusters_json(clusters, output_path)
@@ -512,9 +580,18 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Round-1 candidate cosine floor. These cause embeddings are highly "
                         "anisotropic (random-pair cosine median ~0.90, true synonyms ~0.95+), so "
                         "the floor sits high; the LLM judge disambiguates the 0.90-0.99 band.")
-    p.add_argument("--tau_merge", type=float, default=0.88,
-                   help="Round-2 leader-merge cosine floor (looser; small leader set).")
-    p.add_argument("--merge_rounds", type=int, default=1, help="0 disables Round-2 leader merge.")
+    p.add_argument("--tau_merge", type=float, default=0.94,
+                   help="Round-2 leader-merge candidate floor. Sits at the same-cause vs "
+                        "cross-cause leader separation (~0.94: same-cause leader pairs are "
+                        "mostly >=0.96, cross-cause mostly <0.94). Too low (e.g. 0.88) admits "
+                        "~all cross-cause leaders as candidates and crowds out the true anchor.")
+    p.add_argument("--merge_rounds", type=int, default=1,
+                   help="Medoid-anchored merge passes. Default 1 (single pass) is the safe "
+                        "operating point: it merges most same-cause fragments while keeping "
+                        "primary categories clean. Iterating (>1) re-medoids after each pass "
+                        "and cascades the LLM's intransitive / bridge-sentence verdicts (e.g. "
+                        "'trauma then secondary bacterial infection') into cross-category "
+                        "over-merge -- raise only with a drift-resistant judge prompt. 0 disables.")
 
     p.add_argument("--ollama_host", default=DEFAULT_OLLAMA_HOST)
     p.add_argument("--model", default=DEFAULT_MODEL)

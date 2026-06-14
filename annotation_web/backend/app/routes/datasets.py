@@ -188,6 +188,7 @@ def list_annotated(
 
     image_filenames = storage_service.list_images(dataset, settings)
     index_map = {Path(fn).stem: i + 1 for i, fn in enumerate(image_filenames)}
+    last_submitters = storage_service.get_last_submitters(dataset, settings)
 
     for row in storage_service.list_task_rows(dataset, settings):
         task_id = str(row["task_id"])
@@ -213,6 +214,7 @@ def list_annotated(
                     last_modified_at=str(row["last_modified_at"]),
                     general_editor=[str(x).strip() for x in general if str(x).strip()],
                     expert_editor=[str(x).strip() for x in expert if str(x).strip()],
+                    last_editor=last_submitters.get(task_id),
                 )
             )
     items.sort(key=lambda x: x.last_modified_at, reverse=True)

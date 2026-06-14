@@ -11,7 +11,7 @@ import ProjectHeader from "../../components/ProjectHeader";
 import React, { useState } from "react";
 
 // Icons
-import { Trash2, SquarePlus, Save, Undo2, Redo2, BarChart3, LogOut } from "lucide-react";
+import { Trash2, SquarePlus, Save, Undo2, Redo2, BarChart3, LogOut, Stethoscope } from "lucide-react";
 
 // ===== 小元件：Kbd / IconButton / Separator =====
 const Kbd: React.FC<React.PropsWithChildren> = ({ children }) => (
@@ -70,6 +70,16 @@ const DatasetPickerPage: React.FC = () => {
               aria-label="提交概況"
             >
               <BarChart3 className="h-4 w-4" aria-hidden="true" />
+            </button>
+            {/* 前往 AI 診斷報告 */}
+            <button
+              type="button"
+              onClick={() => navigate("/diagnose")}
+              className="inline-flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+              title="AI 診斷"
+              aria-label="AI 診斷"
+            >
+              <Stethoscope className="h-4 w-4" aria-hidden="true" />
             </button>
             {/* 登出並回到登入畫面 */}
             <button

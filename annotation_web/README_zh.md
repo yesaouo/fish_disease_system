@@ -76,6 +76,28 @@ sudo env PATH=$PATH:<conda_env_bin> <pm2_bin> startup systemd -u <user> --hp <ho
 pm2 save
 ```
 
+## AI 診斷報告（推論服務）
+
+平台內建一頁 **AI 魚病診斷報告**（路由 `/diagnose`，登入即可、不需選資料集；資料集選擇頁右上的聽診器圖示可進入）。上傳魚體影像（可選填文字描述）即產生結構化報告：基本資料、① 病灶定位與分析（熱力圖⇄原圖切換＋病灶框＋分類卡片）、② 相似案例、③ 疑似病因排序＋α 證據歸因。`處置建議` 與 `專家覆核` 為保留欄位（未來 Human-In-The-Loop，尚未實作回寫）。
+
+推論本身由獨立的 **GPU 推論服務**（`diagnosis_model/serve`，跑在 ML 用的 conda env、需 GPU）負責；本平台後端只是把 `POST /api/diagnose` 轉發過去，沿用既有 Bearer 驗證。
+
+啟用步驟：
+
+```bash
+# 1) 後端 env 需要這兩個套件（首次）
+pip install httpx python-multipart
+
+# 2) 起推論服務（在 ML 的 conda env，例如 SDM，從 repo 根目錄；預設埠 8900）
+python -m diagnosis_model.serve.app --preload grod_soft --port 8900
+
+# 3) 重啟本平台後端以載入 /api/diagnose 路由
+pm2 restart backend
+```
+
+- 服務位址可在 `backend/.env` 以 `INFERENCE_URL`（預設 `http://127.0.0.1:8900`）覆寫；逾時為 `INFERENCE_TIMEOUT_SECONDS`（預設 180s，給首次冷啟動載模型）。
+- 推論服務目前為**手動啟動**，未納入 `ecosystem.config.js`。
+
 ## 文件
 
 - 架構說明：`docs/architecture.md`

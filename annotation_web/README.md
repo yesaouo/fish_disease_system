@@ -148,6 +148,7 @@ With the above, the UI runs at `/fish/`, API at `/fish/api/*`, and image links r
 - `GET /api/datasets/{dataset}/stats`, `GET /api/admin/stats`
 - `GET /api/admin/tasks` – summary of tasks across datasets
 - `GET /api/datasets/{dataset}/images/{filename}` – image streaming; missing files are logged
+- `POST /api/diagnose` – multipart (image + text + mode + thresholds); proxies to the GPU inference service (see *AI Diagnosis Report* below)
 
 All writes are atomic (temp file + rename). Audit entries append to `<DATA_ROOT>/audit_log.jsonl`.
 
@@ -167,6 +168,26 @@ All writes are atomic (temp file + rename). Audit entries append to `<DATA_ROOT>
 - Admin dashboard with aggregate metrics and CSV export
 
 Unsaved changes trigger a `beforeunload` warning.
+
+## AI Diagnosis Report (inference service)
+
+The platform ships an **AI diagnosis report** page (route `/diagnose`, auth-only — no dataset selection needed; reachable via the stethoscope icon on the dataset picker). Uploading a fish image (with optional free-text description) produces a structured report: basic info, ① lesion localization & analysis (heatmap ⇄ original toggle + boxes + classification cards), ② similar cases, ③ ranked candidate causes + α evidence attribution. The `處置建議` (treatment) and `專家覆核` (expert review) blocks are placeholders — the Human-In-The-Loop writeback loop is intentionally not implemented yet.
+
+Inference runs in a separate **GPU inference service** (`diagnosis_model/serve`, in the ML conda env, GPU required); this backend only proxies `POST /api/diagnose` to it behind the existing Bearer auth.
+
+```bash
+# 1) backend env needs these (first time)
+pip install httpx python-multipart
+
+# 2) start the inference service (ML conda env, e.g. SDM, from repo root; default port 8900)
+python -m diagnosis_model.serve.app --preload grod_soft --port 8900
+
+# 3) restart this backend to load the /api/diagnose route
+pm2 restart backend
+```
+
+- Override the target with `INFERENCE_URL` in `backend/.env` (default `http://127.0.0.1:8900`); `INFERENCE_TIMEOUT_SECONDS` (default 180s) covers the first cold model load.
+- The inference service is started **manually** — it is not part of `ecosystem.config.js`.
 
 ## Documentation
 

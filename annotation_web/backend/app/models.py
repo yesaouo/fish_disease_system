@@ -347,6 +347,7 @@ class AnnotatedItem(BaseModel):
     last_modified_at: datetime
     general_editor: List[str] = Field(default_factory=list)
     expert_editor: List[str] = Field(default_factory=list)
+    last_editor: Optional[str] = None
 
 class AnnotatedListResponse(BaseModel):
     items: List[AnnotatedItem]
