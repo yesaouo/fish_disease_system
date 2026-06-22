@@ -293,9 +293,9 @@ def main():
     ap.add_argument("--common_dim", type=int, default=256)
     ap.add_argument("--hidden_dim", type=int, default=512)
     ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--attribution_mode", type=str, default="sigmoid",
+    ap.add_argument("--attribution_mode", type=str, default="softmax",
                     choices=["sigmoid", "softmax"])
-    ap.add_argument("--scoring_mode", type=str, default="single",
+    ap.add_argument("--scoring_mode", type=str, default="multiplicative",
                     choices=["single", "multiplicative"])
 
     # training
@@ -304,7 +304,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-2)
     ap.add_argument("--warmup_steps", type=int, default=200)
-    ap.add_argument("--lambda_sparsity", type=float, default=0.05)
+    ap.add_argument("--lambda_sparsity", type=float, default=0.0)
     ap.add_argument("--text_dropout", type=float, default=0.5)
     # Rung 0: graded soft labels (ramp on max GT cosine) instead of hard positive_mask
     ap.add_argument("--soft_labels", action="store_true")

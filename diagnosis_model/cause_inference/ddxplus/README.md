@@ -2,7 +2,7 @@
 
 This note defines the DDXPlus adaptation contract for `cause_inference`.
 The goal is to validate FaCE-R outside fish images by replacing visual lesions
-with clinical evidence tokens while preserving the existing retrieval and CEAH
+with clinical evidence tokens while preserving the existing retrieval and CEAM
 interfaces.
 
 ## Dataset Role
@@ -69,13 +69,13 @@ Per-case keys are unchanged:
     "lesion_embs": Tensor[N, D],      # atomic evidence tokens, ORDER:
                                        #   [Age: X], [Sex: Y], evidence_1, evidence_2, ...
                                        # Age/Sex prepended (since 2026-05-28 schema)
-                                       # so CEAH can attribute α to each demographic
+                                       # so CEAM can attribute α to each demographic
                                        # / symptom separately rather than collapsing
                                        # them inside global.
     "lesion_boxes_xywh": Tensor[N, 4],# dummy zeros for compatibility
     "causes": list[str],              # [PATHOLOGY] — strict GT pathology name(s)
     "pathology_emb_idx": int,         # ★ single strict pathology cause-table index
-                                       # — used for pathology R@K, CEAH positive_mask,
+                                       # — used for pathology R@K, CEAM positive_mask,
                                        # soft-label GT
     "cause_emb_indices": list[int],   # ★ EXPANDED: [pathology_idx, ddx1_idx, ddx2_idx, ...]
                                        # — used by build_candidate_pool so DDX
@@ -91,7 +91,7 @@ Per-case keys are unchanged:
 ```
 
 `lesion_embs` is intentionally kept as the tensor key even though the semantic
-meaning is evidence embeddings. This keeps the current CEAH code path usable:
+meaning is evidence embeddings. This keeps the current CEAM code path usable:
 global/text/evidence tokens are still projected as evidence and scored against
 candidate causes.
 
@@ -104,7 +104,7 @@ two roles:
 
 | Field | Type | Used by | Why |
 |---|---|---|---|
-| `pathology_emb_idx` | int | pathology R@K, CEAH positive_mask, soft-label GT | strict 1-of-49 GT — DDX alternatives must NOT count as pathology hits |
+| `pathology_emb_idx` | int | pathology R@K, CEAM positive_mask, soft-label GT | strict 1-of-49 GT — DDX alternatives must NOT count as pathology hits |
 | `cause_emb_indices` | list[int] (pathology + DDX) | `build_candidate_pool` for retrieved cases | pool diversity — DDX alternatives become hard negatives in pool, expanding from mean=1.08 to ~10-30 unique causes per query |
 
 Fish builds (pre-2026-05-28) don't write `pathology_emb_idx`; downstream
@@ -133,15 +133,15 @@ lesion_emb_5 = encode("{question_en}: {value_meaning.en}")  # multi-choice (one 
 Use `release_evidences.json` to decode evidence IDs and values. Keep raw IDs in
 metadata for debugging.
 
-### Why CEAH on DDXPlus needs `--text_dropout 1.0` / `--text_kind none`
+### Why CEAM on DDXPlus needs `--text_dropout 1.0` / `--text_kind none`
 
 `text_colloquial_emb` and `text_medical_emb` are populated as duplicates of
-`global_emb`. They exist for backward compatibility with the fish 3-token CEAH
+`global_emb`. They exist for backward compatibility with the fish 3-token CEAM
 architecture (image global + textual notes + lesion crops), where text is a
 separately-encoded modality. DDXPlus has no such modality split — the patient
 summary is the only available case-level descriptor. Training with
 `--text_dropout 1.0` and evaluating with `--text_kind none` masks the text
-token to zero throughout, which avoids feeding CEAH a redundant copy of the
+token to zero throughout, which avoids feeding CEAM a redundant copy of the
 global token. Faithfulness on the previous (v1) schema confirmed `no_text`
 drop = -0.0002 (essentially noise), validating that text adds no information
 on DDXPlus.
@@ -176,9 +176,9 @@ Add DDXPlus-specific metrics in a later pass:
 - NDCG@K against `DIFFERENTIAL_DIAGNOSIS` probabilities
 - coverage of differential diagnosis entries in candidate pool
 
-## CEAH / Faithfulness Mapping
+## CEAM / Faithfulness Mapping
 
-CEAH can be reused directly:
+CEAM can be reused directly:
 
 ```text
 global token  = patient summary embedding
@@ -236,7 +236,7 @@ $PY -m diagnosis_model.cause_inference.ddxplus.build_case_database \
 ### `--embedding_dtype`: storage dtype for shards / cause_text_embs
 
 Use `--embedding_dtype bf16` by default for DDXPlus shards and `cause_text_embs.pt`.
-Downstream loaders upcast embeddings to fp32 before CEAH, avoiding mixed-dtype errors.
+Downstream loaders upcast embeddings to fp32 before CEAM, avoiding mixed-dtype errors.
 Use `fp32` only on older GPUs without native bf16 support.
 
 ### `--lesion_match max_mean` (now the global default)
@@ -254,7 +254,7 @@ coverage）—— 詳見 [`ablations/lesion_match_ranking_equiv`](../ablations/l
 | `eval_retrieval` 全 valid (134k × 1M) | ~9 天 (infeasible) | **~2.3 hr** |
 | `build_train_candidate_pool` (1M × 1M) | ~70 days (infeasible) | **~17 hr** |
 | `train_ceah` validation (300 q subset/epoch) | ~30 min/epoch | **~20 s/epoch** |
-| `eval_ceah` (134k × 1M + CEAH) | infeasible | **~3 hr** |
+| `eval_ceah` (134k × 1M + CEAM) | infeasible | **~3 hr** |
 | `faithfulness_eval` (134k × 1M, 6 masks) | infeasible | **~8 hr** |
 
 > 注:DDXPlus 標準切分 1.3M 約 80/10/10 → train 1.03M / valid 134k / test 134k。
@@ -342,7 +342,7 @@ per-case fields (global + 2× text + lesion embs) blows past 62 GB CPU RAM.
 DDXPlus must explicitly pass `--max_train_cases 200000 --bank_dtype bf16` —
 applied to BOTH the bank and the leave-one-out queries (LOO requires
 query[i] == bank[i], so the same subsample serves both via shared
-`sample_seed`). 200k × top_k=20 = 4M (q, retrieved_case) pairs for CEAH
+`sample_seed`). 200k × top_k=20 = 4M (q, retrieved_case) pairs for CEAM
 training, well above what 49-condition retrieval needs.
 
 ```bash
@@ -365,15 +365,15 @@ For DDXPlus, exact pathology labels are included in the cause table. The `semant
 > the historic fish workflow. DDXPlus must explicitly opt into the bf16 +
 > subsample combination above.
 
-### 4. Train CEAH
+### 4. Train CEAM
 
-Train CEAH on DDXPlus evidence tokens. Pass `--max_train_cases` / `--sample_seed`
-matching the values used in step 3 so `CEAHDataset[idx]` lines up with
+Train CEAM on DDXPlus evidence tokens. Pass `--max_train_cases` / `--sample_seed`
+matching the values used in step 3 so `CEAMDataset[idx]` lines up with
 `train_pool[idx]` (sanity check enforced at startup). `--bank_dtype bf16` keeps
 the validation Phase 1 bank in half precision (200k cases ~6 GB GPU bf16 vs
-~12 GB fp32, leaves headroom for CEAH forward). **`--text_dropout 1.0` is
+~12 GB fp32, leaves headroom for CEAM forward). **`--text_dropout 1.0` is
 required for DDXPlus** — masks the redundant text token (= global duplicate)
-to zero so CEAH attribution can't collapse onto it; **`--eval_text_kind none`**
+to zero so CEAM attribution can't collapse onto it; **`--eval_text_kind none`**
 matches that at validation time.
 
 ```bash
@@ -406,10 +406,10 @@ below for final DDXPlus-specific metrics.
 > The script's CLI defaults (`--bank_dtype fp32 --max_train_cases 0`) preserve
 > the historic fish 12,780-case workflow (full train, fp32 valid bank).
 
-### 5. CEAH Rerank Evaluation
+### 5. CEAM Rerank Evaluation
 
-Evaluate the trained CEAH checkpoint. Add `--stream` for full 1M-bank
-Phase 1 retrieval before CEAH reranking.
+Evaluate the trained CEAM checkpoint. Add `--stream` for full 1M-bank
+Phase 1 retrieval before CEAM reranking.
 
 ```bash
 # Default: 200K subsample bank
@@ -446,7 +446,7 @@ $PY -m diagnosis_model.cause_inference.ddxplus.eval_ceah \
   --stream --stream_query_batch 64
 ```
 
-`gamma=0.0` is pure CEAH reranking. `gamma=1.0` is Phase 1 scoring only.
+`gamma=0.0` is pure CEAM reranking. `gamma=1.0` is Phase 1 scoring only.
 
 Outputs:
 
@@ -533,10 +533,10 @@ Age/Sex as atomic lesion tokens, `--text_dropout 1.0 / --text_kind none`).
 Pathology R@1 drops because the expanded pool now has DDX alternatives
 competing for rank 1 under raw Phase 1 scoring (cosine doesn't know to
 prefer pathology over DDX). R@20=100% confirms pathology is still **in**
-the pool — CEAH at γ=0.75 recovers it (next table). DDX NDCG@K and pool
+the pool — CEAM at γ=0.75 recovers it (next table). DDX NDCG@K and pool
 mass coverage are paper-grade leaderboard numbers now.
 
-### CEAH training (200k cases, 20 epochs)
+### CEAM training (200k cases, 20 epochs)
 
 | Metric             | v1                    | v2                       |
 |--------------------|-----------------------|--------------------------|
@@ -547,20 +547,20 @@ mass coverage are paper-grade leaderboard numbers now.
 v1 saturated trivially (pool size 1 = R@1 is just coverage). v2 has a real
 ranking task and the loss/score curves are healthy.
 
-### CEAH γ-scan (full 132k valid)
+### CEAM γ-scan (full 132k valid)
 
 | γ              | v1 path R@1 | v2 path R@1     | v1 NDCG@5 | v2 NDCG@5     |
 |----------------|-------------|------------------|-----------|----------------|
-| 0.00 pure CEAH | 97.97%      | 87.63%           | 0.485     | 0.699          |
+| 0.00 pure CEAM | 97.97%      | 87.63%           | 0.485     | 0.699          |
 | 0.25           | 98.04%      | 93.56%           | 0.485     | 0.841          |
 | 0.50           | 98.16%      | 94.96%           | 0.485     | 0.848          |
 | **0.75**       | 98.87%      | **95.64% ★**     | 0.485     | **0.853 ★**    |
 | 1.00 pure Φ1   | **98.88% ★**| 53.85%           | 0.485     | 0.824          |
 
-**Best-γ flip**: v1 γ=1.0 (CEAH harmful) → v2 **γ=0.75** (CEAH essential).
+**Best-γ flip**: v1 γ=1.0 (CEAM harmful) → v2 **γ=0.75** (CEAM essential).
 γ=0.75 over γ=1.0 on v2 gives +41.79 pp pathology R@1 — direct evidence
-that CEAH does meaningful reranking on the expanded pool. On v1 the
-ranking task didn't exist so CEAH couldn't show value.
+that CEAM does meaningful reranking on the expanded pool. On v1 the
+ranking task didn't exist so CEAM couldn't show value.
 
 ### Faithfulness (full 132k, mean score drop per masked condition)
 
@@ -576,7 +576,7 @@ ranking task didn't exist so CEAH couldn't show value.
 v1: `no_global ≈ no_top_alpha` indicated top-α was always global (no
 lesion-grounding). v2: `no_top_evidence` jumped 80× — for many queries
 the highest-α token is now an evidence, not global. This is the
-"lesion-grounded attribution" CEAH was designed to provide.
+"lesion-grounded attribution" CEAM was designed to provide.
 
 ### Per-query α (v2 sample over 1000 queries)
 
@@ -590,12 +590,12 @@ the highest-α token is now an evidence, not global. This is the
 | Sex token α mean         | 0.0007      |
 | Sex token median rank    | 10/26       |
 
-CEAH learned a **bimodal** attribution: most queries put α ≈ 1 on a
+CEAM learned a **bimodal** attribution: most queries put α ≈ 1 on a
 single evidence token (global ≈ 0); a minority concentrate α on global
 (e.g. Boerhaave queries with α(global) = 0.93). Age/Sex are atomic
-tokens with separable α but CEAH consistently finds them
+tokens with separable α but CEAM consistently finds them
 non-diagnostic for the 49-condition task — a "negative finding" that
-validates the design: CEAH correctly identifies which atomic tokens
+validates the design: CEAM correctly identifies which atomic tokens
 carry diagnostic signal rather than diluting attribution across all
 inputs.
 
@@ -794,12 +794,12 @@ $PY -m diagnosis_model.cause_inference.ddxplus.eval_phase4 \
 > itself is suboptimal here, so `light` regresses toward dense and
 > hurts. Both observations follow from the same ABQ framework —
 > see paper_tables.md Table G4. The note above is the *retrieval-side
-> proxy*; step 11 confirms it survives end-to-end through CEAH.
+> proxy*; step 11 confirms it survives end-to-end through CEAM.
 
-### 11. Phase 4 — end-to-end CEAH compression eval (γ-swept)
+### 11. Phase 4 — end-to-end CEAM compression eval (γ-swept)
 
-The retrieval proxy (step 10) is pre-CEAH. This step runs the compressed
-coarse ranking *through CEAH* and sweeps γ, the DDXPlus analogue of fish
+The retrieval proxy (step 10) is pre-CEAM. This step runs the compressed
+coarse ranking *through CEAM* and sweeps γ, the DDXPlus analogue of fish
 `eval_ceah_compressed.py`. DDXPlus production is the **coarse-dominant
 γ=0.75** point (not fish's γ=0), so the reranker's end-to-end effect must
 be read across the curve.
@@ -820,11 +820,11 @@ Result (M4K256 768×, 5000 valid, pathology R@1):
 
 | γ | dense | rvq_only | light | full(oracle) |
 |---|---|---|---|---|
-| 0.00 (pure CEAH) | 0.878 | 0.876 | 0.877 | 0.876 |
+| 0.00 (pure CEAM) | 0.878 | 0.876 | 0.877 | 0.876 |
 | 0.75 (production) | 0.954 | **0.981** | 0.974 | 0.973 |
 | 1.00 (pure Phase1) | 0.525 | 0.666 | 0.604 | 0.627 |
 
-> **Two regimes, both kill the reranker end-to-end.** (A) γ=0: CEAH
+> **Two regimes, both kill the reranker end-to-end.** (A) γ=0: CEAM
 > re-scores from scratch and discards coarse order — compression and
 > reranker both vanish into noise (±0.16 pp). (B) γ=0.75: coarse order
 > matters but `rvq_only` beats `dense` (+2.7 pp); `light` drags it back
@@ -836,7 +836,7 @@ Result (M4K256 768×, 5000 valid, pathology R@1):
 ## Smoke Test
 
 Validated with a synthetic DDXPlus-like CSV using `--embedding_backend hash`.
-Covered: case DB build, retrieval eval, CEAH eval, faithfulness eval, and bf16 load/upcast path.
+Covered: case DB build, retrieval eval, CEAM eval, faithfulness eval, and bf16 load/upcast path.
 
 Phase 3 / 4 changes additionally smoke-tested on fish `case_db` (12,780
 cases): precomputed-teacher path unchanged; `--teacher_mode on_the_fly` on

@@ -6,7 +6,7 @@ SigLIP2 text space, so lesion crops are **never re-encoded** — one forward pas
 yields box + objectness + a semantic vector `z` that retrieves directly against a
 symptom-caption bank.
 
-It is a standalone paper contribution (own acronym, alongside ABQ / CEAH). The
+It is a standalone paper contribution (own acronym, alongside ABQ / CEAM). The
 full narrative, reviewer-defense, and ablation matrix live in
 [`note/merge_narrative.md`](../../note/merge_narrative.md).
 
@@ -112,10 +112,10 @@ separate rather than merged:
 
 Both holding up means the grounding is real at both the vector and spatial level.
 
-### Table B — interpretability / faithfulness axis (region feature, CEAH-free)
+### Table B — interpretability / faithfulness axis (region feature, CEAM-free)
 
 The headline faithfulness metric is measured on **GROD's own region feature**,
-with no cause-attribution head in the loop: mask the lesion pixels, re-encode,
+with no cause-attribution module in the loop: mask the lesion pixels, re-encode,
 and see how much the region's symptom probability drops. P = softmax over the 19
 symptom anchors (rank-aware, so it is comparable across feature spaces and is not
 skewed by absolute cosine scale). **Larger positive drop = more faithful**
@@ -138,8 +138,8 @@ isolated-crop already is the non-DETR / RoI-routing proxy.
 The isolated crop barely moves (+0.008): masking the lesion does not change its
 symptom evidence, i.e. the routing is **not grounded** on the lesion. GROD's
 probability collapses by 0.276 — the region feature is grounded on the lesion by
-construction. (An end-to-end variant *through* CEAH gives a smaller but same-sign
-+0.0141; the CEAH-free number above is the cleaner, stronger headline.)
+construction. (An end-to-end variant *through* CEAM gives a smaller but same-sign
++0.0141; the CEAM-free number above is the cleaner, stronger headline.)
 
 ### Table B′ — pixel-level localization (pointing game)
 

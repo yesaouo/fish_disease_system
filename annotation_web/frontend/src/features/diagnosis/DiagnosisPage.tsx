@@ -1,24 +1,25 @@
 import React, { useMemo, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Upload, Stethoscope, Loader2 } from "lucide-react";
-import { diagnose } from "../../api/client";
+import { ArrowLeft, Upload, Stethoscope, Loader2, Download } from "lucide-react";
+import { diagnose, downloadReportPdf } from "../../api/client";
 import type { DiagnoseResponse } from "../../api/types";
 import { useAuth } from "../../context/AuthContext";
 import ProjectHeader from "../../components/ProjectHeader";
 
 const MODE_LABELS: Record<string, string> = {
-  grod_soft: "GROD（soft gate）",
-  grod: "GROD（hard gate）",
-  base: "分離式對照組 base"
+  grod_soft: "OAVLE + CEAM",
+  grod: "OAVLE（硬性門檻）",
+  base: "分離式對照模型"
 };
 
-const Card: React.FC<React.PropsWithChildren<{ title: string; sub?: string }>> = ({
+const Card: React.FC<React.PropsWithChildren<{ title: string; sub?: string; className?: string }>> = ({
   title,
   sub,
+  className,
   children
 }) => (
-  <section className="rounded-xl bg-white p-6 shadow">
+  <section className={"rounded-xl bg-white p-4 shadow sm:p-6" + (className ? ` ${className}` : "")}>
     <div className="mb-3 flex items-baseline justify-between">
       <h2 className="text-lg font-semibold text-slate-800">{title}</h2>
       {sub && <span className="text-xs text-slate-400">{sub}</span>}
@@ -34,9 +35,9 @@ const DiagnosisPage: React.FC = () => {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [text, setText] = useState("");
-  const [mode, setMode] = useState("grod_soft");
-  const [topN, setTopN] = useState(5);
-  const [topK, setTopK] = useState(20);
+  const mode = "grod_soft"; // 生產固定模式，不開放切換
+  const [topN, setTopN] = useState(6);
+  const [topK, setTopK] = useState(3);
   const [selectedCause, setSelectedCause] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -58,33 +59,33 @@ const DiagnosisPage: React.FC = () => {
   };
 
   const cause = useMemo(
-    () => (report && report.causes.length > 0 ? report.causes[selectedCause] : null),
+    () => report?.causes?.[selectedCause] ?? null,
     [report, selectedCause]
   );
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-6xl flex-col gap-6 px-6 py-10">
+    <div className="mx-auto flex min-h-screen max-w-6xl flex-col gap-6 px-4 py-6 sm:px-6 sm:py-10">
       <ProjectHeader />
 
       <header className="flex items-center justify-between">
         <div>
-          <h1 className="flex items-center gap-2 text-2xl font-semibold text-slate-800">
+          <h1 className="flex items-center gap-2 text-xl font-semibold text-slate-800 sm:text-2xl">
             <Stethoscope className="h-6 w-6 text-sky-600" /> AI 魚病診斷報告
           </h1>
-          <p className="text-sm text-slate-500">您好，{name ?? "訪客"}　上傳魚體影像即可產生結構化診斷輔助報告</p>
+          <p className="hidden text-sm text-slate-500 sm:block">您好，{name ?? "訪客"}　上傳魚體影像即可產生結構化診斷輔助報告</p>
         </div>
         <button
           type="button"
           onClick={() => navigate("/datasets")}
-          className="inline-flex items-center gap-1 rounded border border-slate-200 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100"
+          className="inline-flex items-center gap-1 rounded border border-slate-200 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 print:hidden"
         >
           <ArrowLeft className="h-4 w-4" /> 返回
         </button>
       </header>
 
       {/* ===== 輸入區 ===== */}
-      <Card title="輸入" sub="影像為必填，文字描述選填">
-        <div className="grid gap-6 md:grid-cols-2">
+      <Card title="輸入" sub="影像為必填，文字描述選填" className="print:hidden">
+        <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
           <div>
             <div
               onClick={() => fileInputRef.current?.click()}
@@ -109,62 +110,51 @@ const DiagnosisPage: React.FC = () => {
 
           <div className="flex flex-col gap-3">
             <label className="text-sm text-slate-600">
-              文字描述（選填，作為 CEAH 文字證據）
+              文字描述（選填）
               <textarea
                 value={text}
                 onChange={(e) => setText(e.target.value)}
                 rows={3}
-                placeholder="例：體表潰瘍、紅腫，疑似感染；留空＝vision-only"
+                placeholder="例：體表潰瘍、紅腫，疑似感染"
                 className="mt-1 w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
             </label>
-            <div className="grid grid-cols-3 gap-3">
-              <label className="text-sm text-slate-600">
-                模式
-                <select
-                  value={mode}
-                  onChange={(e) => setMode(e.target.value)}
-                  className="mt-1 w-full rounded border border-slate-300 px-2 py-2 text-sm"
-                >
-                  {Object.entries(MODE_LABELS).map(([k, v]) => (
-                    <option key={k} value={k}>
-                      {v}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="text-sm text-slate-600">
-                top_n 病因
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={topN}
-                  onChange={(e) => setTopN(Number(e.target.value))}
-                  className="mt-1 w-full rounded border border-slate-300 px-2 py-2 text-sm"
-                />
-              </label>
-              <label className="text-sm text-slate-600">
-                top_k 案例
-                <input
-                  type="number"
-                  min={5}
-                  max={50}
-                  value={topK}
-                  onChange={(e) => setTopK(Number(e.target.value))}
-                  className="mt-1 w-full rounded border border-slate-300 px-2 py-2 text-sm"
-                />
-              </label>
-            </div>
+            <details className="text-sm text-slate-600">
+              <summary className="cursor-pointer text-slate-500">進階設定</summary>
+              <div className="mt-2 grid grid-cols-2 gap-3">
+                <label className="text-sm text-slate-600">
+                  參考案例數量
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={topK}
+                    onChange={(e) => setTopK(Number(e.target.value))}
+                    className="mt-1 w-full rounded border border-slate-300 px-2 py-2 text-sm"
+                  />
+                </label>
+                <label className="text-sm text-slate-600">
+                  病因顯示上限
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={topN}
+                    onChange={(e) => setTopN(Number(e.target.value))}
+                    className="mt-1 w-full rounded border border-slate-300 px-2 py-2 text-sm"
+                  />
+                </label>
+              </div>
+            </details>
             <button
               type="button"
               disabled={!file || mutation.isPending}
               onClick={() => mutation.mutate()}
-              className="mt-1 inline-flex items-center justify-center gap-2 rounded bg-sky-600 px-4 py-2.5 font-medium text-white hover:bg-sky-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+              className="mt-1 flex w-full items-center justify-center gap-2 rounded bg-sky-600 px-4 py-2.5 font-medium text-white hover:bg-sky-700 disabled:cursor-not-allowed disabled:bg-slate-300"
             >
               {mutation.isPending ? (
                 <>
-                  <Loader2 className="h-4 w-4 animate-spin" /> 推論中…（首次載入模型較久）
+                  <Loader2 className="h-4 w-4 animate-spin" /> 推論中…
                 </>
               ) : (
                 <>
@@ -201,20 +191,53 @@ const Report: React.FC<{
 }> = ({ report, previewUrl, selectedCause, setSelectedCause, cause }) => {
   const m = report.meta;
   const [bgMode, setBgMode] = useState<"original" | "heatmap">("original");
+  const [showBoxes, setShowBoxes] = useState(true);
+  const [activeLesion, setActiveLesion] = useState<number | null>(null);
+  const toggleLesion = (i: number) => setActiveLesion((p) => (p === i ? null : i));
+  const [pdfPending, setPdfPending] = useState(false);
+  const [pdfError, setPdfError] = useState<string | null>(null);
+  const onDownloadPdf = async () => {
+    setPdfPending(true);
+    setPdfError(null);
+    try {
+      await downloadReportPdf(report);
+    } catch (e) {
+      const status = (e as { response?: { status?: number } })?.response?.status;
+      setPdfError(
+        status === 404
+          ? "報告已過期，請重新產生診斷報告後再下載。"
+          : "下載報告失敗，請稍後再試。"
+      );
+    } finally {
+      setPdfPending(false);
+    }
+  };
   const [W, H] = report.image_size;
   const badge = Math.max(W, H) * 0.05; // box-corner index badge size (image px)
   const stroke = Math.max(W, H) * 0.006;
+
   return (
     <>
+      <div className="flex flex-col items-end gap-1">
+        <button
+          type="button"
+          onClick={onDownloadPdf}
+          disabled={pdfPending}
+          className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-600 shadow-sm hover:bg-slate-100 disabled:cursor-not-allowed disabled:text-slate-300"
+        >
+          {pdfPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+          下載診斷報告
+        </button>
+        {pdfError && <p className="text-xs text-red-600">{pdfError}</p>}
+      </div>
       {/* 基本資料 */}
       <Card title="基本資料">
-        <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm md:grid-cols-4">
+        <dl className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-2 md:grid-cols-4">
           <Field k="影像編號" v={m.case_id} />
           <Field k="上傳時間" v={m.timestamp.replace("T", " ")} />
           <Field k="模式" v={MODE_LABELS[m.mode] ?? m.mode} />
-          <Field k="候選病因池" v={String(report.pool_size)} />
-          <div className="col-span-2 md:col-span-4">
-            <Field k="使用者描述" v={m.text || "（未填，vision-only）"} />
+          <div className="sm:col-span-2 md:col-span-4">
+            <Field k="送檢描述" v={m.text || "（未填，僅影像）"} />
           </div>
         </dl>
       </Card>
@@ -222,106 +245,112 @@ const Report: React.FC<{
       {report.abstain ? (
         <Card title="判定結果">
           <p className="rounded-lg bg-emerald-50 px-4 py-3 text-emerald-700">
-            🟢 最高 objectness 未達 abstain 門檻（{m.thresholds.abstain.toFixed(2)}），判定為<strong>健康</strong>，不進行病因推論。
+            🟢 系統未在魚體表面偵測到明顯異常，判定為<strong>健康</strong>，未進行病因分析。
           </p>
+          {previewUrl && (
+            <figure className="mt-4">
+              <img src={previewUrl} alt="送檢影像" className="w-full rounded-lg" />
+              <figcaption className="mt-1 text-center text-xs text-slate-400">送檢影像</figcaption>
+            </figure>
+          )}
         </Card>
       ) : (
-        <>
-          {/* ① 病灶定位與分析（熱力圖 ⇄ 原圖 + 框 + 卡片合併） */}
-          <Card title="① 病灶定位與分析" sub={`${report.n_lesions} 個病灶 · z·anchor 分類`}>
-            {/* 空間總覽：底圖可切換，病灶框為 SVG overlay */}
-            <div className="mb-2 flex gap-2">
-              {(["original", "heatmap"] as const).map((b) => (
+        <div className="flex flex-col gap-6">
+          {/* 區段一：病灶定位（左，較窄）＋ 病灶詳細（右，響應式網格） */}
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)] lg:items-start">
+            <Card title="① 病灶定位" sub={`${report.n_lesions} 個病灶`}>
+              <div className="mb-2 flex gap-2">
                 <button
-                  key={b}
                   type="button"
-                  onClick={() => setBgMode(b)}
+                  onClick={() => setShowBoxes((v) => !v)}
                   className={
                     "rounded-full px-3 py-1 text-xs " +
-                    (bgMode === b
-                      ? "bg-sky-600 text-white"
-                      : "bg-slate-100 text-slate-500 hover:bg-slate-200")
+                    (showBoxes ? "bg-sky-600 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200")
                   }
                 >
-                  {b === "original" ? "原圖" : "異常熱力圖"}
+                  顯示病灶框
                 </button>
-              ))}
-            </div>
-            <div className="relative w-full overflow-hidden rounded-lg">
-              <img
-                src={bgMode === "heatmap" ? report.heatmap : previewUrl ?? report.heatmap}
-                alt="病灶定位"
-                className="block w-full"
-              />
-              <svg
-                viewBox={`0 0 ${W} ${H}`}
-                preserveAspectRatio="none"
-                className="pointer-events-none absolute inset-0 h-full w-full"
-              >
-                {report.lesions.map((l) => {
-                  const [x, y, w, h] = l.bbox_xywh;
-                  return (
-                    <g key={l.idx}>
-                      <rect
-                        x={x}
-                        y={y}
-                        width={w}
-                        height={h}
-                        fill="none"
-                        stroke="#dc2626"
-                        strokeWidth={stroke}
-                      />
-                      <rect x={x} y={y} width={badge} height={badge} rx={badge * 0.15} fill="#dc2626" />
-                      <text
-                        x={x + badge / 2}
-                        y={y + badge * 0.72}
-                        textAnchor="middle"
-                        fontSize={badge * 0.6}
-                        fontWeight="bold"
-                        fill="#fff"
-                      >
-                        {l.idx}
-                      </text>
-                    </g>
-                  );
-                })}
-              </svg>
-            </div>
-            <p className="mt-1 text-xs text-slate-400">
-              框＝顯示門檻內的病灶；熱力圖＝全 query objectness 場（含門檻外訊號）。
-            </p>
+                <button
+                  type="button"
+                  onClick={() => setBgMode(bgMode === "heatmap" ? "original" : "heatmap")}
+                  className={
+                    "rounded-full px-3 py-1 text-xs " +
+                    (bgMode === "heatmap" ? "bg-sky-600 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200")
+                  }
+                >
+                  顯示異常熱力圖
+                </button>
+              </div>
+              <div className="relative w-full overflow-hidden rounded-lg">
+                <img
+                  src={bgMode === "heatmap" ? report.heatmap : previewUrl ?? report.heatmap}
+                  alt="病灶定位"
+                  className="block w-full"
+                />
+                {showBoxes && (
+                  <svg
+                    viewBox={`0 0 ${W} ${H}`}
+                    preserveAspectRatio="none"
+                    className="absolute inset-0 h-full w-full"
+                  >
+                    {report.lesions.map((l) => {
+                      const [x, y, w, h] = l.bbox_xywh;
+                      const on = activeLesion === l.idx;
+                      const color = on ? "#f59e0b" : "#dc2626";
+                      return (
+                        <g key={l.idx} onClick={() => toggleLesion(l.idx)} style={{ cursor: "pointer" }}>
+                          <rect x={x} y={y} width={w} height={h} fill="transparent" />
+                          <rect
+                            x={x}
+                            y={y}
+                            width={w}
+                            height={h}
+                            fill="none"
+                            stroke={color}
+                            strokeWidth={on ? stroke * 1.8 : stroke}
+                          />
+                          <rect x={x} y={y} width={badge} height={badge} rx={badge * 0.15} fill={color} />
+                          <text
+                            x={x + badge / 2}
+                            y={y + badge * 0.72}
+                            textAnchor="middle"
+                            fontSize={badge * 0.6}
+                            fontWeight="bold"
+                            fill="#fff"
+                          >
+                            {l.idx + 1}
+                          </text>
+                        </g>
+                      );
+                    })}
+                  </svg>
+                )}
+              </div>
+            </Card>
 
-            {/* 病灶卡片（原生）：crop + top-k 症狀 + 信心 */}
-            <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              {report.lesions.map((l) => (
-                <LesionCard key={l.idx} l={l} />
-              ))}
-            </div>
-          </Card>
+            <Card title="病灶詳細" sub="點卡片或影像框互相對應">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 2xl:grid-cols-3">
+                {report.lesions.map((l) => (
+                  <LesionCard
+                    key={l.idx}
+                    l={l}
+                    active={activeLesion === l.idx}
+                    onClick={() => toggleLesion(l.idx)}
+                  />
+                ))}
+              </div>
+            </Card>
+          </div>
 
-          {/* ② 相似案例 */}
-          <Card title="② 相似案例" sub={`Top-${report.retrieved.length} 檢索`}>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-5">
-              {report.retrieved.map((r) => (
-                <figure key={r.rank} className="overflow-hidden rounded-lg border border-slate-100">
-                  <img src={r.image} alt={r.file_name} className="h-28 w-full object-cover" />
-                  <figcaption className="px-2 py-1 text-center text-xs text-slate-500">
-                    #{r.rank}　sim={r.similarity.toFixed(3)}
-                  </figcaption>
-                </figure>
-              ))}
-            </div>
-          </Card>
-
-          {/* ③ 疑似病因 + 證據歸因 */}
-          <Card title="③ 疑似病因排序 + α 證據歸因" sub="點選病因查看歸因">
-            <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
-              <ul className="flex flex-col gap-2">
+          {/* 區段二：病因排序（左）＋ 病因詳細（右，含來源相似案例） */}
+          <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+            <Card title="② 疑似病因" sub="點選病因查看詳細">
+              <ul className="flex min-w-0 flex-col gap-2">
                 {report.causes.map((c, i) => (
-                  <li key={c.rank}>
+                  <li key={c.rank} className="min-w-0">
                     <button
                       type="button"
-                      onClick={() => setSelectedCause(i)}
+                      onClick={() => setSelectedCause(i === selectedCause ? -1 : i)}
                       className={
                         "w-full rounded-lg border px-3 py-2 text-left text-sm " +
                         (i === selectedCause
@@ -338,36 +367,26 @@ const Report: React.FC<{
                       </div>
                       <p className="mt-0.5 line-clamp-2 text-slate-600">{c.text}</p>
                     </button>
+                    {/* 手機：手風琴就地展開詳細（電腦改用右欄） */}
+                    {i === selectedCause && (
+                      <div className="mt-2 md:hidden">
+                        <CauseDetail cause={c} retrieved={report.retrieved} />
+                      </div>
+                    )}
                   </li>
                 ))}
               </ul>
+            </Card>
 
-              {cause && (
-                <div className="flex flex-col gap-3">
-                  <div className="rounded-lg bg-slate-50 px-4 py-3 text-sm">
-                    <p className="font-semibold text-slate-800">Top-{cause.rank} 病因</p>
-                    <p className="mt-1 text-slate-700">{cause.text}</p>
-                    <p className="mt-2 text-xs text-slate-500">
-                      CEAH score：{cause.score.toFixed(3)}
-                      {cause.support != null && `　·　支持度：${cause.support} 個相似病例`}
-                    </p>
-                    {cause.members.length > 1 && (
-                      <details className="mt-2 text-xs text-slate-500">
-                        <summary className="cursor-pointer">已聚合 {cause.members.length - 1} 條相近病因</summary>
-                        <ul className="mt-1 list-disc pl-5">
-                          {cause.members.slice(1, 6).map((mm, j) => (
-                            <li key={j}>{mm}</li>
-                          ))}
-                        </ul>
-                      </details>
-                    )}
-                  </div>
-                  <img src={cause.attribution} alt="α attribution" className="w-full rounded-lg" />
-                  <img src={cause.breakdown} alt="α breakdown" className="w-full rounded-lg" />
-                </div>
+            {/* 電腦：右側詳細欄 */}
+            <Card title="病因詳細" sub="各證據貢獻" className="hidden md:block">
+              {cause ? (
+                <CauseDetail cause={cause} retrieved={report.retrieved} />
+              ) : (
+                <p className="py-2 text-sm text-slate-400">點左側病因，查看各證據的貢獻。</p>
               )}
-            </div>
-          </Card>
+            </Card>
+          </div>
 
           {/* 處置建議 / 專家覆核 — 佔位（未來工作） */}
           <Card title="處置建議與專家覆核" sub="保留欄位 · 未來 Human-In-The-Loop">
@@ -398,7 +417,7 @@ const Report: React.FC<{
               </div>
             </div>
           </Card>
-        </>
+        </div>
       )}
 
       {/* 模組參數 + 延遲 */}
@@ -422,7 +441,7 @@ const Report: React.FC<{
                 ))}
                 <tr className="border-t border-slate-200 font-semibold">
                   <td className="py-1">總計</td>
-                  <td className="py-1 text-right">{report.params.total.toLocaleString()}</td>
+                  <td className="py-1 text-right">{(report.params.total / 1e6).toFixed(1)}M</td>
                 </tr>
               </tbody>
             </table>
@@ -455,16 +474,70 @@ const Report: React.FC<{
   );
 };
 
-const LesionCard: React.FC<{ l: DiagnoseResponse["lesions"][number] }> = ({ l }) => (
-  <div className="rounded-lg border border-slate-200 p-3">
+const CauseDetail: React.FC<{
+  cause: DiagnoseResponse["causes"][number];
+  retrieved: DiagnoseResponse["retrieved"];
+}> = ({ cause, retrieved }) => {
+  const supportCases = cause.support_cases
+    .map((rk) => retrieved.find((r) => r.rank === rk))
+    .filter((r): r is DiagnoseResponse["retrieved"][number] => !!r);
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="rounded-lg bg-slate-50 px-4 py-3 text-sm">
+        <p className="font-semibold text-slate-800">Top-{cause.rank} 病因</p>
+        <p className="mt-1 text-slate-700">{cause.text}</p>
+        <p className="mt-2 text-xs text-slate-500">
+          AI 評分：{cause.score.toFixed(3)}
+          {cause.support != null && `　·　${cause.support} 個相似案例支持`}
+        </p>
+      </div>
+      {supportCases.length > 0 && (
+        <div className="min-w-0">
+          <p className="mb-1 text-xs text-slate-400">此病因來自以下相似案例</p>
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {supportCases.map((r) => (
+              <figure
+                key={r.rank}
+                className="w-28 shrink-0 overflow-hidden rounded-lg border border-slate-100"
+              >
+                <img src={r.image} alt={r.file_name} className="h-20 w-28 object-cover" />
+                <figcaption className="px-1 py-0.5 text-center text-[10px] text-slate-500">
+                  相似度 {r.similarity.toFixed(3)}
+                </figcaption>
+              </figure>
+            ))}
+          </div>
+        </div>
+      )}
+      <div>
+        <p className="mb-1 text-xs text-slate-400">各證據對此病因的貢獻</p>
+        <img src={cause.breakdown} alt="α breakdown" className="w-full rounded-lg" />
+      </div>
+    </div>
+  );
+};
+
+const LesionCard: React.FC<{
+  l: DiagnoseResponse["lesions"][number];
+  active?: boolean;
+  onClick?: () => void;
+}> = ({ l, active, onClick }) => (
+  <div
+    onClick={onClick}
+    className={
+      "rounded-lg border p-3 transition " +
+      (onClick ? "cursor-pointer hover:bg-slate-50 " : "") +
+      (active ? "border-amber-400 bg-amber-50 ring-1 ring-amber-300" : "border-slate-200")
+    }
+  >
     <div className="flex gap-3">
-      <img src={l.crop} alt={`病灶 L${l.idx}`} className="h-20 w-20 shrink-0 rounded object-cover" />
+      <img src={l.crop} alt={`病灶 L${l.idx + 1}`} className="h-20 w-20 shrink-0 rounded object-cover" />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="rounded bg-red-600 px-1.5 text-xs font-bold text-white">L{l.idx}</span>
+          <span className="rounded bg-red-600 px-1.5 text-xs font-bold text-white">L{l.idx + 1}</span>
           <span className="truncate font-medium text-slate-700">{l.label_zh}</span>
         </div>
-        <p className="mt-0.5 text-xs text-slate-400">obj={l.det_score.toFixed(2)}</p>
+        <p className="mt-0.5 text-xs text-slate-400">異常程度 {l.det_score.toFixed(2)}</p>
       </div>
     </div>
     <ul className="mt-2 space-y-1">

@@ -16,8 +16,8 @@ async def diagnose(
     mode: str = Form("grod_soft"),
     abstain_thresh: float | None = Form(None),
     display_thresh: float | None = Form(None),
-    top_k_cases: int = Form(20),
-    top_n_causes: int = Form(5),
+    top_k_cases: int = Form(3),
+    top_n_causes: int = Form(6),
     _token: str = Depends(require_api_key),
     settings: Settings = Depends(get_settings),
 ) -> Response:
@@ -46,3 +46,24 @@ async def diagnose(
         raise HTTPException(status_code=502, detail=f"inference service unreachable: {e}")
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type=resp.headers.get("content-type", "application/json"))
+
+
+@router.get("/diagnose/report.pdf")
+async def diagnose_report_pdf(
+    case_id: str,
+    _token: str = Depends(require_api_key),
+    settings: Settings = Depends(get_settings),
+) -> Response:
+    """Fetch a fixed-template PDF for an already-computed report by case_id.
+    The inference service renders it from its in-memory report cache — no
+    re-inference and no large JSON round-trip (avoids 413 on the upload hop)."""
+    url = settings.inference_url.rstrip("/") + "/report/pdf"
+    try:
+        async with httpx.AsyncClient(timeout=settings.inference_timeout_seconds) as client:
+            resp = await client.get(url, params={"case_id": case_id})
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"inference service unreachable: {e}")
+    return Response(content=resp.content, status_code=resp.status_code,
+                    media_type=resp.headers.get("content-type", "application/pdf"),
+                    headers={"Content-Disposition":
+                             resp.headers.get("content-disposition", "attachment; filename=report.pdf")})

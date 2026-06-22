@@ -12,8 +12,8 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
                       仍可顯式 --lesion_match hungarian 重現論文舊數字；ablation
                       證據見 ablations/lesion_match_ranking_equiv/metrics.json)
   Diversification:   threshold=0.95
-  CEAH:              softmax + multiplicative,  best_ceah.pt
-  Scoring:           cascade ≡ γ=0（fine stage 純 CEAH；γ-scan 上 sem/cluster R@10 最強點）
+  CEAM:              softmax + multiplicative,  best_ceah.pt
+  Scoring:           cascade ≡ γ=0（fine stage 純 CEAM；γ-scan 上 sem/cluster R@10 最強點）
   Cluster taxonomy:  cause_clusters_llm.json (466 LLM topics)
   Text:              medical（也支援 colloquial / none）
 
@@ -68,11 +68,11 @@ Python env: /home/lab603/anaconda3/envs/SDM/bin/python
   → Raw 在 retrieval 持平甚至略勝（R@10 +1.2 pp，MRR +0.002，cluster 完全等價）；
     確認 Phase 1 是 zero-shot vision-language retrieval 範式，不依賴 in-domain 微調。
 
-警告：把這個 raw case_db 拿去訓 CEAH 會 faithfulness 反轉（見 [C-ablation]）。
+警告：把這個 raw case_db 拿去訓 CEAM 會 faithfulness 反轉（見 [C-ablation]）。
 Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
 
 ================================================================================
-[B] CEAH γ-scan — fine-stage contribution-breakdown ablation（非 production；production = cascade γ=0，端到端數字見 [H]）
+[B] CEAM γ-scan — fine-stage contribution-breakdown ablation（非 production；production = cascade γ=0，端到端數字見 [H]）
 ================================================================================
 時間: ~50 秒（1573 valid queries）
 
@@ -83,7 +83,7 @@ Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
   --cluster_json diagnosis_model/cause_inference/outputs/cause_clusters_llm.json \
   --attribution_mode softmax --scoring_mode multiplicative \
   --gammas 0.0 0.5 0.75 1.0 \
-  --dump_gamma 0.0 \     # α dump 用 γ=0（production cascade 對應點，[D] gamma_tag 吃 g=0.00）；α 對 γ 不敏感（CEAH 自身輸出）
+  --dump_gamma 0.0 \     # α dump 用 γ=0（production cascade 對應點，[D] gamma_tag 吃 g=0.00）；α 對 γ 不敏感（CEAM 自身輸出）
   --top_k_cases 20 \
   --diversify_threshold 0.95 \
   --semantic_threshold 0.95 \
@@ -93,21 +93,21 @@ Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
 （γ-scan 需要單一 case_db 才能線性混合 phase1/ceah 分數），1573 valid，LLM 466 cluster：
 
   γ 掃描（sem_MRR / sem_R@10 / cl_MRR / cl_R@10）：
-    γ=0.00 (純 CEAH):      0.301 / 46.8% / 0.271 / 39.8%   ← production 對應點（cascade）
+    γ=0.00 (純 CEAM):      0.301 / 46.8% / 0.271 / 39.8%   ← production 對應點（cascade）
     γ=0.50:                0.303 / 45.9% / 0.254 / 37.6%
     γ=0.75:                0.302 / 45.3% / 0.245 / 37.0%
     γ=1.00 (純 Phase1):    0.298 / 44.4% / 0.235 / 35.8%   ← pure retrieval baseline
 
-  →  breakdown：純 CEAH（γ=0）vs 純檢索（γ=1）cl_R@10 +4pp、sem R@10 +2.4pp，量化 fine
+  →  breakdown：純 CEAM（γ=0）vs 純檢索（γ=1）cl_R@10 +4pp、sem R@10 +2.4pp，量化 fine
      stage 的增益；γ=0 同時是 sem 與 cluster R@10 最佳點 → cascade 取 γ=0、無 γ 旋鈕。
-  →  本表非 production headline：真正 production cascade（raw coarse pool → CEAH）端到端
+  →  本表非 production headline：真正 production cascade（raw coarse pool → CEAM）端到端
      數字見 [H] / eval_ceah_compressed.py dense row = sem R@10 47.6% / cl R@10 39.6%
      （此處 fine-tuned-pool γ=0 的 46.8%/39.8% 是 breakdown 用的 ablation 對照）。
 
 ================================================================================
 [C] Faithfulness 驗證（lesion masking 實驗，論文核心結果）
 ================================================================================
-驗證 CEAH 的 lesion attribution 真的影響預測（不是裝飾）。
+驗證 CEAM 的 lesion attribution 真的影響預測（不是裝飾）。
 時間: ~40 秒
 
 /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.faithfulness_eval \
@@ -129,10 +129,10 @@ Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
   → multi-lesion case 下，lesion 是 load-bearing 的解釋來源
 
 ================================================================================
-[C-ablation] Phase 2 VLM dependency（為什麼 CEAH 必須用 fine-tuned VLM-Lesion）
+[C-ablation] Phase 2 VLM dependency（為什麼 CEAM 必須用 fine-tuned VLM-Lesion）
 ================================================================================
-論文 ablation：把 raw SigLIP2 case_db（見 training.txt [0-raw]）拿去訓 CEAH，
-然後跑 faithfulness eval。驗證 CEAH 對 fusion-trained lesion encoder 的必要性。
+論文 ablation：把 raw SigLIP2 case_db（見 training.txt [0-raw]）拿去訓 CEAM，
+然後跑 faithfulness eval。驗證 CEAM 對 fusion-trained lesion encoder 的必要性。
 
 # 流程
 /home/lab603/anaconda3/envs/SDM/bin/python -m diagnosis_model.cause_inference.preprocessing.build_train_candidate_pool \
@@ -157,7 +157,7 @@ Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
   --attribution_mode softmax --scoring_mode multiplicative \
   --gamma 0.5 --max_queries -1
 
-論文報告數字（1573 valid，CEAH trained on raw case_db）：
+論文報告數字（1573 valid，CEAM trained on raw case_db）：
   Retrieval 持平：       γ=0.75 sem R@10 = 46.4% (raw) vs 45.3% (fine-tuned)
                        γ=0.75 sem MRR  = 0.306 (raw) vs 0.302 (fine-tuned)
 
@@ -166,7 +166,7 @@ Phase 2 仍須使用 fine-tuned VLM-Lesion fusion 建的 case_db。
     no_random drop:  +0.004
     no_global drop:  +0.05
 
-  → CEAH 把 attention 放在 lesion 上（lesion sum α 仍 0.23–0.42），但遮 lesion 後
+  → CEAM 把 attention 放在 lesion 上（lesion sum α 仍 0.23–0.42），但遮 lesion 後
     分數反而上升 — 即 lesion 內容不是有效訊號，違反 architecture-enforced
     lesion-grounded explainability 的設計目標。
   → 結論：retrieval 可以 zero-shot（Phase 1），但 attribution 必須有 lesion-
@@ -270,7 +270,7 @@ LLM cluster 是論文預設；HDBSCAN coarse 當對照。
 ================================================================================
 最終選擇：DeepSets encoder + dual-target distillation（見 training.txt [5b]）。
 把 Phase 1 的 multi-vector hungarian 比對壓成單一 cosine，加速 14×、品質
-微幅超越老師。CEAH 下游接得起來，不需要任何改動。
+微幅超越老師。CEAM 下游接得起來，不需要任何改動。
 
 ENV：SDM（DeepSets / mean 都是純 PyTorch；mamba 變體已搬到
 diagnosis_model/cause_inference/mamba_ablation/，要訓那條才需要 mamba3 env +
@@ -280,7 +280,7 @@ CC=/usr/bin/gcc-12）。
 [I-1] 標準 Phase-1-aligned 評估（最常用）
 --------------------------------------------------------------------------------
 比較任何 encoder vs Phase 1 hungarian，沿用同一條 candidate-pool aggregation
-+ semantic-rank metric（純檢索評估，無 CEAH）。
++ semantic-rank metric（純檢索評估，無 CEAM）。
 
 /home/lab603/anaconda3/envs/SDM/bin/python \
   -m diagnosis_model.cause_inference.eval_phase1_aligned \
@@ -298,9 +298,9 @@ CC=/usr/bin/gcc-12）。
 可選：--min_query_lesions N 評估 lesion-rich subset（N=2/3/4）。
 
 --------------------------------------------------------------------------------
-[I-2] 端到端 hybrid（case encoder + CEAH）
+[I-2] 端到端 hybrid（case encoder + CEAM）
 --------------------------------------------------------------------------------
-把 case encoder 嵌進完整 hybrid pipeline，驗證跟 CEAH 串接無痛。
+把 case encoder 嵌進完整 hybrid pipeline，驗證跟 CEAM 串接無痛。
 
 /home/lab603/anaconda3/envs/SDM/bin/python \
   -m diagnosis_model.cause_inference.eval_hybrid_aligned \
@@ -339,7 +339,7 @@ CC=/usr/bin/gcc-12）。
     distillation 不依賴 in-domain VLM finetune，再次支持 Phase 1 retrieval 屬於
     zero-shot vision-language 範式的論點。
   → 跟 [C-ablation] 對照：retrieval-side（Phase 1 + Phase 3）對 VLM training 不敏感；
-    attribution-side（Phase 2 CEAH）必須 fine-tuned VLM-Lesion fusion。
+    attribution-side（Phase 2 CEAM）必須 fine-tuned VLM-Lesion fusion。
 
 ================================================================================
 [J] ABQ (Aggregation-Buffered Quantization) — case-bank codebook 壓縮（RVQ）+ 選配殘差 reranker（buffer-free 對照）
@@ -538,8 +538,8 @@ Step 5  [Build candidate cause pool]
 
 Step 6  [Stage 2 — fine rerank]
         對每個 candidate_cause c, 從 case_db 拿出 query 的 fine-tuned features
-        (fused_global, fused_lesions) 跑 CEAH:
-          score_c, alpha_c = CEAH(fused_global, text_emb_or_None,
+        (fused_global, fused_lesions) 跑 CEAM:
+          score_c, alpha_c = CEAM(fused_global, text_emb_or_None,
                                   fused_lesions, cause_text_emb=c)
         其中 alpha_c ∈ R^(2+N) 是 softmax over (global, text, lesion_1..N).
 
@@ -557,19 +557,19 @@ Step 8  [Output]
   demo/app_gradio.py
     — 完整 cascade 的可執行 reference：Stage 1 走 raw SigLIP2 → Phase 3
       encoder_raw → Phase 4 RVQ (M=4 K=256) + Light reranker on case_db_raw，
-      Stage 2 走 VLM-Lesion + CEAH on case_db，γ-free（cascade ≡ γ=0）。
-      UI 另顯示各階段（detection / 編碼 / Stage1 / Stage2 CEAH）的 CUDA-synced 耗時。
+      Stage 2 走 VLM-Lesion + CEAM on case_db，γ-free（cascade ≡ γ=0）。
+      UI 另顯示各階段（detection / 編碼 / Stage1 / Stage2 CEAM）的 CUDA-synced 耗時。
 
 注意：
-  - **γ hybrid 在 cascade 下不再使用**。Cascade ≡ γ=0（純 CEAH for fine stage），
+  - **γ hybrid 在 cascade 下不再使用**。Cascade ≡ γ=0（純 CEAM for fine stage），
     這也是 γ-scan 中 sem R@10 + cluster R@10 最強的點（46.8% / 39.8% vs γ=0.75
     的 45.3% / 37.0%）。如果要對照 hybrid γ scan 看 contribution breakdown，
-    用 [B] CEAH eval 的 --gammas 0.0 0.5 0.75 1.0 sweep.
+    用 [B] CEAM eval 的 --gammas 0.0 0.5 0.75 1.0 sweep.
   - Coarse stage 對 fine-tuned 跟 raw case_db 都 work（ablation 在 [A-ablation]
     / [I-ablation] 已驗證）；production 選 raw 是因為它 +1.2 pp R@10 且支持
     paper 的 zero-shot vision-language retrieval claim.
   - Fine stage 對 VLM-Lesion 是 architecturally required：raw case_db 上重訓
-    CEAH 會 faithfulness 反轉（[C-ablation]）.
+    CEAM 會 faithfulness 反轉（[C-ablation]）.
 
 ================================================================================
 [K] Phase 4 method extensions: aggregation absorption surface + importance-RVQ

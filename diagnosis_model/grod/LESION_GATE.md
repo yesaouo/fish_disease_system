@@ -101,7 +101,7 @@ recall 0.994 vs 0.983, AUROC 0.994 vs 0.986** (this is the feature-choice ablati
 both numbers are train-set-optimistic). Current ckpt:
 `models/disease_head/neck_disease_head.pt` (dim 1536, val AUROC 0.994, τ*≈0.277).
 Putting the bit on `g` directly (a "768+1" augmented dim) is the worst option — weakest
-substrate **and** it risks CEAH faithfulness; the neck head touches neither.
+substrate **and** it risks CEAM faithfulness; the neck head touches neither.
 
 **Not wired anywhere (2026-06-12).** Both `gpu_infer*.py` and `demo/app_gradio.py`
 abstain on the constant objectness `abstain_thresh`. A held-out test-split A/B

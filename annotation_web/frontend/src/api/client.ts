@@ -217,12 +217,28 @@ export const diagnose = async (
   form.append("image", image);
   form.append("text", params.text ?? "");
   form.append("mode", params.mode ?? "grod_soft");
-  form.append("top_k_cases", String(params.topKCases ?? 20));
-  form.append("top_n_causes", String(params.topNCauses ?? 5));
+  form.append("top_k_cases", String(params.topKCases ?? 3));
+  form.append("top_n_causes", String(params.topNCauses ?? 6));
   const { data } = await http.post<DiagnoseResponse>("/diagnose", form, {
     headers: { "Content-Type": "multipart/form-data" }
   });
   return data;
+};
+
+// 以 case_id 向後端要固定模板 PDF（serve 端由快取的報告渲染，不重跑推論、不回傳大 JSON）。
+export const downloadReportPdf = async (report: DiagnoseResponse): Promise<void> => {
+  const { data } = await http.get("/diagnose/report.pdf", {
+    params: { case_id: report.meta.case_id },
+    responseType: "blob"
+  });
+  const url = URL.createObjectURL(data as Blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${report.meta.case_id || "report"}.pdf`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 };
 
 export const fetchHealthyTaskByIndex = async (

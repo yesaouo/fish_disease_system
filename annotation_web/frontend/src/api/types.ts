@@ -175,8 +175,8 @@ export type DiagnoseCause = {
   score: number;
   support: number | null;
   members: string[];
+  support_cases: number[];
   alpha: number[];
-  attribution: string;
   breakdown: string;
 };
 

@@ -113,15 +113,15 @@ def _detector_params(net) -> Dict[str, int]:
     def g(name):
         return _nparams(getattr(net, name)) if hasattr(net, name) else 0
     d = {
-        "backbone (DINOv2)": g("backbone"),
-        "DETR encoder/decoder": g("transformer") + g("query_feat") + g("refpoint_embed"),
-        "box head": g("bbox_embed"),
-        "objectness head": g("class_embed"),
+        "Image Feature Encoder": g("backbone"),
+        "Object Feature Decoder": g("transformer") + g("query_feat") + g("refpoint_embed"),
+        "Box Detection Head": g("bbox_embed"),
+        "Object Score Head": g("class_embed"),
     }
     if hasattr(net, "semantic_embed"):
-        d["semantic head"] = g("semantic_embed")
+        d["Image-Text Alignment Head"] = g("semantic_embed")
     if hasattr(net, "global_embed"):
-        d["global head"] = g("global_embed")
+        d["Global Image-Text Alignment Head"] = g("global_embed")
     return d
 
 
@@ -239,9 +239,9 @@ def _candidate_pool(zq, bank_z, memb, mlen, top_k_cases, device):
     return cand, topi, topw
 
 
-def _retrieved_cards(topi, topw, file_names, n=5):
+def _retrieved_cards(topi, topw, file_names):
     out = []
-    for k in range(min(topi.numel(), n)):
+    for k in range(topi.numel()):
         ci = int(topi[k].item()); fn = file_names[ci]
         p = DET_TRAIN / fn
         out.append({"file_name": fn, "similarity": float(topw[k].item()),
@@ -258,6 +258,18 @@ def _load_fold_thresh():
 
 
 FOLD_THRESH = _load_fold_thresh()   # agglomerative cut (pool-centered cosine distance)
+
+
+def _load_cause_thresh():
+    """病因顯示門檻：min-max CEAM score ≥ τ、上限 cause_max_n（grod/calibrate_cause_threshold.py）。"""
+    try:
+        d = json.load(open(THRESHOLDS_JSON))
+        return float(d.get("cause_score_thresh", 0.6)), int(d.get("cause_max_n", 6))
+    except Exception:
+        return 0.6, 6
+
+
+CAUSE_SCORE_THRESH, CAUSE_MAX_N = _load_cause_thresh()
 
 
 def _fold_causes(cand_embs, scores_np, top_n, fold_thresh=FOLD_THRESH):
@@ -318,23 +330,32 @@ def _ceah_score(ceah, g, z_lesions, cand, cause_embs, text_emb, device,
             "sc": _minmax(s_ceah), "alphas": alphas, "P": P}
 
 
-def _fold_topn(scored, cause_texts, top_n, topi=None, memb=None, mlen=None):
+def _fold_topn(scored, cause_texts, top_n, topi=None, memb=None, mlen=None,
+               score_thresh=CAUSE_SCORE_THRESH):
     """Non-model stage (CPU): fold near-duplicate causes (agglomerative) + case-level
-    support, build top_n output. No CEAH forward here. Timed as ⑥."""
+    support. 顯示折疊後 min-max score ≥ score_thresh 之病因，上限 top_n、至少 1
+    （自適應數量，取代固定 top-n）。No CEAH forward here. Timed as ⑥."""
     cand_embs = scored["cand_embs"]; sc = scored["sc"]; alphas = scored["alphas"]
     s_np = scored["s_ceah"].detach().cpu().numpy()
     cand_np = scored["cand"].cpu().numpy()
-    groups = _fold_causes(cand_embs, s_np, top_n)
+    sc_np = sc.detach().cpu().numpy()
+    groups = _fold_causes(cand_embs, s_np, len(cand_np))          # 全部折疊群，依分數排序
+    kept = [(rep, mem) for (rep, mem) in groups if sc_np[rep] >= score_thresh][:top_n]
+    if not kept:
+        kept = groups[:1]                                        # 至少顯示 top-1
     case_sets = _case_cause_sets(topi, memb, mlen)
     out = []
-    for rank, (rep_li, member_lis) in enumerate(groups, 1):
+    for rank, (rep_li, member_lis) in enumerate(kept, 1):
         gi = int(cand_np[rep_li])
         gids = {int(cand_np[li]) for li in member_lis}
-        support = sum(1 for cs in case_sets if cs & gids) if case_sets is not None else None
+        # 哪幾個相似案例（rank，對齊 retrieved 順序）含此病因 → 供前端就地顯示來源案例
+        support_cases = ([j + 1 for j, cs in enumerate(case_sets) if cs & gids]
+                         if case_sets is not None else [])
         out.append({"rank": rank, "cause_idx": gi, "text": cause_texts[gi],
                     "score": float(sc[rep_li].item()),
                     "alpha": [float(a) for a in alphas[rep_li].cpu().tolist()],
-                    "support": support,
+                    "support": len(support_cases) if case_sets is not None else None,
+                    "support_cases": support_cases,
                     "members": [cause_texts[int(cand_np[li])] for li in member_lis]})
     return out, scored["P"]
 
@@ -361,10 +382,9 @@ class GrodSoftPipeline:
                                  str(SOFT_BANK), device=DEVICE)
         cases = torch.load(Path(SOFT_CASE_DB) / "train_cases.pt", weights_only=False)
         self.file_names = [c["file_name"] for c in cases]
-        sfx = "hard gate" if self.hard_gate else "soft"
         self.params = {**_detector_params(self.p.net),
-                       f"Aggregator (DeepSets, {sfx})": _nparams(self.p.enc),
-                       f"CEAH ({sfx})": _nparams(self.p.ceah)}
+                       "Weighted DeepSets Aggregator": _nparams(self.p.enc),
+                       "Cause-Evidence Attribution Module": _nparams(self.p.ceah)}
 
     @torch.no_grad()
     def infer_rich(self, image, text_emb, top_k_cases, top_n,
@@ -379,7 +399,7 @@ class GrodSoftPipeline:
         g = out["pred_global"][0]; boxes = out["pred_boxes"][0]
         w = logits.sigmoid()
         scores, lidx = w.topk(min(K, w.numel()))
-        T.append(("① backbone+DETR forward (4 head)", (_sync_now() - t) * 1000))
+        T.append(("① 影像分析與病灶偵測", (_sync_now() - t) * 1000))
 
         # Two thresholds: abstain (健/病) + display (顯示選框). Aggregation always uses
         # all-Q (soft contract); CEAH always uses top-K; the thresholds only govern the
@@ -387,7 +407,7 @@ class GrodSoftPipeline:
         t = _sync_now()
         abstain = float(w.amax()) < abstain_thresh
         keep_mask = scores > display_thresh
-        T.append(("② 健/病 + 病灶門檻 (abstain/display)", (_sync_now() - t) * 1000))
+        T.append(("② 健康／異常判定", (_sync_now() - t) * 1000))
         if abstain or int(keep_mask.sum().item()) == 0:
             r = _empty_result(image, T); r["abstain"] = True
             r["obj_all"] = w; r["boxes_all"] = boxes; return r
@@ -402,7 +422,7 @@ class GrodSoftPipeline:
 
         t = _sync_now()
         cls = classify_against_anchors(zk[:M].float())
-        T.append(("③ 病灶分類 (z·anchor)", (_sync_now() - t) * 1000))
+        T.append(("③ 病灶症狀分類", (_sync_now() - t) * 1000))
 
         t = _sync_now()
         # hard_gate (grod mode): binarize objectness at display_thresh → {0,1}, the
@@ -411,19 +431,19 @@ class GrodSoftPipeline:
         zq = p.enc(g.float().unsqueeze(0), z_all.float().unsqueeze(0),
                    torch.tensor([w.numel()], device=dev), lesion_weights=w_model.unsqueeze(0))
         cand, topi, topw = _candidate_pool(zq, p.bank_z, p.memb, p.mlen, top_k_cases, dev)
-        T.append(("④ 聚合 + dense 檢索", (_sync_now() - t) * 1000))
+        T.append(("④ 相似案例檢索", (_sync_now() - t) * 1000))
 
         t = _sync_now()
         lw = ((scores > display_thresh).float() if self.hard_gate else scores.float()).unsqueeze(0)
         scored = _ceah_score(p.ceah, g.float(), zk.float(), cand, p.cause_embs,
                              text_emb, dev,
                              lesion_weights=lw.expand(int(cand.numel()), -1).contiguous())
-        T.append(("⑤ CEAH 評分 + α", (_sync_now() - t) * 1000))
+        T.append(("⑤ 病因評分與證據分析", (_sync_now() - t) * 1000))
 
         t = _sync_now()
         top_n_out, P = _fold_topn(scored, p.cause_texts, top_n,
                                   topi=topi, memb=p.memb, mlen=p.mlen)
-        T.append(("⑥ 病因聚合 (CPU)", (_sync_now() - t) * 1000))
+        T.append(("⑥ 病因彙整", (_sync_now() - t) * 1000))
 
         lesions = [{"idx": i, "bbox_xywh": bxywh[i], "det_score": float(scores[i]),
                     "crop": crops[i], "cls": cls[i]} for i in range(M)]
@@ -541,16 +561,16 @@ class BasePipeline:
         lp = torch.zeros(1, max(N, 1), self.in_dim, device=dev); lp[0, :N] = Ls
         zq = self.enc(g.unsqueeze(0), lp, torch.tensor([N], device=dev)).float()
         cand, topi, topw = _candidate_pool(zq, self.bank_z, self.memb, self.mlen, top_k_cases, dev)
-        T.append(("④ 聚合 + dense 檢索", (_sync_now() - t) * 1000))
+        T.append(("④ 相似案例檢索", (_sync_now() - t) * 1000))
 
         t = _sync_now()
         scored = _ceah_score(self.ceah, g, L, cand, self.cause_embs, text_emb, dev)
-        T.append(("⑤ CEAH 評分 + α", (_sync_now() - t) * 1000))
+        T.append(("⑤ 病因評分與證據分析", (_sync_now() - t) * 1000))
 
         t = _sync_now()
         top_n_out, P = _fold_topn(scored, self.cause_texts, top_n,
                                   topi=topi, memb=self.memb, mlen=self.mlen)
-        T.append(("⑥ 病因聚合 (CPU)", (_sync_now() - t) * 1000))
+        T.append(("⑥ 病因彙整", (_sync_now() - t) * 1000))
 
         lesions = [{"idx": i, "bbox_xywh": bxywh[i], "det_score": scores[i],
                     "crop": crops[i], "cls": cls[i]} for i in range(N)]
@@ -607,13 +627,13 @@ def render_heatmap_image(image, obj_all, boxes_all):
 
 
 def render_detection_image(image, lesions):
+    """原圖＋紅框＋編號（1-based）。僅標號避免標籤過長。"""
     img = image.copy().convert("RGB"); draw = ImageDraw.Draw(img)
     for li, les in enumerate(lesions):
         x, y, w, h = [int(v) for v in les["bbox_xywh"]]
         for off in range(3):
             draw.rectangle((x - off, y - off, x + w + off, y + h + off), outline=(220, 50, 50))
-        _put_label(draw, x + 2, max(2, y - 22),
-                   f"L{li}: {les['cls']['label_zh']} ({les['det_score']:.2f})", bg=(180, 30, 30))
+        _put_label(draw, x + 2, y + 2, f"L{li + 1}", bg=(220, 50, 50))
     return img
 
 
@@ -686,22 +706,62 @@ def make_alpha_attribution_image(image, lesion_boxes, alpha, n_lesions, cause_te
 
 
 def make_alpha_breakdown_chart(alpha, n_lesions, show_text):
+    # 只呈現可見證據（整體外觀／文字／各病灶），正規化為相對貢獻（合計＝1）；
+    # 未顯示之低信心區域不另列（避免報告出現難解的殘差項）。
     les_vals = [float(a) for a in alpha[2: 2 + n_lesions]]
     if show_text:
-        labels = ["global", "text"] + [f"L{i}" for i in range(n_lesions)]
+        labels = ["整體外觀", "文字描述"] + [f"病灶{i + 1}" for i in range(n_lesions)]
         vals = [float(alpha[0]), float(alpha[1])] + les_vals
         colors = ["#2660ff", "#ff8c00"] + ["#dc1e1e"] * n_lesions
     else:
-        labels = ["global"] + [f"L{i}" for i in range(n_lesions)]
+        labels = ["整體外觀"] + [f"病灶{i + 1}" for i in range(n_lesions)]
         vals = [float(alpha[0])] + les_vals
         colors = ["#2660ff"] + ["#dc1e1e"] * n_lesions
-    fig, ax = plt.subplots(figsize=(7.5, 3.3)); bars = ax.bar(labels, vals, color=colors)
-    ax.set_ylim(0, max(0.6, max(vals) * 1.2)); ax.set_ylabel("α", fontproperties=_font(11))
-    ax.set_title("Per-evidence α (softmax, sums to 1)", fontproperties=_font(11))
+    tot = sum(vals) or 1.0
+    vals = [v / tot for v in vals]
+    fig, ax = plt.subplots(figsize=(7.5, 3.3))
+    x = list(range(len(labels)))
+    bars = ax.bar(x, vals, color=colors)
+    ax.set_xticks(x); ax.set_xticklabels(labels, fontproperties=_font(10))
+    ax.set_ylim(0, max(0.6, max(vals) * 1.2)); ax.set_ylabel("貢獻比例", fontproperties=_font(11))
+    ax.set_title("各證據對此病因的相對貢獻", fontproperties=_font(11))
     for b, v in zip(bars, vals):
         ax.text(b.get_x() + b.get_width() / 2, v + 0.01, f"{v:.2f}", ha="center",
                 va="bottom", fontproperties=_font(10))
     ax.grid(axis="y", linestyle="--", alpha=0.3); fig.tight_layout(); fig.canvas.draw()
+    out = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy(); plt.close(fig)
+    return Image.fromarray(out)
+
+
+def make_combined_alpha_chart(causes, n_lesions, show_text):
+    """所有病因合成一張垂直堆疊圖：X 軸＝各病因，每根長條由 整體外觀/文字/各病灶 之
+    可見證據相對貢獻堆疊(顏色＝證據來源，每病因合計＝1)，圖例＝證據來源。"""
+    base_labels = ["整體外觀"] + (["文字描述"] if show_text else []) + [f"病灶{i + 1}" for i in range(n_lesions)]
+    base_idx = [0] + ([1] if show_text else []) + [2 + i for i in range(n_lesions)]
+    n_src = len(base_labels); n_c = len(causes)
+    cmap = plt.get_cmap("tab10" if n_src <= 10 else "tab20")
+    colors = [cmap(i % cmap.N) for i in range(n_src)]
+
+    def _vals(alpha):
+        v = [float(alpha[i]) for i in base_idx]; tot = sum(v) or 1.0
+        return [x / tot for x in v]
+    mat = [_vals(causes[ci]["alpha"]) for ci in range(n_c)]
+    x = list(range(n_c))
+    fig, ax = plt.subplots(figsize=(max(5.0, 1.1 * n_c + 2.5), 4.0))
+    bottom = [0.0] * n_c
+    for si in range(n_src):
+        vals = [mat[ci][si] for ci in range(n_c)]
+        ax.bar(x, vals, bottom=bottom, color=colors[si], edgecolor="white",
+               linewidth=0.4, label=base_labels[si])
+        bottom = [b + v for b, v in zip(bottom, vals)]
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"#{causes[ci]['rank']}" for ci in range(n_c)], fontproperties=_font(10))
+    ax.set_ylabel("貢獻比例", fontproperties=_font(10))
+    ax.set_ylim(0, 1.0)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.legend(prop=_font(9), loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False)
+    fig.subplots_adjust(left=0.1, right=0.7, top=0.92, bottom=0.12)
+    fig.canvas.draw()
     out = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy(); plt.close(fig)
     return Image.fromarray(out)
 
