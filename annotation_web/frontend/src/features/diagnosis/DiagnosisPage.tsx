@@ -233,11 +233,20 @@ const Report: React.FC<{
       {/* 基本資料 */}
       <Card title="基本資料">
         <dl className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-2 md:grid-cols-4">
-          <Field k="影像編號" v={m.case_id} />
-          <Field k="上傳時間" v={m.timestamp.replace("T", " ")} />
-          <Field k="模式" v={MODE_LABELS[m.mode] ?? m.mode} />
+          <Field k="病例編號" v={m.case_id} />
+          <Field k="報告時間" v={m.timestamp.replace("T", " ")} />
+          <Field k="分析模式" v={MODE_LABELS[m.mode] ?? m.mode} />
+          <Field k="病灶數量" v={String(report.n_lesions)} />
+
           <div className="sm:col-span-2 md:col-span-4">
-            <Field k="送檢描述" v={m.text || "（未填，僅影像）"} />
+            <Field k="補充描述" v={m.text || "未提供"} />
+          </div>
+
+          <div className="sm:col-span-2 md:col-span-4">
+            <Field
+              k="判定結果"
+              v={report.abstain ? "健康（未偵測到明顯異常）" : "疑似異常，進行病因分析"}
+            />
           </div>
         </dl>
       </Card>

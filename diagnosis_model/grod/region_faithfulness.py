@@ -102,11 +102,8 @@ class GRODRouting:
     def __init__(self, joint_ckpt, anchors_path, device):
         os.environ["RFDETR_SEMANTIC_DIM"] = "768"
         os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(anchors_path)
-        from rfdetr import RFDETRMedium
-        self.rf = RFDETRMedium(pretrain_weights=joint_ckpt, num_classes=1)
-        self.net = self.rf.model.model.to(device).eval()
-        self.means, self.stds = list(self.rf.means), list(self.rf.stds)
-        self.res = int(self.rf.model.resolution)
+        from diagnosis_model.grod.build import load_oavle
+        self.net, self.res, self.means, self.stds = load_oavle(joint_ckpt, device=device)
         self.device = device
         self.anchors = torch.load(anchors_path, map_location=device,
                                   weights_only=False)["anchor_embs"].to(device)

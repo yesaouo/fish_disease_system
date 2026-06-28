@@ -36,12 +36,10 @@ from PIL import Image
 
 
 def load_detector(det_ckpt: str, device: str):
-    from rfdetr import RFDETRMedium
+    from diagnosis_model.grod.build import load_oavle
 
-    rf = RFDETRMedium(pretrain_weights=det_ckpt)
-    net = rf.model.model.to(device).eval()
-    resolution = int(rf.model.resolution)
-    return net, list(rf.means), list(rf.stds), resolution
+    net, resolution, means, stds = load_oavle(det_ckpt, device=device, num_classes=None)
+    return net, means, stds, resolution
 
 
 @torch.no_grad()
@@ -57,7 +55,13 @@ def pool_backbone_global(net, batch_t: torch.Tensor) -> torch.Tensor:
         net(batch_t)
     finally:
         h.remove()
-    scales = cap["enc"]                          # list of [B,384,H,W]
+    scales = cap["enc"]                          # list of [B,C,H,W]
+    # Prefer the encoder's own pooling (external backbones share one definition
+    # with inference, e.g. DinoV3Backbone.pool_global); fall back to inline
+    # spatial-mean for the built-in DinoV2 encoder.
+    enc = net.backbone[0].encoder
+    if hasattr(enc, "pool_global"):
+        return enc.pool_global(scales)           # [B, sum_C]
     per = [F.normalize(s.mean(dim=(2, 3)), dim=-1) for s in scales]
     return torch.cat(per, dim=-1)                # [B, 4*384]
 

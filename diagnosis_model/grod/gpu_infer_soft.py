@@ -50,15 +50,17 @@ class GpuPipelineSoft:
 
         # --- GROD joint detector: decoder region heads (box/obj/semantic z)
         #     + backbone-tapped global branch (both enabled via env) ---
+        #     Built from the vendored decoder (diagnosis_model/grod/detector), so
+        #     inference no longer imports the rfdetr package. The env switches are
+        #     still read (by the GROD heads factory) to enable the heads.
         os.environ["RFDETR_SEMANTIC_DIM"] = "768"
         os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(anchors)
         os.environ["RFDETR_GLOBAL_DIM"] = "768"
-        from rfdetr import RFDETRMedium
-        rf = RFDETRMedium(pretrain_weights=joint_ckpt, num_classes=1)
-        self.net = rf.model.model.to(device).eval()
-        self.net.global_embed.load_state_dict(torch.load(global_sd, map_location=device))
-        self.res = int(rf.model.resolution)
-        self.means, self.stds = list(rf.means), list(rf.stds)
+        from diagnosis_model.grod.build import OAVLE
+        self.net = OAVLE.from_vendored(joint_ckpt, device=device)
+        self.net.core.global_embed.load_state_dict(torch.load(global_sd, map_location=device))
+        self.res = int(self.net.resolution)
+        self.means, self.stds = list(self.net.means), list(self.net.stds)
 
         # --- Aggregator (DeepSets) — native soft pooling via lesion_weights ---
         from diagnosis_model.cause_inference.models.case_encoder import (
@@ -68,6 +70,17 @@ class GpuPipelineSoft:
         cfg_dict = pkg["encoder_config"]; cfg_dict["dtype"] = torch.bfloat16
         self.enc = build_encoder(EncoderConfig(**cfg_dict)).to(device).eval()
         self.enc.load_state_dict(pkg["encoder_state"])
+
+        # --- Region Gate: objectness logits -> aggregation/attribution weights.
+        #     The trained ∅-sink softmax gate rides in the encoder ckpt (gate_state).
+        #     Decoupled from lesion selection / abstain (those stay on raw objectness).
+        #     Absent (legacy sigmoid ckpt) -> self.gate=None, falls back to sigmoid(obj).
+        self.gate = None
+        if "gate_state" in pkg:
+            from diagnosis_model.grod.region_gate import RegionGate
+            self.gate = RegionGate(init_temp=pkg.get("gate_init_temp", 0.3)).to(device).eval()
+            self.gate.load_state_dict(pkg["gate_state"])
+            print(f"[gate] RegionGate τ={self.gate.temp.item():.4f} ∅={self.gate.sink.item():+.4f}")
 
         # --- CEAH — soft alpha gate via lesion_weights ---
         from diagnosis_model.cause_inference.models.ceah import CEAH
@@ -102,16 +115,19 @@ class GpuPipelineSoft:
         out = self.net(px)
         logits = out["pred_logits"][0][:, 0]                     # [Q] ABNORMAL logit (cat 0 -> col 0)
         z_all, g = out["pred_semantic"][0], out["pred_global"][0]  # [Q,768],[768]
-        w = logits.sigmoid()                                     # [Q] soft evidence, all Q kept
+        obj = logits.sigmoid()                                   # [Q] absolute objectness: selection / abstain
+        # Region Gate weights drive aggregation + attribution; decoupled from
+        # objectness (which drives selection/abstain). Legacy fallback = sigmoid.
+        w = self.gate(logits.unsqueeze(0))[0] if self.gate is not None else obj
 
-        # one topk serves both: scores[0]=max_w (abstain) and (scores, lidx)=top-K (CEAH)
-        scores, lidx = w.topk(self.top_k_lesions)                                 # descending; scores[0]=max_w
+        # select top-K by objectness (softmax preserves rank, so == by gate weight)
+        sel, lidx = obj.topk(self.top_k_lesions)                 # descending; sel[0]=max objectness
 
-        # abstain: healthy iff no query clears the fixed threshold
-        if scores[0].item() < det_thresh:
+        # abstain: healthy iff no query clears the fixed objectness threshold
+        if sel[0].item() < det_thresh:
             return []
 
-        # aggregate ALL Q soft-weighted queries -> query case vector (matches bank_z_soft)
+        # aggregate ALL Q gate-weighted queries -> query case vector (matches bank_z_soft)
         zq = self.enc(g.float().unsqueeze(0), z_all.float().unsqueeze(0),
                       torch.tensor([w.numel()], device=self.dev),
                       lesion_weights=w.float().unsqueeze(0))      # [1,768]
@@ -126,11 +142,11 @@ class GpuPipelineSoft:
         P = cand.numel()
         cand_embs = self.cause_embs[cand]                        # [P,768]
 
-        # soft CEAH over candidates: top-K lesions (by w), scores as the soft alpha gate
+        # soft CEAH over candidates: top-K lesions (by objectness), gate weights as the soft alpha gate
         z_k = z_all[lidx]                                        # [K,768]
         g_e = g.float().unsqueeze(0).expand(P, -1)
         l_e = z_k.float().unsqueeze(0).expand(P, -1, -1).contiguous()
-        l_w = scores.float().unsqueeze(0).expand(P, -1).contiguous()
+        l_w = w[lidx].float().unsqueeze(0).expand(P, -1).contiguous()
         l_m = torch.ones(P, self.top_k_lesions, dtype=torch.bool, device=self.dev)
         t_e = torch.zeros(P, 768, device=self.dev)
         t_p = torch.zeros(P, dtype=torch.bool, device=self.dev)
@@ -143,7 +159,7 @@ class GpuPipelineSoft:
                             ("ceah_score", s_ceah), ("rank_order", order)]:
                 assert t.is_cuda, f"{name} left CUDA!"
             print(f"[verify] Q={z_all.size(0)} topK_les={self.top_k_lesions} P_candidates={P} "
-                  f"max_w={scores[0].item():.3f} — all on CUDA ✓")
+                  f"max_obj={sel[0].item():.3f} — all on CUDA ✓")
 
         ids = cand[order].cpu().tolist()
         sc = s_ceah[order].cpu().tolist()

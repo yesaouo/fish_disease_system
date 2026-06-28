@@ -44,15 +44,18 @@ def load_split(dino_dir: Path, target_db: Path, split: str):
     return x, F.normalize(y, dim=-1), fns
 
 
-from rfdetr.models.math import MLP as _RFMLP  # exact arch of the folded global_embed
+from diagnosis_model.grod.detector.models.math import MLP as _RFMLP  # exact arch of the folded global_embed (vendored)
 
 
 class MLP(nn.Module):
     """Wraps the fork's MLP (Linear/ReLU FFN) + L2-norm, so the trained
     state_dict loads 1:1 into LWDETR.global_embed (path P, no fork retrain).
-    Default hidden=256 = RFDETRMedium d_model."""
+    Single Linear (num_layers=1): the pooled-DINO -> SigLIP2-global map is
+    near-linear, so 1 layer distills it best (valid_cos 0.945 vs 0.917 for the
+    old 3L/256-bottleneck) and is seed-deterministic. Must match region_heads.py's
+    global_embed build (num_layers=1). d_hidden unused at num_layers=1."""
 
-    def __init__(self, d_in=1536, d_hidden=256, d_out=768, num_layers=3):
+    def __init__(self, d_in=1536, d_hidden=768, d_out=768, num_layers=1):
         super().__init__()
         self.net = _RFMLP(d_in, d_hidden, d_out, num_layers)
 

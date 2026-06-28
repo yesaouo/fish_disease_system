@@ -165,16 +165,13 @@ def main():
 
     os.environ["RFDETR_SEMANTIC_DIM"] = "768"
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(args.anchors)
-    from rfdetr import RFDETRMedium
+    from diagnosis_model.grod.build import load_oavle
     from rfdetr.models.ops.modules import MSDeformAttn
     from diagnosis_model.grod.extract_hs import (
         iou_matrix, greedy_match, cxcywh_norm_to_xyxy_abs, xywh_to_xyxy,
     )
 
-    rf = RFDETRMedium(pretrain_weights=args.joint_ckpt, num_classes=1)
-    net = rf.model.model.to(args.device).eval()
-    means, stds = list(rf.means), list(rf.stds)
-    resolution = int(rf.model.resolution)
+    net, resolution, means, stds = load_oavle(args.joint_ckpt, device=args.device)
     text_anchors = torch.load(args.anchors, map_location=args.device,
                               weights_only=False)["anchor_embs"].to(args.device)
 

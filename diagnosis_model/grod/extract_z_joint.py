@@ -74,14 +74,10 @@ def main():
     os.environ["RFDETR_SEMANTIC_LAYERS"] = str(args.semantic_layers)
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(args.anchors)
 
-    from rfdetr import RFDETRMedium
+    from diagnosis_model.grod.build import load_oavle
 
-    rf = RFDETRMedium(pretrain_weights=args.joint_ckpt, num_classes=1)
-    net = rf.model.model
-    net = net.to(args.device).eval()
+    net, resolution, means, stds = load_oavle(args.joint_ckpt, device=args.device)
     device = next(net.parameters()).device
-    means, stds = list(rf.means), list(rf.stds)
-    resolution = int(rf.model.resolution)
     assert hasattr(net, "semantic_embed"), "joint ckpt did not load a semantic head"
     print(f"[joint] device={device} resolution={resolution} "
           f"semantic_dim={net.semantic_embed.out_features}")

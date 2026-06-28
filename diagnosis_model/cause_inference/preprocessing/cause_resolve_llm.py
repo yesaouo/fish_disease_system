@@ -160,18 +160,18 @@ def load_texts_embeddings(case_db: str, max_items: int) -> Tuple[List[str], torc
     return texts, embeddings
 
 
-def _fingerprint(texts: Sequence[str], judge_sig: str) -> str:
-    """Cache fingerprint over inputs AND the judge configuration.
+def _fingerprint(judge_sig: str) -> str:
+    """Cache fingerprint over the judge configuration ONLY.
 
-    Including the judge backend + system prompt (or the cosine threshold) means a
-    prompt edit auto-invalidates stale verdicts instead of silently reusing them.
+    Verdicts are content-addressed by the actual cause-string pair (see
+    ``JudgeCache``), so they survive any change to the cause set / order and the
+    fingerprint no longer needs to cover ``texts`` -- that is what lets a rebuilt
+    case_db reuse prior judgments and only judge genuinely new pairs. The
+    fingerprint still guards the judge backend + system prompt (or the cosine
+    threshold) so a prompt edit auto-invalidates stale verdicts.
     """
     h = hashlib.sha256()
     h.update(judge_sig.encode("utf-8"))
-    h.update(b"\x00")
-    for t in texts:
-        h.update(t.encode("utf-8"))
-        h.update(b"\x00")
     return h.hexdigest()
 
 
@@ -228,13 +228,18 @@ def knn_candidates(
 class JudgeCache:
     """Persistent, fingerprint-guarded cache of pairwise verdicts.
 
-    Key is "i-j" with i < j over global cause indices. Values store the verdict
-    plus reason and cosine for the audit trail.
+    Key is a content hash of the order-independent cause-string pair
+    ``sha256(min(a,b) || max(a,b))``, NOT a positional ``i-j``. Content
+    addressing is what makes the cache survive a rebuilt case_db: the same two
+    cause strings reuse their prior verdict regardless of their new indices, and
+    only genuinely new string pairs hit the LLM. Values store the verdict plus
+    the raw strings, reason and cosine for the audit trail.
     """
 
-    def __init__(self, path: Path, fingerprint: str, flush_every: int = 200):
+    def __init__(self, path: Path, fingerprint: str, texts: Sequence[str], flush_every: int = 200):
         self.path = path
         self.fingerprint = fingerprint
+        self.texts = texts
         self.flush_every = flush_every
         self.pairs: Dict[str, Dict[str, Any]] = {}
         self._dirty = 0
@@ -248,15 +253,24 @@ class JudgeCache:
                 print(f"[cache] fingerprint mismatch in {path}; ignoring stale cache")
 
     @staticmethod
-    def key(i: int, j: int) -> str:
-        lo, hi = (i, j) if i < j else (j, i)
-        return f"{lo}-{hi}"
+    def _content_key(a: str, b: str) -> str:
+        lo, hi = (a, b) if a <= b else (b, a)
+        h = hashlib.sha256()
+        h.update(lo.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(hi.encode("utf-8"))
+        return h.hexdigest()
+
+    def key(self, i: int, j: int) -> str:
+        return self._content_key(self.texts[i], self.texts[j])
 
     def get(self, i: int, j: int) -> Dict[str, Any] | None:
         return self.pairs.get(self.key(i, j))
 
     def put(self, i: int, j: int, same: bool, reason: str, cos: float) -> None:
         self.pairs[self.key(i, j)] = {
+            "a": self.texts[i],
+            "b": self.texts[j],
             "same": bool(same),
             "reason": reason,
             "cos": round(float(cos), 4),
@@ -475,10 +489,10 @@ def _cluster_medoids(
 # --------------------------------------------------------------------------- #
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     texts, embeddings = load_texts_embeddings(args.case_db, args.max_items)
-    fingerprint = _fingerprint(texts, _judge_signature(args))
+    fingerprint = _fingerprint(_judge_signature(args))
     output_path = Path(args.output)
     cache_path = output_path.with_name(output_path.name + ".judge_cache.json")
-    cache = JudgeCache(cache_path, fingerprint)
+    cache = JudgeCache(cache_path, fingerprint, texts)
 
     print(f"[judge] backend={args.judge}" + (f" model={args.model}" if args.judge == "ollama" else ""))
 
@@ -530,7 +544,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     clusters = assign_cause_ids(texts, embeddings, cluster_labels)
     save_clusters_json(clusters, output_path)
-    _dump_audit(cache, texts, output_path)
+    _dump_audit(cache, output_path)
 
     print()
     print(quality_report(clusters, top_n=args.report_top_n))
@@ -540,16 +554,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     return clusters
 
 
-def _dump_audit(cache: JudgeCache, texts: Sequence[str], output_path: Path) -> None:
+def _dump_audit(cache: JudgeCache, output_path: Path) -> None:
     audit_path = output_path.with_name(output_path.name + ".judgments.jsonl")
     with audit_path.open("w", encoding="utf-8") as f:
-        for key, rec in cache.pairs.items():
-            i, j = (int(x) for x in key.split("-"))
+        for rec in cache.pairs.values():
             f.write(
                 json.dumps(
                     {
-                        "a": texts[i],
-                        "b": texts[j],
+                        "a": rec["a"],
+                        "b": rec["b"],
                         "cos": rec["cos"],
                         "same": rec["same"],
                         "reason": rec["reason"],

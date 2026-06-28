@@ -57,13 +57,13 @@ def main():
     os.environ["RFDETR_SEMANTIC_LOSS_COEF"] = str(args.semantic_loss_coef)
     os.environ["RFDETR_SEMANTIC_TEMP"] = str(args.semantic_temp)
 
-    from rfdetr import RFDETRMedium
+    from diagnosis_model.grod.build import build_oavle
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     # freeze_encoder=True -> backbone frozen; decoder + semantic head stay trainable.
-    model = RFDETRMedium(
-        pretrain_weights=args.pretrain_weights,
+    model = build_oavle(
+        args.pretrain_weights,
         num_classes=1,            # class-agnostic ABNORMAL detector (unchanged)
         freeze_encoder=True,
     )

@@ -54,11 +54,9 @@ def main():
     os.environ["RFDETR_SEMANTIC_DIM"] = "768"
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(args.anchors)
     os.environ["RFDETR_GLOBAL_DIM"] = "768"
-    from rfdetr import RFDETRMedium
+    from diagnosis_model.grod.build import load_oavle
     import torch.nn.functional as F
-    rf = RFDETRMedium(pretrain_weights=args.joint_ckpt, num_classes=1)
-    net = rf.model.model.to(dev).eval()
-    res = int(rf.model.resolution); means, stds = list(rf.means), list(rf.stds)
+    net, res, means, stds = load_oavle(args.joint_ckpt, device=dev)
     A = torch.load(args.anchors, weights_only=False)["anchor_embs"].float().to(dev)
     mu = A.mean(0, keepdim=True); A_c = F.normalize(A - mu, dim=-1)
     tp_sal, fp_sal = [], []          # centered saliency of correctly-matched vs false selected boxes

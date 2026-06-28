@@ -24,12 +24,10 @@ class GpuPipeline:
         os.environ["RFDETR_SEMANTIC_DIM"] = "768"
         os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(anchors)
         os.environ["RFDETR_GLOBAL_DIM"] = "768"
-        from rfdetr import RFDETRMedium
-        rf = RFDETRMedium(pretrain_weights=joint_ckpt, num_classes=1)
-        self.net = rf.model.model.to(device).eval()
-        self.net.global_embed.load_state_dict(torch.load(global_sd, map_location=device))
-        self.res = int(rf.model.resolution)
-        self.means, self.stds = list(rf.means), list(rf.stds)
+        from diagnosis_model.grod.build import OAVLE
+        self.net = OAVLE.from_pretrained(joint_ckpt, device=device)
+        self.net.core.global_embed.load_state_dict(torch.load(global_sd, map_location=device))
+        self.res, self.means, self.stds = self.net.resolution, self.net.means, self.net.stds
 
         # --- Aggregator (DeepSets) ---
         from diagnosis_model.cause_inference.models.case_encoder import (

@@ -71,15 +71,18 @@ _TEMPLATE = Template(
   <table class="info">
     <tr>
       <td class="lab">病例編號</td><td>{{ r.meta.case_id }}</td>
-      <td class="lab">報告日期</td><td>{{ r.meta.timestamp.replace("T", " ") }}</td>
+      <td class="lab">報告時間</td><td>{{ r.meta.timestamp.replace("T", " ") }}</td>
     </tr>
     <tr>
-      <td class="lab">診斷模式</td><td>{{ mode_label }}</td>
+      <td class="lab">分析模式</td><td>{{ mode_label }}</td>
       <td class="lab">病灶數量</td><td>{{ r.n_lesions }}</td>
     </tr>
     <tr>
-      <td class="lab">判定結果</td><td>{{ "健康（未偵測到明顯異常）" if r.abstain else "疑似異常，進行病因分析" }}</td>
-      <td class="lab">送檢描述</td><td>{{ r.meta.text or "（未填，僅影像）" }}</td>
+      <td class="lab">補充描述</td><td colspan="3">{{ r.meta.text or "未提供" }}</td>
+    </tr>
+    <tr>
+      <td class="lab">判定結果</td>
+      <td colspan="3">{{ "健康（未偵測到明顯異常）" if r.abstain else "疑似異常，進行病因分析" }}</td>
     </tr>
   </table>
 
@@ -141,7 +144,7 @@ _TEMPLATE = Template(
   {% set fig.n = fig.n + 1 %}
   <div class="figrow"><div class="item" style="width:100%">
     <img class="fig" src="{{ r.causes_breakdown }}" style="width:100%">
-    <div class="cap">圖{{ fig.n }}　各疑似病因主要由哪些證據支持（顏色＝證據來源）</div>
+    <div class="cap">圖{{ fig.n }}　各疑似病因的證據來源比例</div>
   </div></div>
   {% endif %}
   {% endif %}

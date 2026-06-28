@@ -1,7 +1,13 @@
 from __future__ import annotations
 import argparse
 import os
+import sys
 
+# This script is run directly from diagnosis_model/detection/ (BUILD_PIPELINE Step 2:
+# `cd diagnosis_model/detection; python train_rfdetr.py`), so the repo root isn't on
+# sys.path. Add it so the grod monkeypatch (RFDETR_BACKBONE backbone swap etc.) imports.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+import diagnosis_model.grod  # noqa: F401  applies rfdetr monkeypatch; no-op when RFDETR_* env unset
 from rfdetr import RFDETRMedium
 
 
@@ -17,14 +23,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--freeze_encoder", action="store_true",
+                   help="凍結 backbone（只訓 projector/decoder/heads）。預設不凍＝微調整個 backbone。")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    model = RFDETRMedium()
+
+    model = RFDETRMedium(freeze_encoder=args.freeze_encoder)
     model.train(
         dataset_dir=args.dataset_dir,
         epochs=args.epochs,

@@ -33,10 +33,8 @@ from diagnosis_model.grod.render_anomaly_heatmap import overlay
 def load_detector(joint_ckpt, anchors, device):
     os.environ["RFDETR_SEMANTIC_DIM"] = "768"
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(anchors)
-    from rfdetr import RFDETRMedium
-    rf = RFDETRMedium(pretrain_weights=joint_ckpt, num_classes=1)
-    net = rf.model.model.to(device).eval()
-    return net, int(rf.model.resolution), list(rf.means), list(rf.stds)
+    from diagnosis_model.grod.build import load_oavle
+    return load_oavle(joint_ckpt, device=device)
 
 
 @torch.no_grad()

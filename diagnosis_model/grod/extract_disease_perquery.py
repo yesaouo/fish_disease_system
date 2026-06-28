@@ -60,12 +60,9 @@ class Grod:
         os.environ["RFDETR_SEMANTIC_DIM"] = "768"
         os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(anchors)
         os.environ["RFDETR_GLOBAL_DIM"] = "768"
-        from rfdetr import RFDETRMedium
-        rf = RFDETRMedium(pretrain_weights=joint_ckpt, num_classes=1)
-        self.net = rf.model.model.to(device).eval()
+        from diagnosis_model.grod.build import load_oavle
+        self.net, self.res, self.means, self.stds = load_oavle(joint_ckpt, device=device)
         self.net.global_embed.load_state_dict(torch.load(global_sd, map_location=device))
-        self.res = int(rf.model.resolution)
-        self.means, self.stds = list(rf.means), list(rf.stds)
         # anchors for centered semantic saliency (anisotropy fix: subtract centroid)
         A = torch.load(anchors, weights_only=False)["anchor_embs"].float().to(device)
         self.mu = A.mean(0, keepdim=True)

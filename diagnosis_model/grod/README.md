@@ -178,13 +178,32 @@ Base detector: **RF-DETR-Medium** (DINOv2 backbone, single class-agnostic
 | `hs` (decoder query dim) | 256 |
 | semantic dim (SigLIP2 text) | 768 (CLIP ablation: 512) |
 
-The semantic head requires a **patched fork** of `rfdetr` (adds the optional head
-+ `loss_semantic`, `+110` lines, all additive). The plain detector is unchanged
-when `semantic_dim=0`. Setup / commit pins: [`RFDETR_FORK.md`](RFDETR_FORK.md).
+The semantic head uses **stock (unmodified) `rfdetr 1.6.5.post0`** — no fork. The
+optional head + `loss_semantic` are added to stock rfdetr at runtime by
+[`rfdetr_patch.py`](rfdetr_patch.py) (monkeypatch, auto-applied on
+`import diagnosis_model.grod`); inference instead builds via the vendored decoder
+in [`detector/`](detector/) (`build_grod_detector`), which imports no rfdetr.
+Toggled via env (`RFDETR_SEMANTIC_DIM` / `RFDETR_GLOBAL_DIM` / `RFDETR_BACKBONE`);
+all default off → plain stock detector.
 
 ---
 
 ## Pipeline & commands
+
+> **Paths below are old-tree illustrative examples.** For the current dataset
+> version substitute the `current` tree: images/COCO under
+> `data/processed/current/detection/{train,valid}/` (NOT `data/detection/coco/_merged`,
+> which is a stale snapshot), artifacts (case_db, text_anchors, checkpoints) under
+> `data/processed/current/artifacts/{db,models}/`. The `current` symptom taxonomy
+> is 15 classes; rebuild `merged_semantic` on the current detection COCO before
+> joint training (none ships in the current tree yet).
+>
+> **DINOv3 backbone:** prefix any build/train/extract command with
+> `RFDETR_BACKBONE=dinov3_base` (or `dinov3_small`/`dinov3_large`). The global
+> head input width changes with the backbone (DINOv2 1536 → DINOv3-base 3072), so
+> the global head must be re-distilled per backbone. rfdetr is stock + runtime
+> monkeypatch (auto-applied on `import diagnosis_model.grod`); no env beyond the
+> `RFDETR_*` switches is needed.
 
 ### 0. One-time data prep
 
@@ -275,7 +294,7 @@ python -m diagnosis_model.grod.train_joint ... \
 |---|---|
 | `build_merged_coco.py` | detection COCO + per-box `symptom_category_id` → `_merged_semantic/` |
 | `build_text_anchors.py` | frozen VLM text anchors `[C, D]` (`--model_name` swaps VLM) |
-| `train_joint.py` | **production** joint detection+semantic training (forked rfdetr) |
+| `train_joint.py` | **production** joint detection+semantic training (stock rfdetr + `rfdetr_patch` monkeypatch) |
 | `extract_z_joint.py` | run joint model, IoU-match GT→query, dump trained `z` |
 | `rebuild_case_db.py` | swap case_db `lesion_embs` with `z` (`--from_joint`) |
 | `extract_hs.py` | frozen-probe (rung-1 evidence): hook raw `hs` from a frozen detector |

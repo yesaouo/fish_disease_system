@@ -61,10 +61,8 @@ def main():
 
     os.environ["RFDETR_SEMANTIC_DIM"] = "768"
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(args.anchors)
-    from rfdetr import RFDETRMedium
-    rf = RFDETRMedium(pretrain_weights=args.joint_ckpt, num_classes=1)
-    net = rf.model.model.to(args.device).eval()
-    means, stds, res = list(rf.means), list(rf.stds), int(rf.model.resolution)
+    from diagnosis_model.grod.build import load_oavle
+    net, res, means, stds = load_oavle(args.joint_ckpt, device=args.device)
 
     anc = torch.load(args.anchors, weights_only=False)
     A = F.normalize(anc["anchor_embs"].float(), dim=-1)              # [C,768]

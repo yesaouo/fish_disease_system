@@ -50,9 +50,8 @@ def clone_heads(joint_ckpt, global_sd, anchors, device):
     os.environ["RFDETR_SEMANTIC_DIM"] = "768"
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = str(Path(anchors).resolve())
     os.environ["RFDETR_GLOBAL_DIM"] = "768"
-    from rfdetr import RFDETRMedium
-    rf = RFDETRMedium(pretrain_weights=joint_ckpt, num_classes=1)
-    net = rf.model.model
+    from diagnosis_model.grod.build import load_oavle
+    net, _, _, _ = load_oavle(joint_ckpt, eval_mode=False)
     ce_src = None
     for name, mod in net.named_modules():
         if name.split(".")[-1] == "class_embed" and isinstance(mod, nn.Linear):
@@ -66,7 +65,7 @@ def clone_heads(joint_ckpt, global_sd, anchors, device):
     sem_head = nn.Linear(se_src.in_features, se_src.out_features,
                          bias=se_src.bias is not None).to(device)
     sem_head.load_state_dict(se_src.state_dict())
-    del rf, net
+    del net
     return obj_head, sem_head
 
 

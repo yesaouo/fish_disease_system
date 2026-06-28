@@ -34,7 +34,7 @@ from collections import OrderedDict
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from PIL import Image
+from PIL import Image, ImageOps
 
 from diagnosis_model.grod.pipeline import (
     DEVICE, ABSTAIN_DEFAULT, DISPLAY_DEFAULT, _BUILDERS,
@@ -162,7 +162,11 @@ def diagnose(
     if mode not in _BUILDERS:
         raise HTTPException(400, f"unknown mode '{mode}'; choose {list(_BUILDERS.keys())}")
     try:
-        img = Image.open(io.BytesIO(image.file.read())).convert("RGB")
+        # exif_transpose bakes the EXIF orientation into the pixels so server-side
+        # work (bboxes, image_size, heatmap) matches the upright image the browser
+        # shows from URL.createObjectURL (which applies EXIF). Without this, phone
+        # photos tagged "rotate 90°" come out with boxes/heatmap mis-aligned.
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(image.file.read()))).convert("RGB")
     except Exception as e:
         raise HTTPException(400, f"cannot read image: {e}")
 

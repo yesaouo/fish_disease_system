@@ -9,7 +9,6 @@
 **/__pycache__/
 
 note/
-temp/
 .gradio/
 annotation_web/frontend/dist/
 paper/

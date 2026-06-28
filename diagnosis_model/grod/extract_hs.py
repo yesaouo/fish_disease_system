@@ -121,9 +121,9 @@ def build_category_lookup(vlc_coco_path: Path) -> Dict[Tuple[str, Tuple[int, int
 # ---------------------------------------------------------------------------
 
 def load_detector(det_ckpt: str, device: Optional[str] = None):
-    from rfdetr import RFDETRMedium
+    from diagnosis_model.grod.build import build_oavle
 
-    rf = RFDETRMedium(pretrain_weights=det_ckpt)
+    rf = build_oavle(det_ckpt, num_classes=None)
     net = rf.model.model  # the LWDETR nn.Module
     if device is not None:
         net = net.to(device)

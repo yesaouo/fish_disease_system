@@ -60,11 +60,9 @@ def main():
     os.environ["RFDETR_SEMANTIC_DIM"] = "768"
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(args.anchors)
     os.environ["RFDETR_GLOBAL_DIM"] = "768"
-    from rfdetr import RFDETRMedium
-    rf = RFDETRMedium(pretrain_weights=args.joint_ckpt, num_classes=1)
-    net = rf.model.model.to(dev).eval()
+    from diagnosis_model.grod.build import load_oavle
+    net, res, means, stds = load_oavle(args.joint_ckpt, device=dev)
     net.global_embed.load_state_dict(torch.load(args.global_sd, map_location=dev))
-    res = int(rf.model.resolution); means, stds = list(rf.means), list(rf.stds)
     head, disease_tau = load_disease_head(args.disease_ckpt, dev)
 
     # val images: diseased (valid_cases) + healthy (val split of healthy_images)

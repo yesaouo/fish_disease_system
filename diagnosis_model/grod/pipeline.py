@@ -48,10 +48,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------------------------------------------------------------------
 # Paths (new dataset tree)
 # ---------------------------------------------------------------------------
-ART = REPO_ROOT / "data/processed/current/artifacts"
-DET_TRAIN = REPO_ROOT / "data/processed/current/detection/train"
-DET_VALID = REPO_ROOT / "data/processed/current/detection/valid"
-SYMPTOMS_JSON = REPO_ROOT / "data/processed/current/symptoms.json"
+# Dataset version is "current" (symlink to the latest build) by default; set
+# FDS_PROCESSED before launch to pin a specific build dir under data/processed/
+# (e.g. FDS_PROCESSED=2026-06-10_2113 $PY -m diagnosis_model.serve.app), useful
+# when current/artifacts points at a half-built tree.
+_PROC = REPO_ROOT / "data/processed" / (os.environ.get("FDS_PROCESSED") or "current")
+ART = _PROC / "artifacts"
+DET_TRAIN = _PROC / "detection/train"
+DET_VALID = _PROC / "detection/valid"
+SYMPTOMS_JSON = _PROC / "symptoms.json"
 ANCHORS_PT = ART / "models/text_anchors.pt"
 RAW_SIGLIP_NAME = "google/siglip2-base-patch16-224"
 
@@ -75,7 +80,7 @@ CJK_FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
 # Two decoupled GROD objectness thresholds, dataset-calibrated by
 # diagnosis_model/grod/calibrate_thresholds.py; fall back to legacy values.
-THRESHOLDS_JSON = REPO_ROOT / "data/processed/current/thresholds.json"
+THRESHOLDS_JSON = _PROC / "thresholds.json"
 
 
 def _load_thresholds():
@@ -138,6 +143,10 @@ class Shared:
 
 
 def load_shared():
+    _ver = os.environ.get("FDS_PROCESSED") or "current"
+    _resolved = _PROC.resolve().name if _PROC.is_symlink() or _ver == "current" else _ver
+    print(f"[init] dataset version: {_ver}"
+          + (f" -> {_resolved}" if _resolved != _ver else "") + f"  ({_PROC})")
     pack = torch.load(ANCHORS_PT, weights_only=False, map_location=DEVICE)
     Shared.anchor_embs = F.normalize(pack["anchor_embs"].float().to(DEVICE), dim=-1)
     C = Shared.anchor_embs.size(0)
@@ -382,7 +391,7 @@ class GrodSoftPipeline:
                                  str(SOFT_BANK), device=DEVICE)
         cases = torch.load(Path(SOFT_CASE_DB) / "train_cases.pt", weights_only=False)
         self.file_names = [c["file_name"] for c in cases]
-        self.params = {**_detector_params(self.p.net),
+        self.params = {**_detector_params(self.p.net.core),
                        "Weighted DeepSets Aggregator": _nparams(self.p.enc),
                        "Cause-Evidence Attribution Module": _nparams(self.p.ceah)}
 
@@ -397,7 +406,10 @@ class GrodSoftPipeline:
         out = p.net(px)
         logits = out["pred_logits"][0][:, 0]; z_all = out["pred_semantic"][0]
         g = out["pred_global"][0]; boxes = out["pred_boxes"][0]
-        w = logits.sigmoid()
+        w = logits.sigmoid()                              # objectness: select / abstain / display
+        # Region Gate weights for aggregation + attribution (∅-sink softmax); decoupled
+        # from objectness. Legacy sigmoid ckpt (p.gate=None) -> falls back to w.
+        w_gate = p.gate(logits.unsqueeze(0))[0] if p.gate is not None else w
         scores, lidx = w.topk(min(K, w.numel()))
         T.append(("① 影像分析與病灶偵測", (_sync_now() - t) * 1000))
 
@@ -426,15 +438,15 @@ class GrodSoftPipeline:
 
         t = _sync_now()
         # hard_gate (grod mode): binarize objectness at display_thresh → {0,1}, the
-        # bytes-exact hard-gate degenerate. grod_soft keeps the continuous w.
-        w_model = (w > display_thresh).float() if self.hard_gate else w.float()
+        # bytes-exact hard-gate degenerate. grod_soft uses the Region Gate weights.
+        w_model = (w > display_thresh).float() if self.hard_gate else w_gate.float()
         zq = p.enc(g.float().unsqueeze(0), z_all.float().unsqueeze(0),
                    torch.tensor([w.numel()], device=dev), lesion_weights=w_model.unsqueeze(0))
         cand, topi, topw = _candidate_pool(zq, p.bank_z, p.memb, p.mlen, top_k_cases, dev)
         T.append(("④ 相似案例檢索", (_sync_now() - t) * 1000))
 
         t = _sync_now()
-        lw = ((scores > display_thresh).float() if self.hard_gate else scores.float()).unsqueeze(0)
+        lw = ((scores > display_thresh).float() if self.hard_gate else w_gate[lidx].float()).unsqueeze(0)
         scored = _ceah_score(p.ceah, g.float(), zk.float(), cand, p.cause_embs,
                              text_emb, dev,
                              lesion_weights=lw.expand(int(cand.numel()), -1).contiguous())
@@ -474,8 +486,8 @@ class BasePipeline:
         # is built without those heads regardless of mode load order.
         for k in ("RFDETR_SEMANTIC_DIM", "RFDETR_SEMANTIC_ANCHORS", "RFDETR_GLOBAL_DIM"):
             os.environ.pop(k, None)
-        from rfdetr import RFDETRMedium
-        self.det = RFDETRMedium(pretrain_weights=str(BASE_DETECTOR), num_classes=1)
+        from diagnosis_model.grod.build import build_oavle
+        self.det = build_oavle(str(BASE_DETECTOR), num_classes=1)
         self.det.optimize_for_inference(compile=False)
         from transformers import AutoModel
         self.lesion = AutoModel.from_pretrained(str(BASE_VLM_LESION)).to(DEVICE).eval()
@@ -627,13 +639,19 @@ def render_heatmap_image(image, obj_all, boxes_all):
 
 
 def render_detection_image(image, lesions):
-    """原圖＋紅框＋編號（1-based）。僅標號避免標籤過長。"""
+    """原圖＋紅框＋編號（1-based）。僅標號避免標籤過長。
+
+    線寬與字級正比於影像長邊：報告 PDF 會把整張圖等比縮小塞進版面，高解析影像
+    縮放倍率更大，固定像素線寬會被縮到次像素而消失——故以長邊推導，縮放後維持穩定粗細。
+    """
     img = image.copy().convert("RGB"); draw = ImageDraw.Draw(img)
+    long_side = max(img.size)
+    lw = max(3, round(long_side / 200))          # 框線寬，隨解析度放大
+    font_size = max(16, round(long_side / 30))   # 標籤字級，隨解析度放大
     for li, les in enumerate(lesions):
         x, y, w, h = [int(v) for v in les["bbox_xywh"]]
-        for off in range(3):
-            draw.rectangle((x - off, y - off, x + w + off, y + h + off), outline=(220, 50, 50))
-        _put_label(draw, x + 2, y + 2, f"L{li + 1}", bg=(220, 50, 50))
+        draw.rectangle((x, y, x + w, y + h), outline=(220, 50, 50), width=lw)
+        _put_label(draw, x + 2, y + 2, f"L{li + 1}", bg=(220, 50, 50), size=font_size)
     return img
 
 
