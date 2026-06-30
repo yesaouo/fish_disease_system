@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Dict, List
 import json
 from pathlib import Path
 
@@ -42,42 +42,9 @@ def _compute_stats(dataset: str, settings: Settings) -> StatsResponse:
     rows = storage_service.list_task_rows(dataset, settings)
     row_by_task_id = {str(r["task_id"]): r for r in rows if str(r["task_id"]) in task_id_set}
 
-    def _is_blank2(value: Any) -> bool:
-        return not str(value or "").strip()
-
-    def _required_fields_ok_raw(raw: dict) -> bool:
-        dets = raw.get("detections", [])
-        if not isinstance(dets, list) or len(dets) == 0:
-            return True
-
-        labels: list[str] = []
-        for d in dets:
-            if not isinstance(d, dict):
-                return False
-            label = str(d.get("label") or "").strip()
-            if not label:
-                return False
-            labels.append(label)
-            if label != HEALTHY_LABEL and d.get("evidence_index") in (None, ""):
-                return False
-
-        # Healthy (all boxes are healthy_region) => OK
-        if all(label == HEALTHY_LABEL for label in labels):
-            return True
-
-        # Non-healthy requires overall + global fields
-        overall = raw.get("overall") if isinstance(raw.get("overall"), dict) else {}
-        if _is_blank2(overall.get("colloquial_zh")):
-            return False
-        if _is_blank2(overall.get("medical_zh")):
-            return False
-        causes = raw.get("global_causes_zh")
-        if not isinstance(causes, list) or len(causes) == 0:
-            return False
-        treatments = raw.get("global_treatments_zh")
-        if not isinstance(treatments, list) or len(treatments) == 0:
-            return False
-        return True
+    # Single source of truth for the completion rule (overall 擇一, treatments
+    # optional). Avoids drift between this stat and submit/dispatch validation.
+    _required_fields_ok_raw = storage_service.required_fields_ok
 
     for task_id in task_ids:
         row = row_by_task_id.get(task_id)

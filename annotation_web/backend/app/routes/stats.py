@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api", tags=["stats"])
 def get_dataset_stats(
     dataset: str,
     settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
+    _role: str = Depends(dependencies.get_role),
 ) -> StatsResponse:
     return stats_service.get_dataset_stats(dataset, settings)
 
@@ -22,7 +22,7 @@ def get_dataset_stats(
 @router.get("/admin/stats", response_model=AdminStatsResponse)
 def get_admin_stats(
     settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
+    _role: str = Depends(dependencies.get_role),
 ) -> AdminStatsResponse:
     return stats_service.get_admin_stats(settings)
 
@@ -30,6 +30,6 @@ def get_admin_stats(
 @router.get("/admin/tasks", response_model=AdminTasksResponse)
 def get_admin_tasks(
     settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
+    _role: str = Depends(dependencies.get_role),
 ) -> AdminTasksResponse:
     return stats_service.get_admin_task_summaries(settings)

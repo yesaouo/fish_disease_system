@@ -218,12 +218,31 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     token: str
     name: str
+    # Server-resolved tier from the key: 'expert' or 'editor'.
+    role: str = "expert"
+
+class DatasetInfo(BaseModel):
+    name: str
+    locked: bool = True  # original training datasets are locked (no marker)
+    status: Optional[str] = None  # e.g. 'pending' for diagnosis-created datasets
 
 class DatasetListResponse(BaseModel):
-    datasets: List[str]
+    datasets: List[DatasetInfo]
+
+class ImportTaskResponse(BaseModel):
+    ok: bool = True
+    task_id: str
+    index: int
+    dataset: str
+    # True when the imported case had no lesions → stored under healthy_images/.
+    is_healthy: bool = False
 
 class ClassesResponse(BaseModel):
     classes: List[str]
+
+class TaskLocatorResponse(BaseModel):
+    # 1-based index within the dataset's `/images` listing (matches /annotate/:index)
+    index: int
 
 class ImageListResponse(BaseModel):
     images: List[str]

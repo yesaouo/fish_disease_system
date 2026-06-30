@@ -35,8 +35,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("DAILY_CHECK_INTERVAL_SECONDS", "IDLE_CHECK_INTERVAL_SECONDS"),
     )
     backup_dirname: str = Field(default="backup")
-    # Auth keys file (one key per line) under data_root by default
+    # Auth keys file (one key per line) under data_root by default.
+    # auth_keys.txt is the legacy flat key file (treated as expert-level for
+    # backward compatibility). expert/editor key files drive the tiered roles.
     auth_keys_filename: str = Field(default="auth_keys.txt")
+    expert_keys_filename: str = Field(default="expert_keys.txt")
+    editor_keys_filename: str = Field(default="editor_keys.txt")
     # GROD diagnosis inference service (diagnosis_model.serve.app, SDM env, GPU).
     # The /api/diagnose route proxies multipart uploads here.
     inference_url: str = Field(default="http://127.0.0.1:8900")
@@ -67,6 +71,14 @@ class Settings(BaseSettings):
     @property
     def auth_keys_path(self) -> Path:
         return self.data_root / self.auth_keys_filename
+
+    @property
+    def expert_keys_path(self) -> Path:
+        return self.data_root / self.expert_keys_filename
+
+    @property
+    def editor_keys_path(self) -> Path:
+        return self.data_root / self.editor_keys_filename
 
 
 @lru_cache(maxsize=1)

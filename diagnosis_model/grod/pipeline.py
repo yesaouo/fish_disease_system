@@ -248,13 +248,48 @@ def _candidate_pool(zq, bank_z, memb, mlen, top_k_cases, device):
     return cand, topi, topw
 
 
+_PROVENANCE: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _load_provenance() -> Dict[str, Dict[str, str]]:
+    """Map case-bank `file_name` (renumbered, e.g. '39.jpg') → its origin in the
+    annotation_web datasets: {source_dataset, source_task_id}. Built once from the
+    detection COCO image entries, which carry these provenance fields per image.
+    Lets the diagnosis report link a retrieved case back to its annotation page.
+    """
+    global _PROVENANCE
+    if _PROVENANCE is not None:
+        return _PROVENANCE
+    prov: Dict[str, Dict[str, str]] = {}
+    for split_dir in (DET_TRAIN, DET_VALID, _PROC / "detection/test"):
+        coco = split_dir / "_annotations.coco.json"
+        if not coco.exists():
+            continue
+        try:
+            data = json.load(open(coco, encoding="utf-8"))
+        except Exception:
+            continue
+        for img in data.get("images", []):
+            fn = img.get("file_name")
+            ds = img.get("source_dataset")
+            tid = img.get("source_task_id")
+            if fn and ds and tid:
+                prov[fn] = {"source_dataset": str(ds), "source_task_id": str(tid)}
+    _PROVENANCE = prov
+    return prov
+
+
 def _retrieved_cards(topi, topw, file_names):
+    prov = _load_provenance()
     out = []
     for k in range(topi.numel()):
         ci = int(topi[k].item()); fn = file_names[ci]
         p = DET_TRAIN / fn
+        src = prov.get(fn, {})
         out.append({"file_name": fn, "similarity": float(topw[k].item()),
-                    "image_path": str(p) if p.exists() else None})
+                    "image_path": str(p) if p.exists() else None,
+                    "source_dataset": src.get("source_dataset"),
+                    "source_task_id": src.get("source_task_id")})
     return out
 
 

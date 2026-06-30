@@ -6,10 +6,9 @@ import ProjectHeader from "../../components/ProjectHeader";
 const NAME_PATTERN = /^[\u4e00-\u9fffA-Za-z]{1,32}$/;
 
 const LoginPage: React.FC = () => {
-  const { login } = useAuth();
+  const { login, continueAsGuest } = useAuth();
   const navigate = useNavigate();
   const [name, setName] = useState("");
-  const [isExpert, setIsExpert] = useState(true);
   const [apiKey, setApiKey] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -27,14 +26,19 @@ const LoginPage: React.FC = () => {
     }
     setLoading(true);
     try {
-      await login(trimmed, isExpert, apiKey.trim());
-      navigate("/datasets", { replace: true });
+      await login(trimmed, apiKey.trim());
+      navigate("/home", { replace: true });
     } catch (err) {
       console.error(err);
-      setError("登入失敗，請稍後再試");
+      setError("登入失敗，請確認金鑰是否正確");
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleGuest = () => {
+    continueAsGuest();
+    navigate("/home", { replace: true });
   };
 
   return (
@@ -77,22 +81,27 @@ const LoginPage: React.FC = () => {
               {error}
             </div>
           )}
-          <div className="mb-4 flex items-center gap-2 text-sm text-slate-700">
-            <input
-              id="expert-flag"
-              type="checkbox"
-              checked={isExpert}
-              onChange={(e) => setIsExpert(e.target.checked)}
-            />
-            <label htmlFor="expert-flag">我是養殖專家</label>
-          </div>
           <button
             type="submit"
             disabled={loading}
             className="w-full rounded bg-sky-600 px-3 py-2 text-white hover:bg-sky-700 disabled:bg-sky-300"
           >
-            {loading ? "登入中..." : "開始標註"}
+            {loading ? "登入中..." : "以金鑰登入"}
           </button>
+          <div className="my-3 flex items-center gap-3 text-xs text-slate-400">
+            <span className="h-px flex-1 bg-slate-200" />或<span className="h-px flex-1 bg-slate-200" />
+          </div>
+          <button
+            type="button"
+            onClick={handleGuest}
+            disabled={loading}
+            className="w-full rounded border border-slate-300 bg-white px-3 py-2 text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          >
+            以訪客身分瀏覽
+          </button>
+          <p className="mt-3 text-center text-xs text-slate-400">
+            訪客可瀏覽標註與使用 AI 診斷，但無法編輯或提交。
+          </p>
         </form>
       </div>
     </div>

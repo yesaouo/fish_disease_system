@@ -1,4 +1,9 @@
-import type { Detection, TaskDocument } from "../api/types";
+import type {
+  Detection,
+  DiagnoseLesion,
+  DiagnoseResponse,
+  TaskDocument
+} from "../api/types";
 
 export const cloneTaskDocument = (doc: TaskDocument): TaskDocument =>
   JSON.parse(JSON.stringify(doc));
@@ -55,16 +60,14 @@ export const validateTaskDocument = (
 
   // Healthy: no required fields.
   if (!isHealthy) {
-    if (!doc.overall?.colloquial_zh?.trim()) {
+    // 病徵敘述擇一必填：通俗/醫學至少一項。
+    const hasOverall = !!(
+      doc.overall?.colloquial_zh?.trim() || doc.overall?.medical_zh?.trim()
+    );
+    if (!hasOverall) {
       errors.push({
         field: "overall.colloquial_zh",
-        message: "通俗描述未填寫"
-      });
-    }
-    if (!doc.overall?.medical_zh?.trim()) {
-      errors.push({
-        field: "overall.medical_zh",
-        message: "醫學描述未填寫"
+        message: "請至少填寫通俗或醫學描述其中一項"
       });
     }
     if (!doc.detections?.length) {
@@ -79,12 +82,7 @@ export const validateTaskDocument = (
         message: "病徵原因未填寫"
       });
     }
-    if (!doc.global_treatments_zh?.length) {
-      errors.push({
-        field: "global_treatments_zh",
-        message: "處置未填寫"
-      });
-    }
+    // 處置建議改為選填，不再驗證。
   }
 
   doc.detections.forEach((det, idx) => {
@@ -162,6 +160,62 @@ export const validateTaskDocument = (
 
 export const ensureSingleLine = (value: string) =>
   value.replace(/\s*\n+\s*/g, " ").trim();
+
+// ===== 診斷報告 → 標註資料（B 草稿預填 / D AI 建議 共用） =====
+
+// 單一病灶 → Detection：bbox_xywh → box_xyxy；label_zh 用反轉的 labelMap 對回英文類別。
+// 對不回英文類別時 label 留空，由專家在編輯器選擇。evidence_index 一律留空（報告無此資訊）。
+export const reportLesionToDetection = (
+  lesion: DiagnoseLesion,
+  zhToEn: Record<string, string>,
+  imageWidth: number,
+  imageHeight: number
+): Detection => {
+  const [x, y, w, h] = lesion.bbox_xywh;
+  return {
+    label: zhToEn[lesion.label_zh] ?? "",
+    evidence_zh: "",
+    evidence_index: null,
+    box_xyxy: normalizeBox(x, y, x + w, y + h, imageWidth, imageHeight),
+    confidence: lesion.det_score
+  };
+};
+
+// 完整報告 → 草稿 TaskDocument（病灶框＋病因預填；整體敘述/外觀敘述/處置留空由專家補）。
+export const reportToTaskDoc = (
+  report: DiagnoseResponse,
+  zhToEn: Record<string, string>
+): TaskDocument => {
+  const [width, height] = report.image_size;
+  return {
+    dataset: "",
+    image_filename: "diagnosis.jpg",
+    image_width: width,
+    image_height: height,
+    version: 0,
+    last_modified_at: new Date().toISOString(),
+    general_editor: [],
+    expert_editor: [],
+    overall: { colloquial_zh: "", medical_zh: "" },
+    detections: report.lesions.map((l) =>
+      reportLesionToDetection(l, zhToEn, width, height)
+    ),
+    global_causes_zh: report.causes.map((c) => c.text),
+    global_treatments_zh: [],
+    comments: []
+  };
+};
+
+// 反轉 labelMapZh（en→zh）成 zh→en，供上面兩支對回英文類別。
+export const invertLabelMap = (
+  labelMapZh: Record<string, string>
+): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const [en, zh] of Object.entries(labelMapZh)) {
+    if (zh && !(zh in out)) out[zh] = en;
+  }
+  return out;
+};
 
 export const defaultDetection = (
   imageWidth: number,

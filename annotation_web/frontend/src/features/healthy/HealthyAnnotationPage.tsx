@@ -15,11 +15,14 @@ import {
   Redo2,
   Save,
   SquarePlus,
+  Trash,
   Trash2,
   Undo2,
 } from "lucide-react";
 
 import {
+  deleteDatasetTask,
+  fetchDatasets,
   fetchHealthyTaskByIndex,
   moveHealthyImageToImages,
   saveTask,
@@ -57,11 +60,33 @@ const HEALTHY_LABEL_DISPLAY = "健康特徵";
 const HealthyAnnotationPage: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { index } = useParams();
+  const { index, dataset: datasetParam } = useParams();
   const routeIndex = index ? Number(index) : null;
 
   const { name, isExpert } = useAuth();
-  const { dataset } = useDataset();
+  const dataset = datasetParam ?? null;
+  const { setDataset } = useDataset();
+  useEffect(() => {
+    if (dataset) setDataset(dataset);
+  }, [dataset, setDataset]);
+
+  // 此資料集是否可寫（診斷建立的資料集才能刪除影像；官方鎖定資料集不可）。
+  const [datasetWritable, setDatasetWritable] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    if (!dataset) {
+      setDatasetWritable(false);
+      return;
+    }
+    fetchDatasets()
+      .then((list) => {
+        if (alive) setDatasetWritable(list.find((d) => d.name === dataset)?.locked === false);
+      })
+      .catch(() => alive && setDatasetWritable(false));
+    return () => {
+      alive = false;
+    };
+  }, [dataset]);
 
   const [task, setTask] = useState<NextTaskResponse | null>(null);
   const [{ doc, history, future, selectedIndex, validationErrors }, dispatch] =
@@ -125,7 +150,7 @@ const HealthyAnnotationPage: React.FC = () => {
   const loadTask = useCallback(async () => {
     if (!dataset) return;
     if (routeIndex == null || Number.isNaN(routeIndex) || routeIndex <= 0) {
-      confirmAndNavigate("/healthy", { replace: true });
+      confirmAndNavigate(`/healthy/${dataset}`, { replace: true });
       return;
     }
     setLoading(true);
@@ -143,7 +168,7 @@ const HealthyAnnotationPage: React.FC = () => {
     } catch (err) {
       const axiosErr = err as AxiosError<{ detail?: string }>;
       if (axiosErr.response?.status === 404) {
-        await runWithBypass(() => navigate("/healthy", { replace: true }));
+        await runWithBypass(() => navigate(`/healthy/${dataset}`, { replace: true }));
         return;
       }
       setError("載入失敗，請稍後再試。");
@@ -374,7 +399,7 @@ const HealthyAnnotationPage: React.FC = () => {
       await moveHealthyImageToImages(dataset, doc.image_filename);
       const currentIdx = routeIndex ?? task.index;
       await runWithBypass(() =>
-        navigate(`/healthy/${currentIdx}`, { replace: true })
+        navigate(`/healthy/${dataset}/${currentIdx}`, { replace: true })
       );
     } catch (err) {
       const axiosErr = err as AxiosError<{ detail?: string }>;
@@ -383,6 +408,30 @@ const HealthyAnnotationPage: React.FC = () => {
       setSaving(false);
     }
   }, [dataset, dirty, doc, navigate, routeIndex, runWithBypass, task]);
+
+  // 刪除此健康影像與標註（僅診斷建立的可寫資料集，專家）。
+  const handleDelete = useCallback(async () => {
+    if (!task || !dataset || !doc) return;
+    const ok = window.confirm("確定要刪除這張影像與其標註嗎？此動作無法復原。");
+    if (!ok) return;
+    setSaving(true);
+    dispatch({ type: "RESET_ERRORS" });
+    try {
+      const res = await deleteDatasetTask(dataset, task.task_id);
+      if (res.dataset_removed) {
+        // 刪掉最後一張後資料集已被移除 → 導回資料集列表，避免停留在空殼頁。
+        await runWithBypass(() => navigate("/datasets", { replace: true }));
+        return;
+      }
+      // 刪除後下一張會遞補到目前編號；直接重新載入（越界時 loadTask 會導回健康影像列表）。
+      await loadTask();
+    } catch (err) {
+      const axiosErr = err as AxiosError<{ detail?: string }>;
+      setError(axiosErr.response?.data?.detail || "刪除失敗，請稍後再試。");
+    } finally {
+      setSaving(false);
+    }
+  }, [dataset, doc, loadTask, navigate, runWithBypass, task]);
 
   const addDisabled = loading || saving || !doc;
   const removeDisabled = loading || saving || !doc || selectedIndex == null;
@@ -442,7 +491,7 @@ const HealthyAnnotationPage: React.FC = () => {
       const n = Number(value);
       if (!Number.isFinite(n)) return;
       const clamped = Math.min(Math.max(Math.trunc(n), 1), task.total_tasks);
-      confirmAndNavigate(`/healthy/${clamped}`);
+      confirmAndNavigate(`/healthy/${dataset}/${clamped}`);
     },
     [confirmAndNavigate, task]
   );
@@ -503,7 +552,7 @@ const HealthyAnnotationPage: React.FC = () => {
                 返回資料集
               </button>
               <button
-                onClick={() => confirmAndNavigate("/healthy")}
+                onClick={() => confirmAndNavigate(`/healthy/${dataset}`)}
                 className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               >
                 <Images className="h-4 w-4" />
@@ -593,6 +642,16 @@ const HealthyAnnotationPage: React.FC = () => {
               >
                 判定為異常
               </button>
+              {datasetWritable && isExpert && (
+                <IconButton
+                  onClick={handleDelete}
+                  disabled={loading || saving || !doc || !task}
+                  label="刪除此影像"
+                  className="border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100"
+                >
+                  <Trash className="h-4 w-4" />
+                </IconButton>
+              )}
             </div>
           </div>
 

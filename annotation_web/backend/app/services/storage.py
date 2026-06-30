@@ -49,9 +49,8 @@ def required_fields_ok(raw: Dict) -> bool:
     if is_healthy_from_raw(raw):
         return True
     overall = raw.get("overall") if isinstance(raw.get("overall"), dict) else {}
-    if is_blank(overall.get("colloquial_zh")):
-        return False
-    if is_blank(overall.get("medical_zh")):
+    # 病徵敘述擇一必填：通俗/醫學至少一項。
+    if is_blank(overall.get("colloquial_zh")) and is_blank(overall.get("medical_zh")):
         return False
     dets = raw.get("detections")
     if not isinstance(dets, list) or len(dets) == 0:
@@ -67,9 +66,7 @@ def required_fields_ok(raw: Dict) -> bool:
     causes = raw.get("global_causes_zh")
     if not isinstance(causes, list) or len(causes) == 0:
         return False
-    treatments = raw.get("global_treatments_zh")
-    if not isinstance(treatments, list) or len(treatments) == 0:
-        return False
+    # 處置建議改為選填（論文未做此模組），不再阻擋提交。
     return True
 
 
@@ -742,6 +739,20 @@ def list_task_rows(
         conn.close()
 
 
+def get_max_sort_index(dataset: str, settings: Settings | None = None) -> int:
+    """Largest sort_index currently in the dataset (0 if empty). Used to append
+    a new task at the end without colliding on the UNIQUE sort_index column."""
+    settings = _ensure_settings(settings)
+    dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
+    db_path = ensure_db(dataset_dir, settings)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(sort_index), 0) AS m FROM tasks;").fetchone()
+        return int(row["m"] if row is not None else 0)
+    finally:
+        conn.close()
+
+
 def count_tasks(dataset: str, settings: Settings | None = None) -> int:
     settings = _ensure_settings(settings)
     dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
@@ -903,6 +914,38 @@ def upsert_task(
         raise
     finally:
         conn.close()
+
+
+def delete_task(dataset: str, task_id: str, settings: Settings | None = None) -> str:
+    """Delete a task row (+ its history) and its image file. Returns the deleted
+    image filename. Used by diagnosis-created datasets to undo a submission."""
+    settings = _ensure_settings(settings)
+    dataset_dir = datasets_service.resolve_dataset_path(dataset, settings)
+    db_path = get_db_path(dataset_dir, settings)
+    if not db_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="資料庫不存在")
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT image_filename FROM tasks WHERE task_id = ?;", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task 不存在")
+        image_filename = str(row["image_filename"])
+        with conn:
+            conn.execute("DELETE FROM history WHERE task_id = ?;", (task_id,))
+            conn.execute("DELETE FROM tasks WHERE task_id = ?;", (task_id,))
+    finally:
+        conn.close()
+    # Remove the image file (best effort) from images/ or healthy_images/.
+    for is_healthy in (False, True):
+        p = get_image_dir(dataset_dir, is_healthy=is_healthy) / image_filename
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    return image_filename
 
 
 def append_audit_log(entry: Dict[str, str], settings: Settings | None = None) -> None:

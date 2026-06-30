@@ -71,16 +71,25 @@ export const Banner: React.FC<{
 export const SubmissionCapsules: React.FC<{
   generalEditor?: string[];
   expertEditor?: string[];
-}> = ({ generalEditor, expertEditor }) => {
+  commentsCount?: number;
+}> = ({ generalEditor, expertEditor, commentsCount }) => {
   const general = (generalEditor ?? []).map((s) => String(s).trim()).filter(Boolean);
   const expert = (expertEditor ?? []).map((s) => String(s).trim()).filter(Boolean);
   const hasGeneral = general.length > 0;
   const hasExpert = expert.length > 0;
+  const comments = commentsCount ?? 0;
+  const hasComments = comments > 0;
 
-  if (!hasGeneral && !hasExpert) return null;
+  if (!hasGeneral && !hasExpert && !hasComments) return null;
 
   return (
     <div className="flex flex-wrap items-center gap-2 text-xs leading-tight">
+      {hasComments && (
+        <span className="inline-flex items-center rounded-full bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200 px-2 py-1 font-medium">
+          <span>已註解</span>
+          <span className="ml-1 text-[10px] text-amber-600/80 font-normal">({comments})</span>
+        </span>
+      )}
       {hasGeneral && (
         <span className="inline-flex items-center rounded-full bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-200 px-2 py-1 font-medium">
           <span>用戶已提交</span>

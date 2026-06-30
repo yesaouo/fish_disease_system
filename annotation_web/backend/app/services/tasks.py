@@ -158,6 +158,51 @@ def validate_detections(
             )
 
 
+def import_diagnosis_task(
+    dataset: str,
+    task_id: str,
+    image_filename: str,
+    image_width: int,
+    image_height: int,
+    incoming: TaskDocument,
+    editor_name: str,
+    settings: Settings | None = None,
+) -> int:
+    """Create a brand-new expert-submitted task from a diagnosis report.
+
+    Inserts an empty row first (with the real image dims so submit_task preserves
+    them), then runs the standard submit_task path for validation + expert
+    bookkeeping. Returns the new version.
+    """
+    settings = _ensure_settings(settings)
+    # Insert the placeholder row at the end of the dataset with correct dims.
+    blank = TaskDocument(
+        dataset=dataset,
+        image_filename=image_filename,
+        image_width=image_width,
+        image_height=image_height,
+    )
+    storage_service.upsert_task(
+        dataset,
+        task_id,
+        sort_index=storage_service.get_max_sort_index(dataset, settings) + 1,
+        document=blank,
+        updated_by="system",
+        action="diagnosis_import_insert",
+        settings=settings,
+    )
+    incoming = incoming.model_copy()
+    incoming.version = 0
+    return submit_task(
+        dataset=dataset,
+        task_id=task_id,
+        incoming=incoming,
+        editor_name=editor_name,
+        is_expert=True,
+        settings=settings,
+    )
+
+
 def submit_task(
     dataset: str,
     task_id: str,
@@ -184,14 +229,13 @@ def submit_task(
 
     # Extra completion checks (skip when user left comments to justify omissions)
     if (not allow_incomplete) and (not is_healthy_task):
-        if _is_blank(getattr(incoming.overall, "colloquial_zh", "")):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="口語描述未填寫")
-        if _is_blank(getattr(incoming.overall, "medical_zh", "")):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="醫學描述未填寫")
+        # 病徵敘述擇一必填；處置建議改為選填。
+        if _is_blank(getattr(incoming.overall, "colloquial_zh", "")) and _is_blank(
+            getattr(incoming.overall, "medical_zh", "")
+        ):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="請至少填寫通俗或醫學描述其中一項")
         if not (getattr(incoming, "global_causes_zh", []) or []):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="病因未填寫")
-        if not (getattr(incoming, "global_treatments_zh", []) or []):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="處置未填寫")
         if not (getattr(incoming, "detections", []) or []):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="未新增任何框選目標")
 

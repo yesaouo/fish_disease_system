@@ -11,7 +11,15 @@ import ProjectHeader from "../../components/ProjectHeader";
 import React, { useState } from "react";
 
 // Icons
-import { Trash2, SquarePlus, Save, Undo2, Redo2, BarChart3, LogOut, Stethoscope } from "lucide-react";
+import { Trash2, SquarePlus, Save, Undo2, Redo2, BarChart3, LogOut, Stethoscope, Home } from "lucide-react";
+
+// 官方資料集來源標籤（鎖定資料集顯示來源，而非籠統的「官方」）。
+const DATASET_SOURCE: Record<string, string> = {
+  fish_disease: "Roboflow",
+  Fish_disease_9911: "Roboflow",
+  fish_disease_detection: "Roboflow",
+  tilapia: "NPUST"
+};
 
 // ===== 小元件：Kbd / IconButton / Separator =====
 const Kbd: React.FC<React.PropsWithChildren> = ({ children }) => (
@@ -22,8 +30,8 @@ const Kbd: React.FC<React.PropsWithChildren> = ({ children }) => (
 
 const DatasetPickerPage: React.FC = () => {
   const navigate = useNavigate();
-  const { dataset, setDataset, setClasses } = useDataset();
-  const { name, logout } = useAuth();
+  const { setDataset, setClasses } = useDataset();
+  const { name, logout, canEdit } = useAuth();
 
   const { data: datasets, isLoading, isError } = useQuery({
     queryKey: ["datasets"],
@@ -42,7 +50,7 @@ const DatasetPickerPage: React.FC = () => {
     try {
       const classes = await fetchClasses(selected);
       setClasses(classes);
-      navigate("/annotate", { replace: true });
+      navigate(`/annotate/${selected}`, { replace: true });
     } catch (err) {
       console.error(err);
     }
@@ -56,21 +64,23 @@ const DatasetPickerPage: React.FC = () => {
     <div className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-10">
       <ProjectHeader />
 
-      <header className="flex items-center justify-between">
-        <div>
+      <header className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold text-slate-800">資料集選擇</h1>
-          <p className="flex items-center gap-2 text-sm text-slate-500">
+          <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500">
             <span>您好，{name ?? "訪客"}</span>
-            {/* 前往後台（AdminDashboard） */}
-            <button
-              type="button"
-              onClick={() => navigate("/admin")}
-              className="inline-flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-              title="提交概況"
-              aria-label="提交概況"
-            >
-              <BarChart3 className="h-4 w-4" aria-hidden="true" />
-            </button>
+            {/* 前往後台（AdminDashboard）— 訪客不可見 */}
+            {canEdit && (
+              <button
+                type="button"
+                onClick={() => navigate("/admin")}
+                className="inline-flex h-6 w-6 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                title="提交概況"
+                aria-label="提交概況"
+              >
+                <BarChart3 className="h-4 w-4" aria-hidden="true" />
+              </button>
+            )}
             {/* 前往 AI 診斷報告 */}
             <button
               type="button"
@@ -98,11 +108,16 @@ const DatasetPickerPage: React.FC = () => {
             </button>
           </p>
         </div>
-        {dataset && (
-          <span className="rounded-full bg-sky-100 px-4 py-1 text-sm text-sky-700">
-            目前：{dataset}
-          </span>
-        )}
+        {/* 返回首頁：手機只顯示圖示（有框）、桌機顯示圖示＋文字 */}
+        <button
+          type="button"
+          onClick={() => navigate("/home")}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm hover:bg-slate-50"
+          title="返回首頁"
+          aria-label="返回首頁"
+        >
+          <Home className="h-4 w-4" /> <span className="hidden sm:inline">返回首頁</span>
+        </button>
       </header>
 
       {/* 免責聲明卡片 */}
@@ -210,8 +225,11 @@ const DatasetPickerPage: React.FC = () => {
         )}
         {datasets && datasets.length > 0 && (
           <ul className="grid gap-3 md:grid-cols-2">
-            {datasets.map((item) => {
-              const stats = adminStats?.datasets?.find((s) => s.dataset === item);
+            {/* 官方（鎖定）資料集排前面；組內維持後端的字母序（sort 為穩定排序） */}
+            {[...datasets]
+              .sort((a, b) => Number(b.locked) - Number(a.locked))
+              .map((item) => {
+              const stats = adminStats?.datasets?.find((s) => s.dataset === item.name);
               const completed = stats?.expert_completed_tasks;
               const total = stats?.total_tasks;
               const label =
@@ -219,14 +237,21 @@ const DatasetPickerPage: React.FC = () => {
                   ? `${completed}/${total}`
                   : "—/—";
               return (
-                <li key={item}>
+                <li key={item.name} className="min-w-0">
                   <button
-                    onClick={() => handleSelect(item)}
-                    className="flex w-full items-center justify-between rounded border border-slate-200 px-4 py-3 text-left hover:border-sky-500 hover:bg-sky-50"
+                    onClick={() => handleSelect(item.name)}
+                    className="flex w-full min-w-0 items-center justify-between rounded border border-slate-200 px-4 py-3 text-left hover:border-sky-500 hover:bg-sky-50"
                     title="選擇資料集"
                   >
-                    <span className="font-medium text-slate-700">{item}</span>
-                    <span className="text-sm text-slate-400" title="標註完成/圖片數量">
+                    <span className="flex min-w-0 items-center gap-2 font-medium text-slate-700">
+                      <span className="truncate">{item.name}</span>
+                      {item.locked && (
+                        <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500">
+                          {DATASET_SOURCE[item.name] ?? "官方"}
+                        </span>
+                      )}
+                    </span>
+                    <span className="shrink-0 pl-3 text-sm text-slate-400" title="標註完成/圖片數量">
                       {label}
                     </span>
                   </button>

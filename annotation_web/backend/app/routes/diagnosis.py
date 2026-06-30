@@ -4,7 +4,7 @@ import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 
 from ..config import Settings, get_settings
-from ..dependencies import require_api_key
+from ..dependencies import get_role
 
 router = APIRouter(prefix="/api", tags=["diagnosis"])
 
@@ -18,7 +18,7 @@ async def diagnose(
     display_thresh: float | None = Form(None),
     top_k_cases: int = Form(3),
     top_n_causes: int = Form(6),
-    _token: str = Depends(require_api_key),
+    _role: str = Depends(get_role),
     settings: Settings = Depends(get_settings),
 ) -> Response:
     """Proxy a diagnosis request to the GROD inference service (SDM env, GPU).
@@ -51,7 +51,7 @@ async def diagnose(
 @router.get("/diagnose/report.pdf")
 async def diagnose_report_pdf(
     case_id: str,
-    _token: str = Depends(require_api_key),
+    _role: str = Depends(get_role),
     settings: Settings = Depends(get_settings),
 ) -> Response:
     """Fetch a fixed-template PDF for an already-computed report by case_id.

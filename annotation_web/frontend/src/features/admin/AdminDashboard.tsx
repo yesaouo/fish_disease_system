@@ -4,7 +4,7 @@ import { fetchAdminStats, fetchAdminTasks } from "../../api/client";
 import type { DatasetStats } from "../../api/types";
 import ProjectHeader from "../../components/ProjectHeader";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Download } from "lucide-react";
 
 const AdminDashboard: React.FC = () => {
   const navigate = useNavigate();
@@ -79,31 +79,32 @@ const AdminDashboard: React.FC = () => {
   }, [data]);
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-10">
+    <div className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-4 py-6 sm:px-6 sm:py-10">
       <ProjectHeader />
-      <header className="flex items-center justify-between">
+      <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-slate-800">
             後台統計
           </h1>
           <p className="text-sm text-slate-500">提交概況</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:items-center">
           <button
             onClick={() => navigate("/datasets")}
-            className="rounded border border-slate-300 px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
+            className="inline-flex items-center justify-center gap-1.5 rounded border border-slate-300 px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
             title="返回資料集"
           >
-            <ArrowLeft className="mr-1 inline h-4 w-4 align-[-2px]" aria-hidden="true" />
-            返回資料集
+            <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+            返回
           </button>
           <button
             onClick={handleExportCsv}
-            className="rounded bg-slate-800 px-4 py-2 text-sm text-white hover:bg-slate-900 disabled:bg-slate-500"
+            className="inline-flex items-center justify-center gap-1.5 rounded bg-slate-800 px-4 py-2 text-sm text-white hover:bg-slate-900 disabled:bg-slate-500"
             title="匯出 CSV"
             disabled={!data}
           >
-            匯出 CSV
+            <Download className="h-4 w-4" aria-hidden="true" />
+            匯出
           </button>
         </div>
       </header>
@@ -137,9 +138,9 @@ const AdminDashboard: React.FC = () => {
             />
           </section>
 
-          <section className="rounded-xl bg-white shadow">
-            <table className="min-w-full divide-y divide-slate-200">
-              <thead className="bg-slate-50 text-sm uppercase text-slate-500">
+          <section className="overflow-hidden rounded-xl bg-white shadow">
+            <table className="block min-w-full divide-y divide-slate-200 sm:table">
+              <thead className="hidden bg-slate-50 text-sm uppercase text-slate-500 sm:table-header-group">
                 <tr>
                   <th className="px-4 py-3 text-left">資料集</th>
                   <th className="px-4 py-3 text-right">總任務</th>
@@ -148,7 +149,7 @@ const AdminDashboard: React.FC = () => {
                   <th className="px-4 py-3 text-right">完成率</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100 text-sm">
+              <tbody className="block divide-y divide-slate-100 text-sm sm:table-row-group">
                 {data.datasets.map((item) => (
                   <DatasetRow key={item.dataset} stats={item} />
                 ))}
@@ -156,9 +157,9 @@ const AdminDashboard: React.FC = () => {
             </table>
           </section>
 
-          <section className="rounded-xl bg-white shadow">
-            <table className="min-w-full divide-y divide-slate-200">
-              <thead className="bg-slate-50 text-sm uppercase text-slate-500">
+          <section className="overflow-hidden rounded-xl bg-white shadow">
+            <table className="block min-w-full divide-y divide-slate-200 sm:table">
+              <thead className="hidden bg-slate-50 text-sm uppercase text-slate-500 sm:table-header-group">
                 <tr>
                   <th className="px-4 py-3 text-left">使用者</th>
                   <th className="px-4 py-3 text-right">一般標註</th>
@@ -166,30 +167,44 @@ const AdminDashboard: React.FC = () => {
                   <th className="px-4 py-3 text-right">合計</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100 text-sm">
+              <tbody className="block divide-y divide-slate-100 text-sm sm:table-row-group">
                 {submissionTotalsByUser.length === 0 && (
-                  <tr>
+                  <tr className="block sm:table-row">
                     <td
                       colSpan={4}
-                      className="px-4 py-4 text-center text-slate-500"
+                      className="block px-4 py-4 text-center text-slate-500 sm:table-cell"
                     >
                       尚無統計資料
                     </td>
                   </tr>
                 )}
                 {submissionTotalsByUser.map(({ user, general, expert, total }) => (
-                  <tr key={user} className="hover:bg-slate-50">
-                    <td className="px-4 py-3 font-medium text-slate-700">
-                      {user || "(未命名)"}
+                  <tr key={user} className="block px-4 py-3 hover:bg-slate-50 sm:table-row sm:px-0 sm:py-0">
+                    <td className="flex items-center justify-between gap-4 py-1 text-right font-medium text-slate-700 sm:table-cell sm:px-4 sm:py-3 sm:text-left">
+                      <span className="text-xs font-normal text-slate-500 sm:hidden">
+                        使用者
+                      </span>
+                      <span className="min-w-0 break-all sm:break-normal">
+                        {user || "(未命名)"}
+                      </span>
                     </td>
-                    <td className="px-4 py-3 text-right text-slate-700">
-                      {general.toLocaleString()}
+                    <td className="flex items-center justify-between gap-4 py-1 text-right text-slate-700 sm:table-cell sm:px-4 sm:py-3">
+                      <span className="text-xs text-slate-500 sm:hidden">
+                        一般標註
+                      </span>
+                      <span>{general.toLocaleString()}</span>
                     </td>
-                    <td className="px-4 py-3 text-right text-slate-700">
-                      {expert.toLocaleString()}
+                    <td className="flex items-center justify-between gap-4 py-1 text-right text-slate-700 sm:table-cell sm:px-4 sm:py-3">
+                      <span className="text-xs text-slate-500 sm:hidden">
+                        專家標註
+                      </span>
+                      <span>{expert.toLocaleString()}</span>
                     </td>
-                    <td className="px-4 py-3 text-right text-slate-700">
-                      {total.toLocaleString()}
+                    <td className="flex items-center justify-between gap-4 py-1 text-right text-slate-700 sm:table-cell sm:px-4 sm:py-3">
+                      <span className="text-xs text-slate-500 sm:hidden">
+                        合計
+                      </span>
+                      <span>{total.toLocaleString()}</span>
                     </td>
                   </tr>
                 ))}
@@ -203,19 +218,28 @@ const AdminDashboard: React.FC = () => {
 };
 
 const DatasetRow: React.FC<{ stats: DatasetStats }> = ({ stats }) => (
-  <tr className="hover:bg-slate-50">
-    <td className="px-4 py-3 font-medium text-slate-700">{stats.dataset}</td>
-    <td className="px-4 py-3 text-right text-slate-600">
-      {stats.total_tasks.toLocaleString()}
+  <tr className="block px-4 py-3 hover:bg-slate-50 sm:table-row sm:px-0 sm:py-0">
+    <td className="flex items-center justify-between gap-4 py-1 text-right font-medium text-slate-700 sm:table-cell sm:px-4 sm:py-3 sm:text-left">
+      <span className="text-xs font-normal text-slate-500 sm:hidden">
+        資料集
+      </span>
+      <span className="min-w-0 break-all sm:break-normal">{stats.dataset}</span>
     </td>
-    <td className="px-4 py-3 text-right text-slate-600">
-      {stats.general_completed_tasks.toLocaleString()}
+    <td className="flex items-center justify-between gap-4 py-1 text-right text-slate-600 sm:table-cell sm:px-4 sm:py-3">
+      <span className="text-xs text-slate-500 sm:hidden">總任務</span>
+      <span>{stats.total_tasks.toLocaleString()}</span>
     </td>
-    <td className="px-4 py-3 text-right text-slate-600">
-      {stats.expert_completed_tasks.toLocaleString()}
+    <td className="flex items-center justify-between gap-4 py-1 text-right text-slate-600 sm:table-cell sm:px-4 sm:py-3">
+      <span className="text-xs text-slate-500 sm:hidden">一般完成</span>
+      <span>{stats.general_completed_tasks.toLocaleString()}</span>
     </td>
-    <td className="px-4 py-3 text-right text-slate-700">
-      {(stats.completion_rate * 100).toFixed(2)}%
+    <td className="flex items-center justify-between gap-4 py-1 text-right text-slate-600 sm:table-cell sm:px-4 sm:py-3">
+      <span className="text-xs text-slate-500 sm:hidden">專家完成</span>
+      <span>{stats.expert_completed_tasks.toLocaleString()}</span>
+    </td>
+    <td className="flex items-center justify-between gap-4 py-1 text-right text-slate-700 sm:table-cell sm:px-4 sm:py-3">
+      <span className="text-xs text-slate-500 sm:hidden">完成率</span>
+      <span>{(stats.completion_rate * 100).toFixed(2)}%</span>
     </td>
   </tr>
 );

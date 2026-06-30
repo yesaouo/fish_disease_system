@@ -6,6 +6,11 @@ import React from "react";
 import type { Detection } from "../../../api/types";
 import { clamp, normalizeBox } from "../../../lib/taskUtils";
 
+type Suggestion = {
+  box_xyxy: [number, number, number, number];
+  label?: string;
+};
+
 type AnnotationCanvasProps = {
   imageUrl: string;
   imageWidth: number;
@@ -15,6 +20,13 @@ type AnnotationCanvasProps = {
   onSelect: (index: number) => void;
   onUpdate: (index: number, box: [number, number, number, number]) => void;
   getDisplayLabel?: (value: string) => string;
+  // AI 建議的幽靈框（虛線、點擊即採用、與面板 hover 連動）
+  suggestions?: Suggestion[];
+  hoveredSuggestion?: number | null;
+  onAcceptSuggestion?: (index: number) => void;
+  onHoverSuggestion?: (index: number | null) => void;
+  editable?: boolean;
+  zoom?: number;
 };
 
 const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
@@ -25,7 +37,13 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
   selectedIndex,
   onSelect,
   onUpdate,
-  getDisplayLabel
+  getDisplayLabel,
+  suggestions = [],
+  hoveredSuggestion = null,
+  onAcceptSuggestion,
+  onHoverSuggestion,
+  editable = true,
+  zoom = 1
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const transformerRef = useRef<Konva.Transformer | null>(null);
@@ -72,7 +90,8 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
     const baseWidth = image?.width ?? fallbackWidth;
     const baseHeight = image?.height ?? fallbackHeight;
     const safeBaseWidth = Math.max(1, baseWidth);
-    const width = containerWidth || safeBaseWidth;
+    const safeZoom = Math.max(1, zoom);
+    const width = (containerWidth || safeBaseWidth) * safeZoom;
     const scale = width / safeBaseWidth;
     return {
       stageWidth: width,
@@ -82,12 +101,12 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       naturalWidth: safeBaseWidth,
       naturalHeight: Math.max(1, baseHeight),
     };
-  }, [image, containerWidth, imageWidth, imageHeight]);
+  }, [image, containerWidth, imageWidth, imageHeight, zoom]);
 
   useEffect(() => {
     const transformer = transformerRef.current;
     if (!transformer) return;
-    if (selectedIndex == null) {
+    if (!editable || selectedIndex == null) {
       transformer.nodes([]);
       return;
     }
@@ -96,7 +115,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       transformer.nodes([node]);
       transformer.getLayer()?.batchDraw();
     }
-  }, [selectedIndex, detections]);
+  }, [selectedIndex, detections, editable]);
 
   const handleDragEnd = (index: number, node: Konva.Rect) => {
     if (!naturalWidth || !naturalHeight) return;
@@ -189,12 +208,12 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
                       stroke={idx === selectedIndex ? "#2563eb" : "#ef4444"}
                       strokeWidth={idx === selectedIndex ? 3 : 2}
                       listening
-                      draggable
+                      draggable={editable}
                       onClick={() => onSelect(idx)}
                       onTap={() => onSelect(idx)}
-                      onDragEnd={(evt) => handleDragEnd(idx, evt.target as Konva.Rect)}
+                      onDragEnd={(evt) => editable && handleDragEnd(idx, evt.target as Konva.Rect)}
                       onTransformEnd={(evt) =>
-                        handleTransformEnd(idx, evt.target as Konva.Rect)
+                        editable && handleTransformEnd(idx, evt.target as Konva.Rect)
                       }
                       dragBoundFunc={(pos) => {
                         const limitedX = clamp(pos.x, 0, stageWidth - boxWidth);
@@ -224,27 +243,74 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
                   </React.Fragment>
                 );
               })}
-              <Transformer
-                ref={transformerRef}
-                rotateEnabled={false}
-                keepRatio={false}
-                enabledAnchors={[
-                  "top-left",
-                  "top-center",
-                  "top-right",
-                  "middle-left",
-                  "middle-right",
-                  "bottom-left",
-                  "bottom-center",
-                  "bottom-right"
-                ]}
-                boundBoxFunc={(oldBox, newBox) => {
-                  if (newBox.width < 10 || newBox.height < 10) {
-                    return oldBox;
-                  }
-                  return newBox;
-                }}
-              />
+              {suggestions.map((sug, sidx) => {
+                const [x1, y1, x2, y2] = sug.box_xyxy;
+                const boxWidth = ((x2 - x1) / naturalWidth) * stageWidth;
+                const boxHeight = ((y2 - y1) / naturalHeight) * stageHeight;
+                const posX = (x1 / naturalWidth) * stageWidth;
+                const posY = (y1 / naturalHeight) * stageHeight;
+                const active = hoveredSuggestion === sidx;
+                return (
+                  <React.Fragment key={`sug-${sidx}`}>
+                    <Rect
+                      x={posX}
+                      y={posY}
+                      width={boxWidth}
+                      height={boxHeight}
+                      stroke="#ff1493"
+                      strokeWidth={active ? 4 : 3}
+                      dash={[9, 5]}
+                      fill={active ? "rgba(255,20,147,0.22)" : "rgba(255,20,147,0.10)"}
+                      shadowColor="#000000"
+                      shadowBlur={2}
+                      shadowOpacity={0.5}
+                      listening
+                      onClick={() => onAcceptSuggestion?.(sidx)}
+                      onTap={() => onAcceptSuggestion?.(sidx)}
+                      onMouseEnter={() => onHoverSuggestion?.(sidx)}
+                      onMouseLeave={() => onHoverSuggestion?.(null)}
+                    />
+                    {sug.label && (
+                      <KonvaLabel
+                        x={Math.max(0, Math.min(stageWidth - 200, posX))}
+                        y={Math.max(0, posY - 22)}
+                        listening={false}
+                      >
+                        <Tag fill="#db2777" opacity={0.95} cornerRadius={4} />
+                        <Text
+                          text={`建議：${(getDisplayLabel ? getDisplayLabel(sug.label) : sug.label) || ""}`}
+                          padding={4}
+                          fill="#ffffff"
+                          fontSize={12}
+                        />
+                      </KonvaLabel>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+              {editable && (
+                <Transformer
+                  ref={transformerRef}
+                  rotateEnabled={false}
+                  keepRatio={false}
+                  enabledAnchors={[
+                    "top-left",
+                    "top-center",
+                    "top-right",
+                    "middle-left",
+                    "middle-right",
+                    "bottom-left",
+                    "bottom-center",
+                    "bottom-right"
+                  ]}
+                  boundBoxFunc={(oldBox, newBox) => {
+                    if (newBox.width < 10 || newBox.height < 10) {
+                      return oldBox;
+                    }
+                    return newBox;
+                  }}
+                />
+              )}
             </Layer>
           </Stage>
         )}

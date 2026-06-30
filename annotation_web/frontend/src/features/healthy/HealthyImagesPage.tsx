@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, CheckCheck, MessageSquareQuote } from "lucide-react";
 
@@ -16,7 +16,12 @@ const apiBase = baseUrl.replace(/\/$/, "");
 
 const HealthyImagesPage: React.FC = () => {
   const navigate = useNavigate();
-  const { dataset } = useDataset();
+  const { dataset = null } = useParams();
+  const { setDataset } = useDataset();
+  // 同步進 context，讓 /annotated、/commented 等共用 context 的頁面照常運作。
+  useEffect(() => {
+    if (dataset) setDataset(dataset);
+  }, [dataset, setDataset]);
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["healthy_images", dataset],
@@ -43,7 +48,7 @@ const HealthyImagesPage: React.FC = () => {
       imageUrl: `${apiBase}/api/datasets/${encodeURIComponent(
         dataset || ""
       )}/healthy_images/${encodeURIComponent(filename)}`,
-      onOpen: () => navigate(`/healthy/${index + 1}`),
+      onOpen: () => navigate(`/healthy/${dataset}/${index + 1}`),
       fields: {
         index: index + 1,
       },
@@ -62,21 +67,21 @@ const HealthyImagesPage: React.FC = () => {
         </div>
         <div className="flex gap-2">
           <button
-            onClick={() => navigate("/annotated")}
+            onClick={() => navigate(`/annotated/${dataset}`)}
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <CheckCheck className="h-4 w-4" />
             查看提交
           </button>
           <button
-            onClick={() => navigate("/commented")}
+            onClick={() => navigate(`/commented/${dataset}`)}
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <MessageSquareQuote className="h-4 w-4" />
             查看註解
           </button>
           <button
-            onClick={() => navigate("/annotate")}
+            onClick={() => navigate(`/annotate/${dataset}`)}
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <ArrowLeft className="h-4 w-4" />

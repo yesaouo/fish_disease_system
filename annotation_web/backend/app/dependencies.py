@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import Header, HTTPException, status
 
 from .config import Settings, get_settings
-from .services.auth import is_key_valid
+from .services.auth import is_key_valid, resolve_role
 
 
 def get_app_settings() -> Settings:
@@ -27,3 +27,40 @@ def require_api_key(
     if not is_key_valid(token, settings):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_token")
     return token
+
+
+def get_role(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> str:
+    """Resolve the caller's tier from the Bearer token.
+
+    Returns 'guest' (no/invalid token), 'editor', or 'expert'. Never raises —
+    read-only endpoints depend on this to allow anonymous access.
+    """
+    if not authorization:
+        return "guest"
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return "guest"
+    role = resolve_role(parts[1].strip(), get_settings())
+    return role or "guest"
+
+
+def require_editor(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> str:
+    """Require an editor- or expert-level key. Returns the resolved role."""
+    role = get_role(authorization)
+    if role not in ("editor", "expert"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="editor_required")
+    return role
+
+
+def require_expert(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> str:
+    """Require an expert-level key. Returns the resolved role ('expert')."""
+    role = get_role(authorization)
+    if role != "expert":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="expert_required")
+    return role

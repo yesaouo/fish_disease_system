@@ -131,6 +131,13 @@ export type ImageListResponse = {
 export type LoginResponse = {
   token: string;
   name: string;
+  role: "expert" | "editor";
+};
+
+export type DatasetInfo = {
+  name: string;
+  locked: boolean;
+  status?: string | null;
 };
 
 export type LabelMapZhResponse = {
@@ -167,6 +174,10 @@ export type DiagnoseRetrieved = {
   similarity: number;
   exists: boolean;
   image: string;
+  // Provenance back to the source annotation dataset (null for folder-scanned
+  // healthy negatives that have no annotation task).
+  source_dataset?: string | null;
+  source_task_id?: string | null;
 };
 
 export type DiagnoseCause = {

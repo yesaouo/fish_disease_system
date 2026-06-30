@@ -119,6 +119,8 @@ def _serialize(res: dict, pipe, meta: dict) -> dict:
             "similarity": float(r["similarity"]),
             "exists": r.get("image_path") is not None,
             "image": _b64(img),
+            "source_dataset": r.get("source_dataset"),
+            "source_task_id": r.get("source_task_id"),
         })
 
     n = res["n_lesions"]

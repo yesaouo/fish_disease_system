@@ -9,18 +9,23 @@ import {
 import { login as apiLogin, setAuthToken } from "../api/client";
 import type { LoginResponse } from "../api/types";
 
+export type Role = "guest" | "editor" | "expert";
+
 type AuthContextValue = {
   name: string | null;
   token: string | null;
+  role: Role | null; // null = not authenticated (show login)
   isAuthenticated: boolean;
   isExpert: boolean;
-  login: (name: string, isExpert: boolean, apiKey: string) => Promise<LoginResponse>;
+  canEdit: boolean; // editor or expert
+  login: (name: string, apiKey: string) => Promise<LoginResponse>;
+  continueAsGuest: () => void;
   logout: () => void;
 };
 
 const NAME_KEY = "annotatorName";
 const TOKEN_KEY = "annotatorToken";
-const EXPERT_KEY = "annotatorIsExpert";
+const ROLE_KEY = "annotatorRole";
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
@@ -33,46 +38,59 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   const [token, setToken] = useState<string | null>(() => {
     return localStorage.getItem(TOKEN_KEY);
   });
-  const [isExpert, setIsExpert] = useState<boolean>(() => {
-    const raw = localStorage.getItem(EXPERT_KEY);
-    if (raw == null) return true;
-    return raw === "true";
+  const [role, setRole] = useState<Role | null>(() => {
+    const raw = localStorage.getItem(ROLE_KEY);
+    if (raw === "guest" || raw === "editor" || raw === "expert") return raw;
+    return null;
   });
 
   useEffect(() => {
     setAuthToken(token);
   }, [token]);
 
-  const login = useCallback(async (displayName: string, expert: boolean, apiKey: string) => {
-    const response = await apiLogin(displayName, expert, apiKey);
+  const login = useCallback(async (displayName: string, apiKey: string) => {
+    const response = await apiLogin(displayName, apiKey);
+    const resolvedRole: Role = response.role === "editor" ? "editor" : "expert";
     localStorage.setItem(NAME_KEY, response.name);
     localStorage.setItem(TOKEN_KEY, response.token);
-    localStorage.setItem(EXPERT_KEY, String(expert));
+    localStorage.setItem(ROLE_KEY, resolvedRole);
     setName(response.name);
     setToken(response.token);
-    setIsExpert(expert);
+    setRole(resolvedRole);
     return response;
+  }, []);
+
+  const continueAsGuest = useCallback(() => {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(NAME_KEY);
+    localStorage.setItem(ROLE_KEY, "guest");
+    setToken(null);
+    setName(null);
+    setRole("guest");
   }, []);
 
   const logout = useCallback(() => {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(NAME_KEY);
-    localStorage.removeItem(EXPERT_KEY);
+    localStorage.removeItem(ROLE_KEY);
     setToken(null);
     setName(null);
-    setIsExpert(true);
+    setRole(null);
   }, []);
 
   const value = useMemo<AuthContextValue>(
     () => ({
       name,
       token,
-      isAuthenticated: Boolean(name && token),
-      isExpert,
+      role,
+      isAuthenticated: role != null,
+      isExpert: role === "expert",
+      canEdit: role === "editor" || role === "expert",
       login,
+      continueAsGuest,
       logout
     }),
-    [name, token, isExpert, login, logout]
+    [name, token, role, login, continueAsGuest, logout]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

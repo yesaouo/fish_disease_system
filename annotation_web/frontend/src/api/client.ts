@@ -14,7 +14,9 @@ import type {
   SaveTaskRequest,
   SaveTaskResponse,
   AnnotatedListResponse,
-  CommentedListResponse
+  CommentedListResponse,
+  DatasetInfo,
+  TaskDocument
 } from "./types";
 
 const base = import.meta.env.BASE_URL || "/"; // always ends with "/" in Vite
@@ -56,14 +58,42 @@ http.interceptors.request.use((config) => {
   return config;
 });
 
-export const login = async (name: string, isExpert: boolean, apiKey: string): Promise<LoginResponse> => {
-  const { data } = await http.post<LoginResponse>("/login", { name, is_expert: isExpert, api_key: apiKey });
+export const login = async (name: string, apiKey: string): Promise<LoginResponse> => {
+  const { data } = await http.post<LoginResponse>("/login", { name, api_key: apiKey });
   return data;
 };
 
-export const fetchDatasets = async (): Promise<string[]> => {
-  const { data } = await http.get<{ datasets: string[] }>("/datasets");
+export const fetchDatasets = async (): Promise<DatasetInfo[]> => {
+  const { data } = await http.get<{ datasets: DatasetInfo[] }>("/datasets");
   return data.datasets;
+};
+
+export const deleteDatasetTask = async (
+  dataset: string,
+  taskId: string
+): Promise<{ ok: boolean; dataset_removed?: boolean }> => {
+  const { data } = await http.delete<{ ok: boolean; dataset_removed?: boolean }>(
+    `/datasets/${encodeURIComponent(dataset)}/tasks/${encodeURIComponent(taskId)}`
+  );
+  return data;
+};
+
+export const importDiagnosisTask = async (
+  dataset: string,
+  imageFile: File,
+  doc: TaskDocument,
+  editorName: string
+): Promise<{ ok: boolean; task_id: string; index: number; dataset: string; is_healthy: boolean }> => {
+  const form = new FormData();
+  form.append("image", imageFile);
+  form.append("doc_json", JSON.stringify(doc));
+  form.append("editor_name", editorName);
+  const { data } = await http.post(
+    `/datasets/${encodeURIComponent(dataset)}/tasks/import`,
+    form,
+    { headers: { "Content-Type": "multipart/form-data" } }
+  );
+  return data;
 };
 
 export const fetchClasses = async (dataset: string): Promise<string[]> => {
@@ -171,6 +201,45 @@ export const fetchCommentedList = async (
     `/datasets/${encodeURIComponent(dataset)}/commented`
   );
   return data;
+};
+
+// 全域 symptoms（classes + zh 標籤 + 外觀敘述選項），供診斷草稿編輯器使用
+// （目標資料集可能尚未建立 → 不能用需要資料夾存在的 dataset 範圍端點）。
+export const fetchGlobalSymptoms = async (): Promise<{
+  classes: string[];
+  label_map_zh: Record<string, string>;
+  evidence_options_zh: Record<string, string[]>;
+}> => {
+  const { data } = await http.get("/symptoms");
+  return data;
+};
+
+// 取某案例的整體描述＋病因（供相似案例描述建議清單）。
+export const fetchTaskSummary = async (
+  dataset: string,
+  taskId: string
+): Promise<{ overall: { colloquial_zh: string; medical_zh: string }; global_causes_zh: string[] }> => {
+  const { data } = await http.get(
+    `/datasets/${encodeURIComponent(dataset)}/tasks/${encodeURIComponent(taskId)}/summary`
+  );
+  return data;
+};
+
+// 由 task_id（影像 stem）解析到資料集 /images 清單中的 1-based index（/annotate/:index 用）。
+// 找不到（如資料夾掃描的健康負樣本）回 null。
+export const locateTask = async (
+  dataset: string,
+  taskId: string
+): Promise<number | null> => {
+  try {
+    const { data } = await http.get<{ index: number }>(
+      `/datasets/${encodeURIComponent(dataset)}/task_locator`,
+      { params: { task_id: taskId } }
+    );
+    return data.index;
+  } catch {
+    return null;
+  }
 };
 
 export const fetchHealthyImagesList = async (

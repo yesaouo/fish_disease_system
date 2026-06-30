@@ -1,10 +1,19 @@
 import React, { useMemo, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Upload, Stethoscope, Loader2, Download } from "lucide-react";
-import { diagnose, downloadReportPdf } from "../../api/client";
-import type { DiagnoseResponse } from "../../api/types";
+import { Home, Upload, Stethoscope, Loader2, Download, FolderPlus } from "lucide-react";
+import {
+  diagnose,
+  downloadReportPdf,
+  locateTask,
+  fetchDatasets,
+  fetchGlobalSymptoms,
+  fetchTaskSummary
+} from "../../api/client";
+import type { DiagnoseResponse, DatasetInfo } from "../../api/types";
+import { reportToTaskDoc, invertLabelMap } from "../../lib/taskUtils";
 import { useAuth } from "../../context/AuthContext";
+import { useDataset } from "../../context/DatasetContext";
 import ProjectHeader from "../../components/ProjectHeader";
 
 const MODE_LABELS: Record<string, string> = {
@@ -30,7 +39,96 @@ const Card: React.FC<React.PropsWithChildren<{ title: string; sub?: string; clas
 
 const DiagnosisPage: React.FC = () => {
   const navigate = useNavigate();
-  const { name } = useAuth();
+  const { name, isExpert } = useAuth();
+  const { setClasses } = useDataset();
+
+  // 送到資料集編輯（專家）：選可寫資料集或新增 → 帶報告草稿進標註編輯器。
+  const [sendOpen, setSendOpen] = useState(false);
+  const [writable, setWritable] = useState<DatasetInfo[]>([]);
+  const [sendBusy, setSendBusy] = useState(false);
+  const [sendErr, setSendErr] = useState<string | null>(null);
+  const [newName, setNewName] = useState("");
+
+  // 點相似案例 → 解析來源資料集中的 index → 跳到該案例的標註詳細頁（訪客唯讀可看）。
+  const openCase = async (r: DiagnoseResponse["retrieved"][number]) => {
+    if (!r.source_dataset || !r.source_task_id) return;
+    const index = await locateTask(r.source_dataset, r.source_task_id);
+    if (index == null) {
+      window.alert("找不到此相似案例的來源標註（可能為健康負樣本）。");
+      return;
+    }
+    setClasses([]); // 讓標註頁依新資料集重新載入類別
+    navigate(`/annotate/${r.source_dataset}/${index}`);
+  };
+
+  const openSend = async () => {
+    setSendErr(null);
+    try {
+      const all = await fetchDatasets();
+      setWritable(all.filter((d) => !d.locked));
+    } catch {
+      setWritable([]);
+    }
+    setSendOpen(true);
+  };
+
+  // 帶報告草稿進標註編輯器。目標資料集可能尚未建立（提交時才落地），故類別/標籤
+  // 一律用全域 symptoms；另外撈前幾個相似案例的整體描述當建議、預設帶最相似的。
+  const goToEditor = async (datasetName: string) => {
+    if (!mutation.data || !file) return;
+    setSendBusy(true);
+    setSendErr(null);
+    try {
+      const g = await fetchGlobalSymptoms();
+      const zhToEn = invertLabelMap(g.label_map_zh);
+      const doc = reportToTaskDoc(mutation.data, zhToEn);
+      doc.dataset = datasetName;
+
+      const cards = mutation.data.retrieved
+        .filter((r) => r.source_dataset && r.source_task_id)
+        .slice(0, 3);
+      const overallSuggestions: { source: string; colloquial: string; medical: string }[] = [];
+      for (const r of cards) {
+        try {
+          const s = await fetchTaskSummary(r.source_dataset!, r.source_task_id!);
+          if (s.overall?.colloquial_zh || s.overall?.medical_zh) {
+            overallSuggestions.push({
+              source: `相似案例 #${r.rank}（${r.source_dataset}）`,
+              colloquial: s.overall.colloquial_zh,
+              medical: s.overall.medical_zh
+            });
+          }
+        } catch {
+          /* 撈不到就略過該案例 */
+        }
+      }
+      if (overallSuggestions.length > 0) {
+        doc.overall = {
+          colloquial_zh: overallSuggestions[0].colloquial,
+          medical_zh: overallSuggestions[0].medical
+        };
+      }
+
+      setClasses([]);
+      navigate(`/annotate/${datasetName}/new`, {
+        state: { draft: true, dataset: datasetName, imageFile: file, doc, overallSuggestions }
+      });
+    } catch {
+      setSendErr("開啟編輯器失敗，請稍後再試。");
+      setSendBusy(false);
+    }
+  };
+
+  // 新資料集：不在此即建（提交才落地），僅做名稱格式檢查後進編輯器。
+  const createAndGo = async () => {
+    const nm = newName.trim();
+    if (!nm) return;
+    if (!/^[A-Za-z0-9_-]+$/.test(nm)) {
+      setSendErr("資料集名稱僅能使用英文、數字、底線(_)、連字號(-)，不可中文或空白。");
+      return;
+    }
+    await goToEditor(nm);
+  };
 
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -67,7 +165,7 @@ const DiagnosisPage: React.FC = () => {
     <div className="mx-auto flex min-h-screen max-w-6xl flex-col gap-6 px-4 py-6 sm:px-6 sm:py-10">
       <ProjectHeader />
 
-      <header className="flex items-center justify-between">
+      <header className="flex items-center justify-between gap-3">
         <div>
           <h1 className="flex items-center gap-2 text-xl font-semibold text-slate-800 sm:text-2xl">
             <Stethoscope className="h-6 w-6 text-sky-600" /> AI 魚病診斷報告
@@ -76,10 +174,12 @@ const DiagnosisPage: React.FC = () => {
         </div>
         <button
           type="button"
-          onClick={() => navigate("/datasets")}
-          className="inline-flex items-center gap-1 rounded border border-slate-200 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 print:hidden"
+          onClick={() => navigate("/home")}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm hover:bg-slate-50 print:hidden"
+          title="返回首頁"
+          aria-label="返回首頁"
         >
-          <ArrowLeft className="h-4 w-4" /> 返回
+          <Home className="h-4 w-4" /> <span className="hidden sm:inline">返回首頁</span>
         </button>
       </header>
 
@@ -176,7 +276,65 @@ const DiagnosisPage: React.FC = () => {
           selectedCause={selectedCause}
           setSelectedCause={setSelectedCause}
           cause={cause}
+          canSend={isExpert}
+          onSendToDataset={openSend}
+          onOpenCase={openCase}
         />
+      )}
+
+      {/* 送到資料集編輯（專家）：選現有可寫資料集或新增 */}
+      {sendOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
+            <h3 className="mb-1 text-lg font-semibold text-slate-800">送到資料集編輯</h3>
+            <p className="mb-3 text-xs text-slate-500">
+              診斷結果會帶入標註編輯器，編輯完成後再提交存入。官方資料集已鎖定，無法選取。
+            </p>
+            {sendErr && (
+              <div className="mb-3 rounded bg-red-50 px-3 py-2 text-sm text-red-600">{sendErr}</div>
+            )}
+            <div className="mb-3 max-h-48 overflow-y-auto rounded border border-slate-200">
+              {writable.length === 0 ? (
+                <p className="px-3 py-3 text-sm text-slate-400">尚無可寫資料集，請於下方新增。</p>
+              ) : (
+                writable.map((d) => (
+                  <button
+                    key={d.name}
+                    disabled={sendBusy}
+                    onClick={() => goToEditor(d.name)}
+                    className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-sky-50 disabled:opacity-50"
+                  >
+                    <span className="text-slate-700">{d.name}</span>
+                  </button>
+                ))
+              )}
+            </div>
+            <div className="mb-4 flex gap-2">
+              <input
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="新資料集名稱（英數字 _ -）"
+                className="flex-1 rounded border border-slate-300 px-3 py-2 text-sm"
+              />
+              <button
+                disabled={sendBusy || !newName.trim()}
+                onClick={createAndGo}
+                className="inline-flex items-center gap-1 rounded bg-sky-600 px-3 py-2 text-sm text-white hover:bg-sky-700 disabled:bg-sky-300"
+              >
+                <FolderPlus className="h-4 w-4" /> 新增並編輯
+              </button>
+            </div>
+            <div className="flex justify-end">
+              <button
+                onClick={() => setSendOpen(false)}
+                disabled={sendBusy}
+                className="rounded border border-slate-200 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -188,7 +346,10 @@ const Report: React.FC<{
   selectedCause: number;
   setSelectedCause: (i: number) => void;
   cause: DiagnoseResponse["causes"][number] | null;
-}> = ({ report, previewUrl, selectedCause, setSelectedCause, cause }) => {
+  canSend: boolean;
+  onSendToDataset: () => void;
+  onOpenCase: (r: DiagnoseResponse["retrieved"][number]) => void;
+}> = ({ report, previewUrl, selectedCause, setSelectedCause, cause, canSend, onSendToDataset, onOpenCase }) => {
   const m = report.meta;
   const [bgMode, setBgMode] = useState<"original" | "heatmap">("original");
   const [showBoxes, setShowBoxes] = useState(true);
@@ -219,15 +380,27 @@ const Report: React.FC<{
   return (
     <>
       <div className="flex flex-col items-end gap-1">
-        <button
-          type="button"
-          onClick={onDownloadPdf}
-          disabled={pdfPending}
-          className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-600 shadow-sm hover:bg-slate-100 disabled:cursor-not-allowed disabled:text-slate-300"
-        >
-          {pdfPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-          下載診斷報告
-        </button>
+        <div className="flex items-center gap-2">
+          {canSend && (
+            <button
+              type="button"
+              onClick={onSendToDataset}
+              className="inline-flex items-center gap-1 rounded border border-sky-200 bg-sky-50 px-3 py-1.5 text-sm text-sky-700 shadow-sm hover:bg-sky-100"
+            >
+              <FolderPlus className="h-4 w-4" />
+              送到資料集編輯
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onDownloadPdf}
+            disabled={pdfPending}
+            className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-600 shadow-sm hover:bg-slate-100 disabled:cursor-not-allowed disabled:text-slate-300"
+          >
+            {pdfPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+            下載診斷報告
+          </button>
+        </div>
         {pdfError && <p className="text-xs text-red-600">{pdfError}</p>}
       </div>
       {/* 基本資料 */}
@@ -379,7 +552,7 @@ const Report: React.FC<{
                     {/* 手機：手風琴就地展開詳細（電腦改用右欄） */}
                     {i === selectedCause && (
                       <div className="mt-2 md:hidden">
-                        <CauseDetail cause={c} retrieved={report.retrieved} />
+                        <CauseDetail cause={c} retrieved={report.retrieved} onOpenCase={onOpenCase} />
                       </div>
                     )}
                   </li>
@@ -390,42 +563,13 @@ const Report: React.FC<{
             {/* 電腦：右側詳細欄 */}
             <Card title="病因詳細" sub="各證據貢獻" className="hidden md:block">
               {cause ? (
-                <CauseDetail cause={cause} retrieved={report.retrieved} />
+                <CauseDetail cause={cause} retrieved={report.retrieved} onOpenCase={onOpenCase} />
               ) : (
                 <p className="py-2 text-sm text-slate-400">點左側病因，查看各證據的貢獻。</p>
               )}
             </Card>
           </div>
 
-          {/* 處置建議 / 專家覆核 — 佔位（未來工作） */}
-          <Card title="處置建議與專家覆核" sub="保留欄位 · 未來 Human-In-The-Loop">
-            <div className="grid gap-4 md:grid-cols-2">
-              <div>
-                <p className="mb-1 text-sm font-medium text-slate-600">處置建議</p>
-                <textarea
-                  disabled
-                  rows={3}
-                  placeholder="（保留欄位，待專家填寫）"
-                  className="w-full rounded border border-dashed border-slate-300 bg-slate-50 px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <p className="mb-1 text-sm font-medium text-slate-600">專家覆核</p>
-                <div className="flex flex-wrap gap-2">
-                  {["接受", "修改", "補充", "退回"].map((b) => (
-                    <button
-                      key={b}
-                      disabled
-                      className="cursor-not-allowed rounded border border-dashed border-slate-300 bg-slate-50 px-3 py-1.5 text-sm text-slate-400"
-                    >
-                      {b}
-                    </button>
-                  ))}
-                </div>
-                <p className="mt-2 text-xs text-slate-400">此區為論文未來工作（回寫資料庫與再訓練閉環），目前僅保留欄位。</p>
-              </div>
-            </div>
-          </Card>
         </div>
       )}
 
@@ -486,7 +630,8 @@ const Report: React.FC<{
 const CauseDetail: React.FC<{
   cause: DiagnoseResponse["causes"][number];
   retrieved: DiagnoseResponse["retrieved"];
-}> = ({ cause, retrieved }) => {
+  onOpenCase: (r: DiagnoseResponse["retrieved"][number]) => void;
+}> = ({ cause, retrieved, onOpenCase }) => {
   const supportCases = cause.support_cases
     .map((rk) => retrieved.find((r) => r.rank === rk))
     .filter((r): r is DiagnoseResponse["retrieved"][number] => !!r);
@@ -502,19 +647,27 @@ const CauseDetail: React.FC<{
       </div>
       {supportCases.length > 0 && (
         <div className="min-w-0">
-          <p className="mb-1 text-xs text-slate-400">此病因來自以下相似案例</p>
+          <p className="mb-1 text-xs text-slate-400">此病因來自以下相似案例（點圖可查看原始標註）</p>
           <div className="flex gap-2 overflow-x-auto pb-1">
-            {supportCases.map((r) => (
-              <figure
-                key={r.rank}
-                className="w-28 shrink-0 overflow-hidden rounded-lg border border-slate-100"
-              >
-                <img src={r.image} alt={r.file_name} className="h-20 w-28 object-cover" />
-                <figcaption className="px-1 py-0.5 text-center text-[10px] text-slate-500">
-                  相似度 {r.similarity.toFixed(3)}
-                </figcaption>
-              </figure>
-            ))}
+            {supportCases.map((r) => {
+              const linkable = !!(r.source_dataset && r.source_task_id);
+              return (
+                <figure
+                  key={r.rank}
+                  onClick={linkable ? () => onOpenCase(r) : undefined}
+                  className={
+                    "w-28 shrink-0 overflow-hidden rounded-lg border border-slate-100" +
+                    (linkable ? " cursor-pointer hover:border-sky-400 hover:shadow" : "")
+                  }
+                  title={linkable ? `查看 ${r.source_dataset} 的原始標註` : undefined}
+                >
+                  <img src={r.image} alt={r.file_name} className="h-20 w-28 object-cover" />
+                  <figcaption className="px-1 py-0.5 text-center text-[10px] text-slate-500">
+                    相似度 {r.similarity.toFixed(3)}
+                  </figcaption>
+                </figure>
+              );
+            })}
           </div>
         </div>
       )}

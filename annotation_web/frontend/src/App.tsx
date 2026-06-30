@@ -1,7 +1,8 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider, useAuth } from "./context/AuthContext";
-import { DatasetProvider, useDataset } from "./context/DatasetContext";
+import { DatasetProvider } from "./context/DatasetContext";
 import LoginPage from "./features/auth/LoginPage";
+import HomePage from "./features/home/HomePage";
 import DatasetPickerPage from "./features/datasets/DatasetPickerPage";
 import AnnotationPage from "./features/annotation/AnnotationPage";
 import AdminDashboard from "./features/admin/AdminDashboard";
@@ -21,11 +22,11 @@ const RequireAuth: React.FC<{ children: React.ReactElement }> = ({
   return children;
 };
 
-const RequireDataset: React.FC<{ children: React.ReactElement }> = ({
+const RequireEditor: React.FC<{ children: React.ReactElement }> = ({
   children
 }) => {
-  const { dataset } = useDataset();
-  if (!dataset) {
+  const { canEdit } = useAuth();
+  if (!canEdit) {
     return <Navigate to="/datasets" replace />;
   }
   return children;
@@ -33,17 +34,21 @@ const RequireDataset: React.FC<{ children: React.ReactElement }> = ({
 
 const AppRoutes = () => {
   const { isAuthenticated } = useAuth();
-  const { dataset } = useDataset();
-  const defaultPath = isAuthenticated
-    ? dataset
-      ? "/annotate"
-      : "/datasets"
-    : "/login";
+  // 獨立首頁為登入後的落地頁；不再依 dataset 自動跳進標註。
+  const defaultPath = isAuthenticated ? "/home" : "/login";
 
   return (
     <Routes>
       <Route path="/" element={<Navigate to={defaultPath} replace />} />
       <Route path="/login" element={<LoginPage />} />
+      <Route
+        path="/home"
+        element={
+          <RequireAuth>
+            <HomePage />
+          </RequireAuth>
+        }
+      />
       <Route
         path="/datasets"
         element={
@@ -53,62 +58,60 @@ const AppRoutes = () => {
         }
       />
       <Route
-        path="/annotate"
+        path="/annotate/:dataset/new"
         element={
           <RequireAuth>
-            <RequireDataset>
+            <RequireEditor>
               <AnnotationPage />
-            </RequireDataset>
+            </RequireEditor>
           </RequireAuth>
         }
       />
       <Route
-        path="/annotate/:index"
+        path="/annotate/:dataset"
         element={
           <RequireAuth>
-            <RequireDataset>
-              <AnnotationPage />
-            </RequireDataset>
+            <AnnotationPage />
           </RequireAuth>
         }
       />
       <Route
-        path="/annotated"
+        path="/annotate/:dataset/:index"
         element={
           <RequireAuth>
-            <RequireDataset>
-              <AnnotatedListPage />
-            </RequireDataset>
+            <AnnotationPage />
           </RequireAuth>
         }
       />
       <Route
-        path="/commented"
+        path="/annotated/:dataset"
         element={
           <RequireAuth>
-            <RequireDataset>
-              <CommentedListPage />
-            </RequireDataset>
+            <AnnotatedListPage />
           </RequireAuth>
         }
       />
       <Route
-        path="/healthy"
+        path="/commented/:dataset"
         element={
           <RequireAuth>
-            <RequireDataset>
-              <HealthyImagesPage />
-            </RequireDataset>
+            <CommentedListPage />
           </RequireAuth>
         }
       />
       <Route
-        path="/healthy/:index"
+        path="/healthy/:dataset"
         element={
           <RequireAuth>
-            <RequireDataset>
-              <HealthyAnnotationPage />
-            </RequireDataset>
+            <HealthyImagesPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/healthy/:dataset/:index"
+        element={
+          <RequireAuth>
+            <HealthyAnnotationPage />
           </RequireAuth>
         }
       />
@@ -124,7 +127,9 @@ const AppRoutes = () => {
         path="/admin"
         element={
           <RequireAuth>
-            <AdminDashboard />
+            <RequireEditor>
+              <AdminDashboard />
+            </RequireEditor>
           </RequireAuth>
         }
       />

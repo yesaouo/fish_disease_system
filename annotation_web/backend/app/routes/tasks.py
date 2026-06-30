@@ -22,10 +22,10 @@ router = APIRouter(prefix="/api", tags=["tasks"])
 def get_next_task(
     body: NextTaskRequest,
     settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
+    role: str = Depends(dependencies.get_role),
 ) -> NextTaskResponse:
     editor_name = body.editor_name or "anonymous"
-    return tasks_service.select_next_task(body.dataset, editor_name, body.is_expert, settings)
+    return tasks_service.select_next_task(body.dataset, editor_name, role == "expert", settings)
 
 
 @router.post("/tasks/{task_id}/submit", response_model=SubmitTaskResponse)
@@ -33,7 +33,7 @@ def submit_task(
     task_id: str,
     request: SubmitTaskRequest,
     settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
+    role: str = Depends(dependencies.require_editor),
 ) -> SubmitTaskResponse:
     editor_name = request.editor_name
     dataset = request.full_json.dataset
@@ -42,7 +42,7 @@ def submit_task(
         task_id=task_id,
         incoming=request.full_json,
         editor_name=editor_name,
-        is_expert=request.is_expert,
+        is_expert=role == "expert",
         settings=settings,
     )
     return SubmitTaskResponse(ok=True, version=new_version)
@@ -52,26 +52,26 @@ def submit_task(
 def get_task_by_index(
     body: TaskByIndexRequest,
     settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
+    role: str = Depends(dependencies.get_role),
 ) -> NextTaskResponse:
     editor_name = body.editor_name or "anonymous"
-    return tasks_service.get_task_by_index(body.dataset, body.index, editor_name, body.is_expert, settings)
+    return tasks_service.get_task_by_index(body.dataset, body.index, editor_name, role == "expert", settings)
 
 @router.post("/healthy_tasks/by_index", response_model=NextTaskResponse)
 def get_healthy_task_by_index(
     body: TaskByIndexRequest,
     settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
+    role: str = Depends(dependencies.get_role),
 ) -> NextTaskResponse:
     editor_name = body.editor_name or "anonymous"
-    return tasks_service.get_healthy_task_by_index(body.dataset, body.index, editor_name, body.is_expert, settings)
+    return tasks_service.get_healthy_task_by_index(body.dataset, body.index, editor_name, role == "expert", settings)
 
 @router.post("/tasks/{task_id}/save", response_model=SaveTaskResponse)
 def save_task(
     task_id: str,
     request: SaveTaskRequest,
     settings: Settings = Depends(dependencies.get_app_settings),
-    _token: str = Depends(dependencies.require_api_key),
+    role: str = Depends(dependencies.require_editor),
 ) -> SaveTaskResponse:
     editor_name = request.editor_name
     dataset = request.full_json.dataset
@@ -80,7 +80,7 @@ def save_task(
         task_id=task_id,
         incoming=request.full_json,
         editor_name=editor_name,
-        is_expert=request.is_expert,
+        is_expert=role == "expert",
         settings=settings,
     )
     return SaveTaskResponse(ok=True, version=new_version)

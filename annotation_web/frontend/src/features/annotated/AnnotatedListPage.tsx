@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Images, MessageSquareQuote } from "lucide-react";
 
@@ -16,7 +16,11 @@ const apiBase = baseUrl.replace(/\/$/, "");
 
 const AnnotatedListPage: React.FC = () => {
   const navigate = useNavigate();
-  const { dataset } = useDataset();
+  const { dataset = null } = useParams();
+  const { setDataset } = useDataset();
+  useEffect(() => {
+    if (dataset) setDataset(dataset);
+  }, [dataset, setDataset]);
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["annotated", dataset],
@@ -45,7 +49,7 @@ const AnnotatedListPage: React.FC = () => {
       imageUrl: `${apiBase}/api/datasets/${encodeURIComponent(
         dataset || item.dataset
       )}/images/${encodeURIComponent(item.image_filename)}`,
-      onOpen: () => navigate(`/annotate/${item.index}`),
+      onOpen: () => navigate(`/annotate/${item.dataset}/${item.index}`),
       fields: {
         index: item.index,
         updated_at: new Date(item.last_modified_at).toLocaleString(),
@@ -68,21 +72,21 @@ const AnnotatedListPage: React.FC = () => {
         </div>
         <div className="flex gap-2">
           <button
-            onClick={() => navigate("/commented")}
+            onClick={() => navigate(`/commented/${dataset}`)}
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <MessageSquareQuote className="h-4 w-4" />
             查看註解
           </button>
           <button
-            onClick={() => navigate("/healthy")}
+            onClick={() => navigate(`/healthy/${dataset}`)}
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <Images className="h-4 w-4" />
             健康影像
           </button>
           <button
-            onClick={() => navigate("/annotate")}
+            onClick={() => navigate(`/annotate/${dataset}`)}
             className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
           >
             <ArrowLeft className="h-4 w-4" />
