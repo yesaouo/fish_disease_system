@@ -488,6 +488,12 @@ Notes：
 Command：
 
 ```bash
+OLD_ART=data/processed/2026-xx-xx_xxxx/artifacts
+NEW_ART=data/processed/2026-xx-xx_xxxx/artifacts
+
+cp $OLD_ART/cause_clusters_llm.json.judge_cache.json \
+   $NEW_ART/cause_clusters_llm.json.judge_cache.json
+
 ollama serve
 ollama pull <model>     # e.g. gemma4:26b
 
@@ -711,6 +717,42 @@ $PY -m diagnosis_model.cause_inference.train_ceah \
     --attribution_mode softmax --scoring_mode multiplicative \
     --lambda_sparsity 0.0 --text_dropout 0.5
 ```
+
+---
+
+### B6. 評估表 14（整合式架構與區域門控消融，三列一次算完）
+
+Purpose：一支腳本同時算出分離式基準 / OAVLE-Hard / OAVLE 三列的 Recall@10 與群集 Recall@10
+（同一協定：學習式聚合單一案例向量 → bank 檢索 → CEAM，cascade γ=0），對應論文表 14
+（`tab:integration_ablation`）與 `paper_tables.md` Table I1。
+
+Depends on：
+
+- Step 8/9：`encoder_grod_soft` / `ceah_grod_soft` / `bank_z_soft.pt`（soft 主列 + hard 列共用）
+- Step 6：`case_db_jointDistRawP` + `soft_inputs`（hard 二值化來源）+ `soft_inputs_gated`（soft 查詢）
+- B1–B5：`case_db_base` / `encoder_base` / `ceah_base`（分離式基準列）
+- `data/processed/current/thresholds.json`（`display_thresh` 硬閘二值化）
+
+Command：
+
+```bash
+# 表 14 生產操作點 k=3；k=20 對照另跑一次
+$PY -m diagnosis_model.grod.eval_integration_ablation --top_k_cases 3
+$PY -m diagnosis_model.grod.eval_integration_ablation --top_k_cases 20
+```
+
+Produces：
+
+- `$ART/models/ceah_grod_soft/integration_ablation{,_k3}/metrics.json`
+
+Gotchas：
+
+- **soft 列用 gated `soft_inputs_gated`（非 raw `soft_inputs`）**：`bank_z_soft` 是 gated 訓出、生產
+  `GrodSoftPipeline` 也以 `w_gate` 查詢，gated-query vs gated-bank 才自洽。Table H6 k-sweep 舊指令
+  用 raw `soft_inputs`（query/bank 不匹配、非生產設定），兩者 k=3 差約 sem 1.6pp / 群集 1.9pp。
+- **hard 列不另建 bank**：二值化 raw objectness（`sigmoid(obj) > display_thresh`）當查詢，沿用同一
+  gated `bank_z_soft`（demo hard 模式的 cross-feed 硬閘退化，與 `pipeline.py` `GrodPipeline` 一致）。
+- 參數量／延遲欄不出自本 eval（見第 §efficiency 量測）；本步只算兩個 Recall 指標。
 
 ---
 

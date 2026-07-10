@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 
 from .. import dependencies
 from ..config import Settings
@@ -13,6 +13,7 @@ from ..models import (
     SaveTaskRequest,
     SaveTaskResponse,
 )
+from ..services import bank_sync
 from ..services import tasks as tasks_service
 
 router = APIRouter(prefix="/api", tags=["tasks"])
@@ -32,6 +33,7 @@ def get_next_task(
 def submit_task(
     task_id: str,
     request: SubmitTaskRequest,
+    background_tasks: BackgroundTasks,
     settings: Settings = Depends(dependencies.get_app_settings),
     role: str = Depends(dependencies.require_editor),
 ) -> SubmitTaskResponse:
@@ -45,6 +47,9 @@ def submit_task(
         is_expert=role == "expert",
         settings=settings,
     )
+    # Mirror the submitted case into the retrieval bank (writable datasets only;
+    # healthy → removed). No-op for locked originals. Best-effort, after response.
+    background_tasks.add_task(bank_sync.sync_upsert, dataset, task_id, settings)
     return SubmitTaskResponse(ok=True, version=new_version)
 
 

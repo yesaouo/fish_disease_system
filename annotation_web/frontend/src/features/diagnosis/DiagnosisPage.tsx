@@ -16,12 +16,6 @@ import { useAuth } from "../../context/AuthContext";
 import { useDataset } from "../../context/DatasetContext";
 import ProjectHeader from "../../components/ProjectHeader";
 
-const MODE_LABELS: Record<string, string> = {
-  grod_soft: "OAVLE + CEAM",
-  grod: "OAVLE（硬性門檻）",
-  base: "分離式對照模型"
-};
-
 const Card: React.FC<React.PropsWithChildren<{ title: string; sub?: string; className?: string }>> = ({
   title,
   sub,
@@ -407,9 +401,12 @@ const Report: React.FC<{
       <Card title="基本資料">
         <dl className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-2 md:grid-cols-4">
           <Field k="病例編號" v={m.case_id} />
-          <Field k="報告時間" v={m.timestamp.replace("T", " ")} />
-          <Field k="分析模式" v={MODE_LABELS[m.mode] ?? m.mode} />
+          <Field k="報告產生時間" v={m.timestamp.replace("T", " ")} />
           <Field k="病灶數量" v={String(report.n_lesions)} />
+          <Field
+            k="診斷資料版本"
+            v={m.data_version + (m.delta_cases > 0 ? `（含 ${m.delta_cases} 筆即時新增案例）` : "")}
+          />
 
           <div className="sm:col-span-2 md:col-span-4">
             <Field k="補充描述" v={m.text || "未提供"} />

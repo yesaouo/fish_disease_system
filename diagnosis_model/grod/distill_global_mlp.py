@@ -24,6 +24,8 @@ Run from repo root:
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 from pathlib import Path
 
 import torch
@@ -72,7 +74,7 @@ def main():
     ap.add_argument("--dino_dir", type=str, required=True)
     ap.add_argument("--target_db", type=str, required=True)
     ap.add_argument("--out_dir", type=str, required=True)
-    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--epochs", type=int, default=2500)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -88,7 +90,12 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     xtr, ytr, xva, yva = xtr.to(dev), ytr.to(dev), xva.to(dev), yva.to(dev)
 
-    best_va = -1.0
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_f = open(out_dir / "train_log.jsonl", "w")
+
+    best_va, best_epoch = -1.0, -1
+    best_state = None
     for ep in range(args.epochs):
         model.train()
         opt.zero_grad()
@@ -96,26 +103,30 @@ def main():
         loss = (1 - (pred * ytr).sum(-1)).mean()
         loss.backward()
         opt.step()
+        model.eval()
+        with torch.no_grad():
+            cva = (model(xva) * yva).sum(-1).mean().item()
+            ctr = (pred * ytr).sum(-1).mean().item()
+        if cva > best_va:
+            best_va, best_epoch = cva, ep + 1
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        log_f.write(json.dumps({"epoch": ep + 1, "train_cos": ctr, "valid_cos": cva}) + "\n")
         if (ep + 1) % 25 == 0 or ep == 0:
-            model.eval()
-            with torch.no_grad():
-                cva = (model(xva) * yva).sum(-1).mean().item()
-                ctr = (pred * ytr).sum(-1).mean().item()
-            best_va = max(best_va, cva)
             print(f"  ep{ep+1:>3} train_cos={ctr:.4f} valid_cos={cva:.4f}")
+    log_f.close()
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # save the best-valid checkpoint (not the last epoch)
+    if best_state is not None:
+        model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
         gtr = model(xtr2.to(dev)).cpu()
         gva = model(xva).cpu()
     torch.save({"global": gtr, "file_names": ftr}, out_dir / "distilled_global_train.pt")
     torch.save({"global": gva, "file_names": fva}, out_dir / "distilled_global_valid.pt")
-    # state_dict that loads 1:1 into LWDETR.global_embed (path P)
     torch.save(model.export_embed_state_dict(), out_dir / "global_embed_state_dict.pt")
-    print(f"[done] best valid_cos={best_va:.4f}  saved train{tuple(gtr.shape)} valid{tuple(gva.shape)} "
-          f"+ global_embed_state_dict.pt")
+    print(f"[done] best valid_cos={best_va:.4f} @ epoch {best_epoch}/{args.epochs}  "
+          f"saved train{tuple(gtr.shape)} valid{tuple(gva.shape)} + global_embed_state_dict.pt")
 
 
 if __name__ == "__main__":

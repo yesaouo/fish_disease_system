@@ -11,7 +11,7 @@ import ProjectHeader from "../../components/ProjectHeader";
 import React, { useState } from "react";
 
 // Icons
-import { Trash2, SquarePlus, Save, Undo2, Redo2, BarChart3, LogOut, Stethoscope, Home } from "lucide-react";
+import { Trash2, SquarePlus, Save, Undo2, Redo2, BarChart3, LogOut, Stethoscope, Home, HeartPulse, Ban } from "lucide-react";
 
 // 官方資料集來源標籤（鎖定資料集顯示來源，而非籠統的「官方」）。
 const DATASET_SOURCE: Record<string, string> = {
@@ -267,8 +267,17 @@ const DatasetPickerPage: React.FC = () => {
 
         <ol className="list-decimal space-y-3 pl-5 text-sm text-slate-700">
           <li>
+            <span className="font-semibold">先判定影像類型</span>
+            ：有病灶才畫框；沒有明顯病灶請使用
+            <HeartPulse className="mx-1 inline h-4 w-4 align-[-2px]" aria-hidden="true" />
+            「判定為健康」；影像模糊、遮擋或無法判讀時，請使用
+            <Ban className="mx-1 inline h-4 w-4 align-[-2px]" aria-hidden="true" />
+            「無法使用並提交」或加註解說明原因。
+          </li>
+
+          <li>
             <span className="font-semibold">檢查標註框</span>
-            ：將每個框調整至正確位置與大小。框可拖曳移動、拉角縮放；但不能旋轉、不能超出影像範圍、不能小於最小尺寸。
+            ：每個病灶一個框，多處病灶請建立多個框。框應貼近病灶、少含背景；可拖曳移動、拉角縮放，但不能超出影像範圍。
           </li>
 
           <li>
@@ -282,45 +291,39 @@ const DatasetPickerPage: React.FC = () => {
             <span className="font-semibold">新增遺漏框</span>
             ：點工具列上的
             <SquarePlus className="mx-1 inline h-4 w-4 align-[-2px]" aria-hidden="true" />
-            圖示，或按 <Kbd>N</Kbd>，再拉出正確位置與大小。新增時會沿用上一個框的類別與外觀敘述（如有），可再調整。
+            圖示，或按 <Kbd>N</Kbd>，再拉出正確位置與大小。新增時會沿用上一個框的類別；外觀敘述需重新選擇。
           </li>
 
           <li>
-            <span className="font-semibold">確認類別與外觀敘述（選填）</span>
-            ：於右側「標註內容」面板選擇表徵類別，並可填寫「外觀敘述」（單行文字）。
-            必要欄位未填寫時，系統會以紅字提示。
+            <span className="font-semibold">確認類別與外觀敘述</span>
+            ：每個非健康框都必須選擇表徵類別與外觀敘述。改變表徵類別後，外觀敘述會清空，需重新選擇。
           </li>
 
           <li>
             <span className="font-semibold">填寫病徵敘述</span>
-            ：
-            <ul className="mt-2 list-disc pl-4">
-              <li>「通俗描述」：一般人可理解的描述。</li>
-              <li>「醫學描述」：依醫學術語填寫。</li>
-            </ul>
-            以上欄位按 Enter 不會換行（僅接受單行）。
+            ：「通俗描述」與「醫學描述」至少填一項；兩者都能填時建議都填。以上欄位按 Enter 不會換行。
           </li>
 
           <li>
             <span className="font-semibold">填寫病徵原因與處置建議</span>
             ：
             <ul className="mt-2 list-disc pl-4">
-              <li>「病徵原因」：依可能性高低排序（最多 10 項）。</li>
-              <li>「處置建議」：依治療流程排序（最多 10 項）。</li>
+              <li>「病徵原因」：必填，依可能性高低排序，最多 10 項且不可重複。</li>
+              <li>「處置建議」：選填；若填寫，依治療流程排序，最多 10 項且不可重複。</li>
             </ul>
             可按 Enter 新增項目，並可上移／下移或刪除。
           </li>
 
           <li>
             <span className="font-semibold">註解</span>
-            ：在「註解」區輸入文字後按 Enter 或點「新增」即可新增一則註解；可個別移除。
+            ：用於記錄例外狀況或判斷依據，例如影像模糊、疑似多重病灶或類別不在清單；不是一般必填欄位的替代品。
           </li>
 
           <li>
             <span className="font-semibold">保存</span>
             ：點工具列上的
             <Save className="mx-1 inline h-4 w-4 align-[-2px]" aria-hidden="true" />
-            圖示，或按 <Kbd>Ctrl</Kbd> + <Kbd>S</Kbd> 暫存。保存後會更新目前進度為基準，之後離開本頁不再跳出「未保存」提醒。
+            圖示，或按 <Kbd>Ctrl</Kbd> + <Kbd>S</Kbd> 暫存。保存只更新草稿，不代表任務完成。
           </li>
 
           <li>
@@ -330,14 +333,17 @@ const DatasetPickerPage: React.FC = () => {
 
           <li>
             <span className="font-semibold">切換影像</span>
-            ：使用上方膠囊輸入列的「上一個／下一個」箭頭，或輸入編號後按「前往」。提交後會自動載入下一張影像。
+            ：使用上方膠囊輸入列的「上一個／下一個」箭頭，或輸入編號後按「前往」。提交後會前往下一個編號。
           </li>
 
           <li>
             <span className="font-semibold">提交</span>
             ：
             <ul className="mt-2 list-disc pl-4">
-              <li><span className="font-medium">提交</span>：點擊「提交」按鈕（會跳出確認視窗）。提交成功後，此影像將不再重新分派並自動前往下一張。</li>
+              <li>有病灶影像：完成所有必填項目後點「提交」。</li>
+              <li>無病灶影像：使用「判定為健康」，影像會移到健康影像區。</li>
+              <li>無法判讀影像：使用「無法使用並提交」或加註解說明原因後提交。</li>
+              <li>提交成功後，此影像視為完成並前往下一個編號。</li>
             </ul>
           </li>
 
@@ -357,6 +363,11 @@ const DatasetPickerPage: React.FC = () => {
         </ol>
 
         <div className="mt-4 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+          <span className="font-medium">提交前檢查：</span>
+          每個框都有類別與外觀敘述；病徵敘述至少填一項；病徵原因至少 1 項；無病灶影像已判定健康；無法判讀影像已有註解。
+        </div>
+
+        <div className="mt-2 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
           <span className="font-medium">快捷鍵小抄：</span>
           <SquarePlus className="mx-1 inline h-3.5 w-3.5 align-[-2px]" aria-hidden="true" /> 新增框（N）；
           <Trash2 className="mx-1 inline h-3.5 w-3.5 align-[-2px]" aria-hidden="true" /> 刪除框（Del/Backspace）；

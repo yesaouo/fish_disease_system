@@ -57,15 +57,16 @@ def main():
     ap.add_argument("--symptoms", default="data/processed/current/symptoms.json")
     ap.add_argument("--iou_thresh", type=float, default=0.5)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--dump_confusion", default=None, help="path to dump confusion matrix JSON")
     args = ap.parse_args()
 
-    os.environ["RFDETR_SEMANTIC_DIM"] = "768"
+    anc = torch.load(args.anchors, weights_only=False)
+    os.environ["RFDETR_SEMANTIC_DIM"] = str(anc.get("dim", anc["anchor_embs"].shape[-1]))
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(args.anchors)
     from diagnosis_model.grod.build import load_oavle
     net, res, means, stds = load_oavle(args.joint_ckpt, device=args.device)
 
-    anc = torch.load(args.anchors, weights_only=False)
-    A = F.normalize(anc["anchor_embs"].float(), dim=-1)              # [C,768]
+    A = F.normalize(anc["anchor_embs"].float(), dim=-1)              # [C,D]
     C = A.size(0)
     cand = [c for c in range(1, C)]                                  # exclude 0=healthy_region
     cand_t = torch.tensor(cand)
@@ -80,6 +81,7 @@ def main():
 
     n_gt = n_matched = top1 = top3 = 0
     tp = defaultdict(int); fp = defaultdict(int); fn = defaultdict(int)  # per-class, over matched
+    confusion = defaultdict(lambda: defaultdict(int))                    # true_c -> pred_c -> count
     for iid, items in by_img.items():
         fn_img = id2fn.get(iid)
         if fn_img is None:
@@ -104,6 +106,7 @@ def main():
             order = sims.argsort(descending=True)
             ranked = [cand[i] for i in order.tolist()]
             pred_c = ranked[0]
+            confusion[true_c][pred_c] += 1
             if pred_c == true_c:
                 top1 += 1; tp[true_c] += 1
             else:
@@ -130,6 +133,14 @@ def main():
             f1s.append(f1)
         print(f"{c:>3} {name.get(c,'?')[:13]:<14} {support:>5} {prec:>6.3f} {rec:>6.3f} {f1:>6.3f}")
     print(f"\nmacro-F1 (over present lesion classes) = {sum(f1s)/max(1,len(f1s)):.4f}")
+
+    if args.dump_confusion:
+        present = sorted({c for c in cand if (tp[c] + fn[c]) > 0}
+                         | {p for t in confusion for p in confusion[t]})
+        mat = [[confusion[t].get(p, 0) for p in present] for t in present]
+        out = {"cats": present, "names": [name.get(c, "?") for c in present], "matrix": mat}
+        json.dump(out, open(args.dump_confusion, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        print(f"[dump] confusion -> {args.dump_confusion}")
 
 
 if __name__ == "__main__":

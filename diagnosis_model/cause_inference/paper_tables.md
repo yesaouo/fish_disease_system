@@ -979,3 +979,39 @@ $PY -m diagnosis_model.grod.finetune_e2e_soft --epochs 5      # -> outputs/e2e_s
 # --- 端到端 soft cascade（對照 gpu_infer.py hard baseline） ---
 $PY -m diagnosis_model.grod.gpu_infer_soft --image <img> --verify
 ```
+
+---
+
+## I. 整合式架構與區域門控消融（表 14 / `tab:integration_ablation`）
+
+一次跑三列（分離式基準 / OAVLE-Hard / OAVLE）。三列共用同一協定：學習式聚合單一案例向量 →
+bank 檢索 → CEAM 病因評分（cascade **γ=0**），數字直接可比。指令、迴圈、收斂慣例（L2-norm、
+miss=+inf、occurrence-level cluster、`semantic_threshold=0.95`、`cause_clusters_llm`）與
+`eval_ceah_soft_paper` 完全一致（soft 列逐項相等，已交叉驗證）。
+
+### Table I1 — 整合式架構與區域門控消融（current 樹、valid 1583、γ=0、**top_k_cases=3** 生產操作點）
+
+| 設定 | 參數量（M） | 延遲（ms） | Recall@10 | 群集 Recall@10 |
+|---|---:|---:|---:|---:|
+| 分離式基準（base） | 225 | 30.4 | **69.9%** | 55.6% |
+| OAVLE-Hard | 40.8 | 15.4 | 66.7% | 53.8% |
+| **OAVLE（soft・主）** | 40.8 | **12.2** | 68.6% | **56.0%** |
+
+> **參數量／延遲欄不出自本 eval**（另見第 §efficiency 節量測）；本表只負責 Recall@10 與群集 Recall@10。
+> 三列準確度持平（sem R@10 ±1.6pp、群集 R@10 ±2.2pp），符合論文主張「整合與軟門控之效益在體積／延遲／歸因，而非準確度」。
+>
+> **soft 用 gated（`soft_inputs_gated`，Region-Gate 權重）而非 raw `soft_inputs`。** 理由：`bank_z_soft` 是用 gated 訓出（BUILD_PIPELINE Step 8/9），生產 `GrodSoftPipeline` 也以 `w_gate` 查詢 → gated-query vs gated-bank 才自洽、才等於生產推論。**Hard 列** = 二值化 raw objectness（`sigmoid(obj)>display_thresh=0.322`）→{0,1} 查詢、沿用同一 gated `bank_z_soft`（demo hard 模式的 cross-feed 硬閘退化，不另建硬 bank）。
+> 若改用非 gated `soft_inputs`（= Table H6 sweep 舊指令）查詢，soft 列 k=3 為 sem 67.0 / 群集 54.1（對應舊操作點紀錄 53.4），query/bank 不匹配、**非生產設定**，僅列此供對照。
+> `top_k_cases` 非單調，k=3 為內部最佳（見 Table H6）；k=20 對照：base 45.2/33.2、hard 44.7/32.9、soft 44.7/33.2。
+
+取得指令（一次三列）：
+
+```bash
+PY=/home/lab603/anaconda3/envs/SDM/bin/python
+cd /mnt/ssd/YJ/fish_disease_system
+# 生產操作點 k=3（表 14）：
+$PY -m diagnosis_model.grod.eval_integration_ablation --top_k_cases 3
+# k=20 對照：
+$PY -m diagnosis_model.grod.eval_integration_ablation --top_k_cases 20
+# 輸出 -> $ART/models/ceah_grod_soft/integration_ablation{,_k3}/metrics.json
+```

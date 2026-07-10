@@ -153,6 +153,8 @@ export type DiagnoseMeta = {
   case_id: string;
   timestamp: string;
   mode: string;
+  data_version: string;
+  delta_cases: number;
   text: string;
   thresholds: { abstain: number; display: number };
 };

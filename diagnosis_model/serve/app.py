@@ -12,6 +12,10 @@ Endpoints:
   GET  /health           → {"status","device","loaded"}
   GET  /modes            → ["base","grod","grod_soft"]
   POST /diagnose         → multipart(image, text, mode, thresholds, top_k/n) → report JSON
+  POST /bank/upsert      → multipart(image, source_dataset/task_id, image_path, causes_json)
+                           → add/replace an expert case in the grod_soft retrieval bank
+  POST /bank/delete      → form(source_dataset, source_task_id) → remove it
+  POST /bank/resync      → clear the delta layer (bank ← base only)
 
 The 處置建議 / 專家覆核 report blocks (Table 4) are intentionally not produced
 here — they are empty fields the React layer renders, matching the thesis framing
@@ -23,6 +27,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import json
 import threading
 import time
 import uuid
@@ -38,10 +43,11 @@ from PIL import Image, ImageOps
 
 from diagnosis_model.grod.pipeline import (
     DEVICE, ABSTAIN_DEFAULT, DISPLAY_DEFAULT, _BUILDERS,
-    load_shared, get_pipeline, encode_text_slot,
+    load_shared, get_pipeline, encode_text_slot, encode_cause_texts, data_version,
     render_heatmap_image, render_detection_image, make_missing_case_placeholder,
     make_alpha_breakdown_chart, make_combined_alpha_chart,
 )
+from diagnosis_model.grod.bank_delta import BankDelta, DeltaCase
 
 # GPU is single — serialize inference so concurrent requests don't race the device
 # (mirrors the demo's default_concurrency_limit=1).
@@ -177,11 +183,14 @@ def diagnose(
         "case_id": case_id,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "mode": mode,
+        "data_version": data_version(),
         "text": text,
         "thresholds": {"abstain": float(abstain_thresh), "display": float(display_thresh)},
     }
     with _GPU_LOCK:
         pipe = get_pipeline(mode)
+        # live retrieval-bank delta size (expert hot-updates); 0 for modes without a delta
+        meta["delta_cases"] = int(len(pipe.p.delta)) if hasattr(pipe, "p") and hasattr(pipe.p, "delta") else 0
         text_emb = encode_text_slot(text)
         res = pipe.infer_rich(img, text_emb, int(top_k_cases), int(top_n_causes),
                               float(abstain_thresh), float(display_thresh))
@@ -214,19 +223,121 @@ def report_pdf(case_id: str):
     )
 
 
+# --------------------------------------------------------------------- bank delta
+# HITL retrieval-bank hot update: expert-submitted cases from annotation_web are
+# appended to / removed from the production (grod_soft) case bank live, keyed by
+# case_id = (source_dataset, source_task_id). Frozen base ⊕ mutable delta; no disk
+# cache (delta rebuilt via /bank/resync). All mutations serialize on _GPU_LOCK.
+
+def _soft_pipe():
+    pipe = get_pipeline("grod_soft")
+    if not hasattr(pipe, "p"):
+        raise HTTPException(400, "grod_soft pipeline does not support bank ops")
+    return pipe
+
+
+@app.post("/bank/upsert")
+def bank_upsert(
+    image: UploadFile = File(...),
+    source_dataset: str = Form(...),
+    source_task_id: str = Form(...),
+    image_path: str = Form(...),
+    causes_json: str = Form(...),
+):
+    """Encode an expert case and add/replace it in the delta bank. A healthy image
+    (no lesion clears the objectness threshold) or one with no causes is removed
+    instead — it is not a retrievable case."""
+    try:
+        causes = [str(c).strip() for c in json.loads(causes_json) if str(c).strip()]
+    except Exception as e:
+        raise HTTPException(400, f"bad causes_json: {e}")
+    try:
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(image.file.read()))).convert("RGB")
+    except Exception as e:
+        raise HTTPException(400, f"cannot read image: {e}")
+    case_id = BankDelta.make_case_id(source_dataset, source_task_id)
+    with _GPU_LOCK:
+        p = _soft_pipe().p
+        z = p.encode_case(img)
+        if z is None or not causes:
+            size = p.bank_delete(case_id)
+            return {"ok": True, "healthy": True, "case_id": case_id, "bank_size": size}
+        cause_embs = encode_cause_texts(causes)
+        rec = DeltaCase(case_id=case_id, source_dataset=source_dataset,
+                        source_task_id=source_task_id, image_path=image_path,
+                        file_name=Path(image_path).name, z=z,
+                        cause_texts=causes, cause_embs=cause_embs)
+        size = p.bank_upsert(rec)
+    return {"ok": True, "healthy": False, "case_id": case_id, "bank_size": size}
+
+
+@app.post("/bank/delete")
+def bank_delete(source_dataset: str = Form(...), source_task_id: str = Form(...)):
+    case_id = BankDelta.make_case_id(source_dataset, source_task_id)
+    with _GPU_LOCK:
+        size = _soft_pipe().p.bank_delete(case_id)
+    return {"ok": True, "case_id": case_id, "bank_size": size}
+
+
+@app.post("/bank/resync")
+def bank_resync():
+    """Clear the delta layer (bank ← base only). annotation_web then re-pushes every
+    writable-dataset task via /bank/upsert — datasets are the single source of truth."""
+    with _GPU_LOCK:
+        p = _soft_pipe().p
+        p.delta = BankDelta()
+        p._rebuild()
+        size = p.bank_size
+    return {"ok": True, "bank_size": size, "delta": len(p.delta)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8900)
-    ap.add_argument("--preload", nargs="*", default=[],
+    ap.add_argument("--preload", nargs="*", default=["grod_soft"],
                     help="modes to load at startup (default: lazy on first request)")
+    ap.add_argument("--annotation_web_url", default="http://127.0.0.1:5174",
+                    help="if set, best-effort POST {url}/api/admin/bank/resync after "
+                         "startup so the delta bank is rebuilt from the datasets.")
+    ap.add_argument("--resync_key", default=None,
+                    help="expert Bearer key for the startup resync callback.")
     args = ap.parse_args()
     print(f"[init] device={DEVICE}")
     load_shared()
     for m in args.preload:
         get_pipeline(m)
+    if args.annotation_web_url:
+        _spawn_startup_resync(args.annotation_web_url, args.resync_key, args.port)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
+
+
+def _spawn_startup_resync(base_url: str, key: str | None, port: int):
+    """Ask annotation_web to rebuild the delta bank (it owns the task storage).
+
+    Runs in a daemon thread that first waits for our own uvicorn to accept
+    connections — annotation_web's resync handler calls back into /bank/upsert, so
+    the server must be live before we trigger it (else deadlock)."""
+    import threading
+    import httpx
+
+    def worker():
+        for _ in range(60):
+            try:
+                httpx.get(f"http://127.0.0.1:{port}/health", timeout=2)
+                break
+            except Exception:
+                time.sleep(1)
+        url = base_url.rstrip("/") + "/api/admin/bank/resync"
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        try:
+            r = httpx.post(url, headers=headers, timeout=600)
+            print(f"[resync] {url} -> {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            print(f"[resync] callback failed (bank starts base-only): {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 if __name__ == "__main__":

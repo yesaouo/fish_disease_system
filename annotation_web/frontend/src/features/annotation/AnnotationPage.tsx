@@ -1081,14 +1081,14 @@ const AnnotationPage: React.FC = () => {
         onClick={() => setGlobalListTab(tab)}
         className={`inline-flex min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2.5 py-2 text-sm font-medium transition-colors ${
           active
-            ? "bg-slate-900 text-white shadow-sm"
-            : "text-slate-600 hover:bg-white hover:text-slate-900"
+            ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-200"
+            : "text-slate-500 hover:bg-white/60 hover:text-slate-700"
         }`}
       >
         <span className="truncate">{label}</span>
         <span
           className={`shrink-0 rounded-full px-1.5 py-0.5 text-[11px] leading-none ${
-            active ? "bg-white/20 text-white" : "bg-white text-slate-500"
+            active ? "bg-slate-100 text-slate-600" : "bg-white text-slate-500"
           }`}
         >
           {count}
@@ -1560,7 +1560,7 @@ const AnnotationPage: React.FC = () => {
 
           {doc && (
             <div className="grid gap-4">
-              <div className="rounded-xl bg-white p-4 shadow">
+              <div className="min-w-0 rounded-xl bg-white p-4 shadow">
                 <h2 className="mb-3 text-lg font-semibold text-slate-800">
                   病徵敘述
                   <span className="ml-2 text-xs font-normal text-slate-400">通俗／醫學描述擇一必填</span>
@@ -1634,14 +1634,14 @@ const AnnotationPage: React.FC = () => {
                 )}
               </div>
 
-              <div className="rounded-xl bg-white p-4 shadow">
+              <div className="min-w-0 rounded-xl bg-white p-4 shadow">
                 <h2 className="mb-3 text-lg font-semibold text-slate-800">註解</h2>
                 <div className="flex gap-2 mb-2">
                   <input
                     type="text"
                     value={commentDraft}
                     onChange={(e) => setCommentDraft(e.target.value)}
-                    className="flex-1 rounded border border-slate-300 px-3 py-2 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                    className="min-w-0 flex-1 rounded border border-slate-300 px-3 py-2 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
                     placeholder="新增註解"
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
@@ -1652,7 +1652,7 @@ const AnnotationPage: React.FC = () => {
                   />
                   <button
                     onClick={handleAddComment}
-                    className="rounded bg-slate-800 px-3 py-2 text-white hover:bg-slate-900 disabled:opacity-50"
+                    className="shrink-0 rounded bg-slate-800 px-3 py-2 text-white hover:bg-slate-900 disabled:opacity-50"
                   >
                     新增
                   </button>
@@ -2291,7 +2291,7 @@ const GlobalListEditor: React.FC<GlobalListEditorProps> = ({
           type="text"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          className="flex-1 rounded border border-slate-300 px-3 py-2 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+          className="min-w-0 flex-1 rounded border border-slate-300 px-3 py-2 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
           placeholder={inputPlaceholder ?? "新增項目 (Enter)"}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
@@ -2306,7 +2306,7 @@ const GlobalListEditor: React.FC<GlobalListEditorProps> = ({
             onChange("add", { value: draft });
             setDraft("");
           }}
-          className="rounded bg-slate-800 px-3 py-2 text-white hover:bg-slate-900"
+          className="shrink-0 rounded bg-slate-800 px-3 py-2 text-white hover:bg-slate-900"
         >
           新增
         </button>

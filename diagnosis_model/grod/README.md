@@ -226,12 +226,21 @@ python -m diagnosis_model.grod.build_text_anchors \
 validated defaults (sweep best operating point). ~7 min/epoch, ~3.5 h for 30
 epochs on one 32 GB GPU.
 
+**Taxonomy must match**: the dataset's per-box `symptom_category_id` and `--anchors`
+must be the SAME symptom tree. The current tree's detection COCO
+(`data/processed/current/detection`) already carries the matching 15-class
+`symptom_category_id` (lesions 1..14) — use it directly. Do NOT use the stale
+`data/detection/coco/_merged_semantic` (old 19-class tree, ids 1..18): its ids
+exceed the 15 anchors, so z trains toward the wrong anchors and symptom
+classification collapses to ~random.
+
 ```bash
+ART=data/processed/current/artifacts
 python -m diagnosis_model.grod.train_joint \
-    --dataset_dir data/detection/coco/_merged_semantic \
-    --pretrain_weights diagnosis_model/detection/outputs/rfdetr/checkpoint_best_total.pth \
-    --anchors diagnosis_model/grod/outputs/text_anchors.pt \
-    --output_dir diagnosis_model/grod/outputs/joint_rfdetr
+    --dataset_dir data/processed/current/detection \
+    --pretrain_weights $ART/models/rfdetr/checkpoint_best_total.pth \
+    --anchors $ART/models/text_anchors.pt \
+    --output_dir $ART/models/joint_rfdetr
 ```
 
 Key flags (defaults shown): `--epochs 30 --batch_size 16 --grad_accum_steps 1

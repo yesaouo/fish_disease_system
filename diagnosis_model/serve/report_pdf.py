@@ -15,12 +15,6 @@ from weasyprint import HTML
 REPORT_ORG = "國立臺灣海洋大學　魚病智慧診斷輔助系統"
 REPORT_TITLE = "AI 魚病診斷輔助報告"
 
-_MODE_LABELS = {
-    "grod_soft": "OAVLE + CEAM",
-    "grod": "OAVLE（硬性門檻）",
-    "base": "分離式對照模型",
-}
-
 # 報告區塊對應 _serialize() 之輸出 schema。處置建議／專家覆核屬論文未來工作，不列入 PDF。
 _TEMPLATE = Template(
     r"""<!doctype html>
@@ -71,11 +65,11 @@ _TEMPLATE = Template(
   <table class="info">
     <tr>
       <td class="lab">病例編號</td><td>{{ r.meta.case_id }}</td>
-      <td class="lab">報告時間</td><td>{{ r.meta.timestamp.replace("T", " ") }}</td>
+      <td class="lab">報告產生時間</td><td>{{ r.meta.timestamp.replace("T", " ") }}</td>
     </tr>
     <tr>
-      <td class="lab">分析模式</td><td>{{ mode_label }}</td>
       <td class="lab">病灶數量</td><td>{{ r.n_lesions }}</td>
+      <td class="lab">診斷資料版本</td><td>{{ r.meta.data_version or "—" }}{% if r.meta.delta_cases %}（含 {{ r.meta.delta_cases }} 筆即時新增案例）{% endif %}</td>
     </tr>
     <tr>
       <td class="lab">補充描述</td><td colspan="3">{{ r.meta.text or "未提供" }}</td>
@@ -160,7 +154,5 @@ _TEMPLATE = Template(
 
 def render_report_pdf(report: dict) -> bytes:
     """report dict（/diagnose 之輸出 schema）→ PDF bytes。"""
-    mode_label = _MODE_LABELS.get((report.get("meta") or {}).get("mode", ""),
-                                  (report.get("meta") or {}).get("mode", ""))
-    html = _TEMPLATE.render(r=report, org=REPORT_ORG, title=REPORT_TITLE, mode_label=mode_label)
+    html = _TEMPLATE.render(r=report, org=REPORT_ORG, title=REPORT_TITLE)
     return HTML(string=html).write_pdf()

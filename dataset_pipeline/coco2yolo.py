@@ -97,6 +97,11 @@ def process_split(split, coco_root, yolo_root):
         for ann in data['annotations']:
             ann_map[ann['image_id']].append(ann)
 
+    # COCO category_id -> 0-indexed YOLO class（對齊 data.yaml names 之 sorted-by-id 順序）；
+    # 直接沿用 cat_id 當 class 於非 0-indexed 類別集（如 VOC 之 1..20）會整體偏移、越界。
+    sorted_cats = sorted(data.get('categories', []), key=lambda c: c['id'])
+    cat_id_to_idx = {c['id']: i for i, c in enumerate(sorted_cats)}
+
     # 開始轉換
     print(f"Converting {split} set ({len(data['images'])} images)...")
     for img_id, img_info in tqdm(img_map.items(), desc=f"  Processing {split}", leave=False):
@@ -123,14 +128,14 @@ def process_split(split, coco_root, yolo_root):
         anns = ann_map.get(img_id, [])
         
         for ann in anns:
-            cat_id = ann['category_id']
+            cls = cat_id_to_idx[ann['category_id']]   # 0-indexed class，非直接用 COCO cat_id
             bbox = ann['bbox']
-            
+
             # 轉換座標
             xc, yc, w, h = coco_to_yolo_bbox(bbox, img_w, img_h)
-            
+
             # YOLO 格式: class_id x_center y_center width height
-            yolo_lines.append(f"{cat_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+            yolo_lines.append(f"{cls} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
             
         # 寫入 txt (即使沒有標註也要產生空檔案)
         with open(dst_txt_path, 'w', encoding='utf-8') as f:

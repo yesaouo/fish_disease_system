@@ -171,6 +171,11 @@ def main():
     ap.add_argument("--scoring_mode", default="multiplicative")
     ap.add_argument("--lambda_sparsity", type=float, default=0.0)
     ap.add_argument("--text_dropout", type=float, default=0.5)
+    # Rung 1: multi-positive listwise CE (cross-candidate competition) on top of BCE.
+    # Ported from cause_inference/train_ceah.py; default 0.0 => loss byte-identical.
+    ap.add_argument("--lambda_bce", type=float, default=1.0)
+    ap.add_argument("--lambda_rank", type=float, default=0.0)
+    ap.add_argument("--rank_temp", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -255,7 +260,18 @@ def main():
             scores = scores.view(B, max_P)
             cmf = cmask.float()
             bce = F.binary_cross_entropy(scores, targets, reduction="none")
-            loss = (bce * cmf).sum() / cmf.sum().clamp_min(1.0)
+            loss = args.lambda_bce * ((bce * cmf).sum() / cmf.sum().clamp_min(1.0))
+            # Rung 1: multi-positive listwise CE — softmax(score/T) over the pool,
+            # target = uniform over the binary positives (ported from train_ceah.py).
+            if args.lambda_rank > 0:
+                logits = (scores / args.rank_temp).masked_fill(~cmask, float("-inf"))
+                logp = F.log_softmax(logits, dim=1)
+                pos = (targets > 0.5) & cmask
+                n_pos = pos.sum(dim=1)
+                per_q = -torch.where(pos, logp, torch.zeros_like(logp)).sum(dim=1) / n_pos.clamp_min(1)
+                valid_q = n_pos > 0
+                if valid_q.any():
+                    loss = loss + args.lambda_rank * per_q[valid_q].mean()
             for gp in optim.param_groups:
                 gp["lr"] = args.lr * lr_mult(gstep)
             optim.zero_grad(); loss.backward()

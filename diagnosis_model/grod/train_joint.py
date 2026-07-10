@@ -8,18 +8,29 @@ the weak frozen-probe regime (+0.0063) up to a usable strength.
 Design (locked):
   - backbone FROZEN (freeze_encoder=True): protects detection, lets decoder+head move
   - semantic NOT in Hungarian matching cost: pure aux loss on matched queries
-  - merged COCO dataset with per-box symptom_category_id feeds loss_semantic
+  - dataset COCO with per-box symptom_category_id feeds loss_semantic
+
+CRITICAL — taxonomy must match: `loss_semantic` aligns each matched query's z to
+`anchors[symptom_category_id]`, so the dataset's per-box `symptom_category_id` and
+the `--anchors` pack MUST come from the SAME symptom taxonomy tree. The current
+tree has 15 categories (symptoms.json ids 0..14, 0=healthy); its detection COCO
+(`data/processed/current/detection`) already carries the matching
+`symptom_category_id` (lesions 1..14) — use it directly, no separate merge needed.
+Do NOT use the stale `data/detection/coco/_merged_semantic` (old tree, ids 1..18):
+its ids exceed the 15 anchors and mean different symptoms, so z is trained toward
+the wrong anchors and downstream symptom classification collapses to ~random.
 
 The semantic head is enabled via env vars consumed by the fork's build_namespace:
   RFDETR_SEMANTIC_DIM / RFDETR_SEMANTIC_ANCHORS / RFDETR_SEMANTIC_LOSS_COEF / RFDETR_SEMANTIC_TEMP
 
 Run from repo root:
   PY=/home/lab603/anaconda3/envs/SDM/bin/python
+  ART=data/processed/current/artifacts
   $PY -m diagnosis_model.grod.train_joint \
-      --dataset_dir data/detection/coco/_merged_semantic \
-      --pretrain_weights diagnosis_model/detection/outputs/rfdetr/checkpoint_best_total.pth \
-      --anchors diagnosis_model/grod/outputs/text_anchors.pt \
-      --output_dir diagnosis_model/grod/outputs/joint_rfdetr \
+      --dataset_dir data/processed/current/detection \
+      --pretrain_weights $ART/models/rfdetr/checkpoint_best_total.pth \
+      --anchors $ART/models/text_anchors.pt \
+      --output_dir $ART/models/joint_rfdetr \
       --epochs 30 --semantic_loss_coef 2.0
 """
 

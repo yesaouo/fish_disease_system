@@ -70,7 +70,8 @@ def main():
     args = ap.parse_args()
 
     # Enable the semantic head when RFDETRMedium rebuilds the model from the ckpt.
-    os.environ["RFDETR_SEMANTIC_DIM"] = "768"
+    _anc = torch.load(args.anchors, weights_only=False)
+    os.environ["RFDETR_SEMANTIC_DIM"] = str(_anc.get("dim", _anc["anchor_embs"].shape[-1]))
     os.environ["RFDETR_SEMANTIC_LAYERS"] = str(args.semantic_layers)
     os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(args.anchors)
 

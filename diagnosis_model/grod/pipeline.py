@@ -7,7 +7,7 @@ Three pipelines, each exposing `.params` (dict) and
 `.infer_rich(image, text_emb, top_k_cases, top_n, abstain_thresh, display_thresh)`:
   base       conventional separated baseline (RF-DETR + raw SigLIP2 global +
              finetuned SigLIP2 lesion crops → DeepSets → dense retrieval → CEAH)
-  grod_soft  soft per-query weights (default, diagnosis_model/grod/gpu_infer_soft.py)
+  grod_soft  soft per-query weights (default; production loader = GpuPipelineSoft below)
   grod       same soft model/artifacts, weights hard-gated to {0,1} at display_thresh
 
 Consumed by:
@@ -70,6 +70,9 @@ SOFT_ENC = ART / "models/encoder_grod_soft/best_encoder.pt"
 SOFT_CEAH = ART / "models/ceah_grod_soft/best_ceah.pt"
 SOFT_BANK = ART / "models/encoder_grod_soft/bank_z_soft.pt"
 SOFT_CASE_DB = ART / "db/case_db_jointDistRawP"
+# Fixed lesion-objectness threshold: abstain (healthy) iff max_i w_i < τ.
+# Derived by compute_lesion_threshold.py; rationale in grod/LESION_GATE.md.
+DEFAULT_LESION_THRESH = 0.5
 # base
 BASE_VLM_LESION = ART / "models/siglip2_base_finetuned"
 BASE_ENC = ART / "models/encoder_base/best_encoder.pt"
@@ -142,6 +145,21 @@ class Shared:
     raw_siglip_proc = None
 
 
+def data_version() -> str:
+    """Resolved dataset version shown in the report, as the date part of the
+    processed dir name (e.g. '2026-06-24_1135' -> '2026-06-24'; the trailing
+    _HHMM time component is dropped)."""
+    try:
+        name = _PROC.resolve().name
+    except Exception:
+        name = _PROC.name
+    if "_" in name:
+        head, tail = name.rsplit("_", 1)
+        if tail.isdigit():
+            name = head
+    return name
+
+
 def load_shared():
     _ver = os.environ.get("FDS_PROCESSED") or "current"
     _resolved = _PROC.resolve().name if _PROC.is_symlink() or _ver == "current" else _ver
@@ -175,6 +193,21 @@ def encode_text_slot(text: str) -> Optional[torch.Tensor]:
     with torch.cuda.amp.autocast(enabled=DEVICE.startswith("cuda")):
         f = get_text_features(Shared.raw_siglip, inp["input_ids"], inp.get("attention_mask"))
     return F.normalize(f.float(), dim=-1)[0]
+
+
+@torch.no_grad()
+def encode_cause_texts(texts: List[str]) -> torch.Tensor:
+    """Embed cause strings into the case-bank cause space for a hot-updated delta
+    case. The production db (case_db_jointDistRawP, RawP path) stores cause_text_embs
+    in the frozen raw SigLIP2 text space — the same encoder as encode_text_slot — so
+    new causes must go through the exact same path. Returns [C,768] L2-normalized."""
+    proc = Shared.raw_siglip_proc
+    inp = proc(text=[t.strip() for t in texts], return_tensors="pt",
+               padding="max_length", truncation=True, max_length=64)
+    inp = {k: v.to(DEVICE) for k, v in inp.items()}
+    with torch.cuda.amp.autocast(enabled=DEVICE.startswith("cuda")):
+        f = get_text_features(Shared.raw_siglip, inp["input_ids"], inp.get("attention_mask"))
+    return F.normalize(f.float(), dim=-1)
 
 
 @torch.no_grad()
@@ -279,17 +312,28 @@ def _load_provenance() -> Dict[str, Dict[str, str]]:
     return prov
 
 
-def _retrieved_cards(topi, topw, file_names):
-    prov = _load_provenance()
+def _retrieved_cards(topi, topw, file_names, case_meta=None):
+    """Build retrieved-case cards. When `case_meta` is given (grod_soft, whose bank
+    may include hot-updated delta cases), image_path / provenance come from it —
+    covering both base cases and expert-submitted delta cases uniformly. Otherwise
+    (base pipeline) fall back to detection/train + COCO provenance."""
+    prov = _load_provenance() if case_meta is None else None
     out = []
     for k in range(topi.numel()):
         ci = int(topi[k].item()); fn = file_names[ci]
-        p = DET_TRAIN / fn
-        src = prov.get(fn, {})
+        if case_meta is not None:
+            m = case_meta[ci]
+            ip = m.get("image_path")
+            image_path = ip if (ip and Path(ip).exists()) else None
+            src_ds, src_tid = m.get("source_dataset"), m.get("source_task_id")
+        else:
+            p = DET_TRAIN / fn
+            image_path = str(p) if p.exists() else None
+            src = prov.get(fn, {})
+            src_ds, src_tid = src.get("source_dataset"), src.get("source_task_id")
         out.append({"file_name": fn, "similarity": float(topw[k].item()),
-                    "image_path": str(p) if p.exists() else None,
-                    "source_dataset": src.get("source_dataset"),
-                    "source_task_id": src.get("source_task_id")})
+                    "image_path": image_path,
+                    "source_dataset": src_ds, "source_task_id": src_tid})
     return out
 
 
@@ -413,6 +457,202 @@ def _minmax(x: torch.Tensor) -> torch.Tensor:
     return (x - lo) / (hi - lo)
 
 
+class GpuPipelineSoft:
+    """Production soft loader + inference core (formerly diagnosis_model/grod/
+    gpu_infer_soft.py). Owns the GROD joint detector, Weighted DeepSets Aggregator,
+    Region Gate, CEAH, and the base⊕delta retrieval bank (HITL hot update). The
+    rich report layer (GrodSoftPipeline) wraps an instance of this; serve reaches
+    its bank ops via `.p.encode_case / .bank_upsert / .bank_delete`. The standalone
+    minimal-flow reference lives in diagnosis_model/grod/gpu_infer.py."""
+
+    def __init__(self, joint_ckpt, global_sd, anchors, enc_ckpt, ceah_ckpt,
+                 case_db_dir, bank_path, top_k_lesions=32,
+                 device="cuda"):
+        self.dev = device
+        self.top_k_lesions = top_k_lesions
+
+        # --- GROD joint detector: decoder region heads (box/obj/semantic z)
+        #     + backbone-tapped global branch (both enabled via env) ---
+        #     Built from the vendored decoder (diagnosis_model/grod/detector), so
+        #     inference no longer imports the rfdetr package. The env switches are
+        #     still read (by the GROD heads factory) to enable the heads.
+        os.environ["RFDETR_SEMANTIC_DIM"] = "768"
+        os.environ["RFDETR_SEMANTIC_ANCHORS"] = os.path.abspath(anchors)
+        os.environ["RFDETR_GLOBAL_DIM"] = "768"
+        from diagnosis_model.grod.build import OAVLE
+        self.net = OAVLE.from_vendored(joint_ckpt, device=device)
+        self.net.core.global_embed.load_state_dict(torch.load(global_sd, map_location=device))
+        self.res = int(self.net.resolution)
+        self.means, self.stds = list(self.net.means), list(self.net.stds)
+
+        # --- Aggregator (DeepSets) — native soft pooling via lesion_weights ---
+        from diagnosis_model.cause_inference.models.case_encoder import (
+            EncoderConfig, build_encoder,
+        )
+        pkg = torch.load(enc_ckpt, weights_only=False, map_location="cpu")
+        cfg_dict = pkg["encoder_config"]; cfg_dict["dtype"] = torch.bfloat16
+        self.enc = build_encoder(EncoderConfig(**cfg_dict)).to(device).eval()
+        self.enc.load_state_dict(pkg["encoder_state"])
+
+        # --- Region Gate: objectness logits -> aggregation/attribution weights.
+        #     The trained ∅-sink softmax gate rides in the encoder ckpt (gate_state).
+        #     Decoupled from lesion selection / abstain (those stay on raw objectness).
+        #     Absent (legacy sigmoid ckpt) -> self.gate=None, falls back to sigmoid(obj).
+        self.gate = None
+        if "gate_state" in pkg:
+            from diagnosis_model.grod.region_gate import RegionGate
+            self.gate = RegionGate(init_temp=pkg.get("gate_init_temp", 0.3)).to(device).eval()
+            self.gate.load_state_dict(pkg["gate_state"])
+            print(f"[gate] RegionGate τ={self.gate.temp.item():.4f} ∅={self.gate.sink.item():+.4f}")
+
+        # --- CEAH — soft alpha gate via lesion_weights ---
+        from diagnosis_model.cause_inference.models.ceah import CEAH
+        self.ceah = CEAH(global_dim=768, text_dim=768, lesion_dim=768, cause_dim=768,
+                         attribution_mode="softmax", scoring_mode="multiplicative").to(device).eval()
+        self.ceah.load_state_dict(torch.load(ceah_ckpt, weights_only=False, map_location=device))
+
+        # --- bank artifacts (precomputed soft bank, kept on GPU) ---
+        # Stored as immutable `base_*`; the live `self.bank_z/...` fields are the
+        # base ⊕ delta merge produced by `_rebuild()`. With an empty delta the merge
+        # returns the base objects unchanged → byte-identical to the pre-delta path.
+        self.base_bank_z = torch.load(bank_path, weights_only=False)["bank_z"].to(device)  # [Nt,768]
+        cdir = Path(case_db_dir)
+        cases = torch.load(cdir / "train_cases.pt", weights_only=False)
+        cte = torch.load(cdir / "cause_text_embs.pt", weights_only=False)
+        self.base_cause_embs = F.normalize(cte["embeddings"].float().to(device), dim=-1)  # [Ncause,768]
+        self.base_cause_texts = list(cte["texts"])
+        idx_lists = [c["cause_emb_indices"] for c in cases]
+        max_c = max(len(x) for x in idx_lists)
+        memb = torch.full((len(cases), max_c), -1, dtype=torch.long)
+        mlen = torch.zeros(len(cases), dtype=torch.long)
+        for i, xs in enumerate(idx_lists):
+            memb[i, :len(xs)] = torch.tensor(xs, dtype=torch.long)
+            mlen[i] = len(xs)
+        self.base_memb = memb.to(device)
+        self.base_mlen = mlen.to(device)
+        self.base_file_names = [c["file_name"] for c in cases]
+        # image_path / provenance are pipeline-level (COCO + detection/train), injected
+        # via set_base_case_meta(); default to empty dicts so the standalone CLI works.
+        self.base_case_meta: list[dict] = [{} for _ in cases]
+
+        from diagnosis_model.grod.bank_delta import BankDelta
+        self.delta = BankDelta()
+        self._rebuild()
+        print(f"[bank] z={tuple(self.bank_z.shape)} causes={tuple(self.cause_embs.shape)} "
+              f"memb={tuple(self.memb.shape)} (base={self.base_bank_z.size(0)} delta={len(self.delta)})")
+
+    # ------------------------------------------------------------------ bank delta
+    def _rebuild(self) -> None:
+        """Recompute the live bank fields from base ⊕ delta (call after any mutation)."""
+        v = self.delta.combined(
+            self.base_bank_z, self.base_memb, self.base_mlen,
+            self.base_cause_embs, self.base_cause_texts,
+            self.base_file_names, self.base_case_meta,
+        )
+        self.bank_z, self.memb, self.mlen = v.bank_z, v.memb, v.mlen
+        self.cause_embs, self.cause_texts = v.cause_embs, v.cause_texts
+        self.file_names, self.case_meta = v.file_names, v.case_meta
+
+    def set_base_case_meta(self, case_meta: list) -> None:
+        """Inject base per-case {image_path, source_dataset, source_task_id} (pipeline
+        knows detection/train + COCO provenance) aligned to base_file_names, then rebuild."""
+        assert len(case_meta) == len(self.base_file_names), "case_meta must align with base bank"
+        self.base_case_meta = list(case_meta)
+        self._rebuild()
+
+    @property
+    def bank_size(self) -> int:
+        return int(self.bank_z.size(0))
+
+    @torch.no_grad()
+    def encode_case(self, image: Image.Image, det_thresh: float = DEFAULT_LESION_THRESH):
+        """One joint forward + soft aggregate → case vector z[768] (same path as
+        bank_z_soft was built). Returns None for a healthy image (no query clears
+        the objectness threshold) → caller should drop it from the bank."""
+        px = TF.normalize(TF.resize(TF.to_tensor(image), [self.res, self.res]),
+                          self.means, self.stds).unsqueeze(0).to(self.dev)
+        out = self.net(px)
+        logits = out["pred_logits"][0][:, 0]
+        z_all, g = out["pred_semantic"][0], out["pred_global"][0]
+        obj = logits.sigmoid()
+        if float(obj.max()) < det_thresh:
+            return None
+        w = self.gate(logits.unsqueeze(0))[0] if self.gate is not None else obj
+        zq = self.enc(g.float().unsqueeze(0), z_all.float().unsqueeze(0),
+                      torch.tensor([w.numel()], device=self.dev),
+                      lesion_weights=w.float().unsqueeze(0))            # [1,768]
+        return zq[0].detach()
+
+    def bank_upsert(self, rec) -> int:
+        """Add/replace a delta case (rec: bank_delta.DeltaCase); returns new bank size."""
+        self.delta.upsert(rec)
+        self._rebuild()
+        return self.bank_size
+
+    def bank_delete(self, case_id: str) -> int:
+        self.delta.delete(case_id)
+        self._rebuild()
+        return self.bank_size
+
+    @torch.no_grad()
+    def infer(self, image: Image.Image, det_thresh=DEFAULT_LESION_THRESH,
+              top_k_cases=20, top_n=10, verify=False):
+        px = TF.normalize(TF.resize(TF.to_tensor(image), [self.res, self.res]),
+                          self.means, self.stds).unsqueeze(0).to(self.dev)
+        out = self.net(px)
+        logits = out["pred_logits"][0][:, 0]                     # [Q] ABNORMAL logit (cat 0 -> col 0)
+        z_all, g = out["pred_semantic"][0], out["pred_global"][0]  # [Q,768],[768]
+        obj = logits.sigmoid()                                   # [Q] absolute objectness: selection / abstain
+        # Region Gate weights drive aggregation + attribution; decoupled from
+        # objectness (which drives selection/abstain). Legacy fallback = sigmoid.
+        w = self.gate(logits.unsqueeze(0))[0] if self.gate is not None else obj
+
+        # select top-K by objectness (softmax preserves rank, so == by gate weight)
+        sel, lidx = obj.topk(self.top_k_lesions)                 # descending; sel[0]=max objectness
+
+        # abstain: healthy iff no query clears the fixed objectness threshold
+        if sel[0].item() < det_thresh:
+            return []
+
+        # aggregate ALL Q gate-weighted queries -> query case vector (matches bank_z_soft)
+        zq = self.enc(g.float().unsqueeze(0), z_all.float().unsqueeze(0),
+                      torch.tensor([w.numel()], device=self.dev),
+                      lesion_weights=w.float().unsqueeze(0))      # [1,768]
+
+        # retrieval (dense, no RVQ) over the soft bank -> candidate cause pool
+        s = zq @ self.bank_z.t()                                 # [1,Nt]
+        _, cidx = s[0].topk(top_k_cases)
+        rows, rlen = self.memb[cidx], self.mlen[cidx]
+        cmask = torch.arange(rows.size(1), device=self.dev)[None] < rlen[:, None]
+        cand = torch.unique(rows[cmask])
+        cand = cand[cand >= 0]
+        P = cand.numel()
+        cand_embs = self.cause_embs[cand]                        # [P,768]
+
+        # soft CEAH over candidates: top-K lesions (by objectness), gate weights as the soft alpha gate
+        z_k = z_all[lidx]                                        # [K,768]
+        g_e = g.float().unsqueeze(0).expand(P, -1)
+        l_e = z_k.float().unsqueeze(0).expand(P, -1, -1).contiguous()
+        l_w = w[lidx].float().unsqueeze(0).expand(P, -1).contiguous()
+        l_m = torch.ones(P, self.top_k_lesions, dtype=torch.bool, device=self.dev)
+        t_e = torch.zeros(P, 768, device=self.dev)
+        t_p = torch.zeros(P, dtype=torch.bool, device=self.dev)
+        s_ceah, alphas, _ = self.ceah(g_e, t_e, t_p, l_e, l_m, cand_embs, lesion_weights=l_w)
+        order = s_ceah.argsort(descending=True)[:top_n]
+
+        if verify:
+            for name, t in [("pred_global", g), ("lesion_z", z_all), ("weights", w),
+                            ("query_zq", zq), ("sims", s), ("candidates", cand),
+                            ("ceah_score", s_ceah), ("rank_order", order)]:
+                assert t.is_cuda, f"{name} left CUDA!"
+            print(f"[verify] Q={z_all.size(0)} topK_les={self.top_k_lesions} P_candidates={P} "
+                  f"max_obj={sel[0].item():.3f} — all on CUDA ✓")
+
+        ids = cand[order].cpu().tolist()
+        sc = s_ceah[order].cpu().tolist()
+        return [(self.cause_texts[i], v) for i, v in zip(ids, sc)]
+
+
 class GrodSoftPipeline:
     label = "grod_soft"
     hard_gate = False   # grod_soft: continuous w. Subclass GrodPipeline sets True
@@ -420,12 +660,20 @@ class GrodSoftPipeline:
                         # bytes-exact hard-gate degenerate of this same soft model.
 
     def __init__(self):
-        from diagnosis_model.grod.gpu_infer_soft import GpuPipelineSoft
         self.p = GpuPipelineSoft(str(JOINT_CKPT), str(GLOBAL_SD), str(ANCHORS_PT),
                                  str(SOFT_ENC), str(SOFT_CEAH), str(SOFT_CASE_DB),
                                  str(SOFT_BANK), device=DEVICE)
-        cases = torch.load(Path(SOFT_CASE_DB) / "train_cases.pt", weights_only=False)
-        self.file_names = [c["file_name"] for c in cases]
+        # Inject base per-case display/provenance metadata (image_path + source
+        # dataset/task) aligned to the bank, so retrieved cards resolve uniformly
+        # across base and hot-updated delta cases (delta carries its own metadata).
+        prov = _load_provenance()
+        base_meta = []
+        for fn in self.p.base_file_names:
+            src = prov.get(fn, {})
+            base_meta.append({"image_path": str(DET_TRAIN / fn),
+                              "source_dataset": src.get("source_dataset"),
+                              "source_task_id": src.get("source_task_id")})
+        self.p.set_base_case_meta(base_meta)
         self.params = {**_detector_params(self.p.net.core),
                        "Weighted DeepSets Aggregator": _nparams(self.p.enc),
                        "Cause-Evidence Attribution Module": _nparams(self.p.ceah)}
@@ -495,7 +743,7 @@ class GrodSoftPipeline:
         lesions = [{"idx": i, "bbox_xywh": bxywh[i], "det_score": float(scores[i]),
                     "crop": crops[i], "cls": cls[i]} for i in range(M)]
         return {"image_pil": image, "lesions": lesions, "n_lesions": M,
-                "retrieved": _retrieved_cards(topi, topw, self.file_names),
+                "retrieved": _retrieved_cards(topi, topw, self.p.file_names, self.p.case_meta),
                 "top_n": top_n_out, "pool_size": P, "abstain": False,
                 "obj_all": w, "boxes_all": boxes,
                 "text_used": text_emb is not None, "timings": T}

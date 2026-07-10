@@ -5,7 +5,7 @@ import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
 from .. import dependencies
@@ -25,6 +25,7 @@ from ..models import (
     TaskDocument,
     TaskLocatorResponse,
 )
+from ..services import bank_sync
 from ..services import datasets as datasets_service
 from ..services import storage as storage_service
 from ..services import tasks as tasks_service
@@ -54,6 +55,7 @@ def get_global_symptoms(
 @router.post("/datasets/{dataset}/tasks/import", response_model=ImportTaskResponse)
 def import_diagnosis_task(
     dataset: str,
+    background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
     doc_json: str = Form(...),
     editor_name: str = Form(...),
@@ -109,6 +111,9 @@ def import_diagnosis_task(
         (target_dir / filename).unlink(missing_ok=True)
         raise
 
+    # Mirror the imported case into the retrieval bank (healthy → removed/no-op).
+    background_tasks.add_task(bank_sync.sync_upsert, dataset, stem, settings)
+
     listing = (
         storage_service.list_healthy_images(dataset, settings)
         if is_healthy
@@ -116,6 +121,18 @@ def import_diagnosis_task(
     )
     index = next((i + 1 for i, fn in enumerate(listing) if Path(fn).stem == stem), 1)
     return ImportTaskResponse(ok=True, task_id=stem, index=index, dataset=dataset, is_healthy=is_healthy)
+
+
+@router.post("/admin/bank/resync")
+def admin_bank_resync(
+    settings: Settings = Depends(dependencies.get_app_settings),
+    _role: str = Depends(dependencies.require_expert),
+) -> dict:
+    """Rebuild the diagnosis serve retrieval bank's delta layer from all writable
+    datasets (serve-restart recovery). Serve calls this on startup; can also be run
+    manually. Synchronous — serve waits for it during its startup callback."""
+    count = bank_sync.resync_all(settings)
+    return {"ok": True, "pushed": count}
 
 
 @router.get("/datasets/{dataset}/classes", response_model=ClassesResponse)
@@ -191,6 +208,7 @@ def get_healthy_image(
 def delete_dataset_task(
     dataset: str,
     task_id: str,
+    background_tasks: BackgroundTasks,
     settings: Settings = Depends(dependencies.get_app_settings),
     _role: str = Depends(dependencies.require_expert),
 ) -> dict[str, bool]:
@@ -200,6 +218,8 @@ def delete_dataset_task(
     if not datasets_service.is_writable(dataset, settings):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="此資料集已鎖定，無法刪除")
     image_filename = storage_service.delete_task(dataset, task_id, settings)
+    # Drop it from the retrieval bank too.
+    background_tasks.add_task(bank_sync.sync_delete, dataset, task_id, settings)
     storage_service.append_audit_log(
         {
             "who": "expert",
@@ -273,10 +293,13 @@ def list_healthy_images(
 def move_image_to_healthy_images(
     dataset: str,
     filename: str,
+    background_tasks: BackgroundTasks,
     settings: Settings = Depends(dependencies.get_app_settings),
     _role: str = Depends(dependencies.require_editor),
 ) -> dict[str, bool]:
     storage_service.move_image_to_healthy_images(dataset, filename, settings)
+    # Moving to healthy downgrades it to a non-case → remove from the retrieval bank.
+    background_tasks.add_task(bank_sync.sync_delete, dataset, Path(filename).stem, settings)
     storage_service.append_audit_log(
         {
             "who": "system",
