@@ -38,7 +38,8 @@ def _default_taps(num_layers: int):
 
 
 class DinoV3Backbone(nn.Module):
-    def __init__(self, variant="base", out_feature_indexes=None, patch_size=16):
+    def __init__(self, variant="base", out_feature_indexes=None, patch_size=16,
+                 interpolate_pos=False):
         super().__init__()
         from transformers import AutoModel
 
@@ -46,6 +47,10 @@ class DinoV3Backbone(nn.Module):
         offline = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
         self.encoder = AutoModel.from_pretrained(model_id, local_files_only=offline)
         cfg = self.encoder.config
+        # Supervised ViTs (e.g. timm/DeiT-style) carry a fixed-resolution pos-embed
+        # trained at 224; DINOv3 handles arbitrary resolution natively. Only the
+        # former needs pos-embed interpolation at detection resolution.
+        self.interpolate_pos = interpolate_pos
 
         self.patch_size = getattr(cfg, "patch_size", patch_size)
         width = cfg.hidden_size
@@ -63,7 +68,10 @@ class DinoV3Backbone(nn.Module):
     def forward(self, pixel_values):
         B, _, H, W = pixel_values.shape
         Hp, Wp = H // self.patch_size, W // self.patch_size
-        out = self.encoder(pixel_values, output_hidden_states=True)
+        kwargs = {"output_hidden_states": True}
+        if self.interpolate_pos:
+            kwargs["interpolate_pos_encoding"] = True
+        out = self.encoder(pixel_values, **kwargs)
         hs = out.hidden_states  # tuple, len = num_hidden_layers + 1
         feats = []
         for idx in self.out_feature_indexes:

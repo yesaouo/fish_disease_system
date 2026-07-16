@@ -12,9 +12,10 @@ Import this before building the model:
 from .dinov3 import DINOV3_VARIANTS, DinoV3Backbone
 
 
-def _make(variant):
+def _make(variant, interpolate_pos=False):
     def factory(out_feature_indexes=None, patch_size=16):
-        return DinoV3Backbone(variant, out_feature_indexes, patch_size)
+        return DinoV3Backbone(variant, out_feature_indexes, patch_size,
+                              interpolate_pos=interpolate_pos)
     return factory
 
 
@@ -22,6 +23,11 @@ def _make(variant):
 # seam) can register the same encoders without re-deriving the mapping.
 BACKBONE_FACTORIES = {f"dinov3_{v}": _make(v) for v in DINOV3_VARIANTS}
 BACKBONE_FACTORIES["dinov3"] = _make("base")   # bare alias -> base
+# Supervised ViT-S/16 (ImageNet-1k), same ViT-S arch/size/depth as dinov3_small —
+# isolates self-supervised (DINO) vs supervised pretraining as backbone init.
+# Trained at 224 → pos-embed must be interpolated at detection resolution.
+BACKBONE_FACTORIES["vit_s_sup"] = _make("WinKawaks/vit-small-patch16-224",
+                                        interpolate_pos=True)
 
 
 def register_backbones(register_fn):

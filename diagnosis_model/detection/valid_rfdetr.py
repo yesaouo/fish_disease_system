@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
                    help="資料集根目錄，需有 train/、valid/、(test/) 與 _annotations.coco.json")
     p.add_argument("--checkpoint_path", type=Path,
                    default=Path("outputs/rfdetr/checkpoint_best_total.pth"), help="模型權重路徑")
-    p.add_argument("--output_dir", type=Path, default=Path("outputs/rfdetr_eval"), help="輸出資料夾")
+    p.add_argument("--output_dir", type=Path, default=Path("diagnosis_model/detection/outputs/rfdetr_eval"), help="輸出資料夾")
     return p.parse_args()
 
 

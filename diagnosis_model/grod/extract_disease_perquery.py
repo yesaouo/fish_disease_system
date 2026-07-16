@@ -96,7 +96,7 @@ def gather_from_coco(det_root):
     """
     det_root = Path(det_root)
     out = {}
-    for fold, key in [("train", "train"), ("valid", "val")]:
+    for fold, key in [("train", "train"), ("valid", "val"), ("test", "test")]:
         coco = json.load(open(det_root / fold / "_annotations.coco.json"))
         by_img = {}
         for a in coco["annotations"]:
@@ -159,6 +159,8 @@ def main():
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--splits", nargs="+", default=["train", "val", "test"],
+                    help="which splits to (re)extract; keys are train/val/test")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -168,7 +170,7 @@ def main():
         items = {s: [x for x in v if x[2] == 1][:args.limit] + [x for x in v if x[2] == 0][:args.limit]
                  for s, v in items.items()}
     grod = Grod(args.joint_ckpt, args.global_sd, args.anchors, dev)
-    for s in ("train", "val"):
+    for s in args.splits:
         print(f"[extract] {s}")
         data = extract_split(grod, items[s], args.iou_thresh, args.batch_size, args.workers)
         suffix = "_smoke" if args.limit else ""

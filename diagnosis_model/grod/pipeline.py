@@ -104,10 +104,48 @@ def _font(size: int = 12) -> FontProperties:
     return FontProperties(size=size)
 
 
-def _sync_now() -> float:
-    if DEVICE.startswith("cuda"):
-        torch.cuda.synchronize()
-    return time.perf_counter()
+class _StageTimer:
+    """Per-stage latency with zero mid-pipeline stall.
+
+    Each stage is bracketed by a pair of CUDA events (async GPU time) AND a
+    no-sync perf_counter (CPU wall time); the whole run is resolved by a *single*
+    synchronize() in finish(), reporting max(gpu_ms, cpu_ms) per stage. The max
+    keeps CPU-only stages (e.g. 病因彙整 / _fold_topn) honest — pure CUDA-event
+    timing reports ~0 for them because no kernel runs. Unlike a synchronize() at
+    every boundary, this neither stalls the pipeline nor inflates the numbers with
+    the drain it forces. On CPU-only devices it degrades to plain perf_counter."""
+
+    def __init__(self):
+        self.cuda = DEVICE.startswith("cuda")
+        self._rows: list = []      # cuda: (label, cpu0, cpu1, ev0, ev1) ; cpu: (label, ms)
+        self._done = None
+
+    def tic(self):
+        if self.cuda:
+            ev = torch.cuda.Event(enable_timing=True); ev.record()
+            return (ev, time.perf_counter())
+        return time.perf_counter()
+
+    def toc(self, label: str, tok):
+        if self.cuda:
+            ev1 = torch.cuda.Event(enable_timing=True); ev1.record()
+            ev0, cpu0 = tok
+            self._rows.append((label, cpu0, time.perf_counter(), ev0, ev1))
+        else:
+            self._rows.append((label, (time.perf_counter() - tok) * 1000.0))
+
+    def finish(self):
+        if self._done is not None:                 # called once per inference; cache guards
+            return self._done                      # the abstain/normal paths both hitting it
+        if not self.cuda:
+            self._done = list(self._rows)
+            return self._done
+        torch.cuda.synchronize()                   # the one and only stall
+        out = []
+        for label, cpu0, cpu1, ev0, ev1 in self._rows:
+            out.append((label, max(ev0.elapsed_time(ev1), (cpu1 - cpu0) * 1000.0)))
+        self._done = out
+        return out
 
 
 def _nparams(m: torch.nn.Module) -> int:
@@ -682,8 +720,8 @@ class GrodSoftPipeline:
     def infer_rich(self, image, text_emb, top_k_cases, top_n,
                    abstain_thresh=ABSTAIN_DEFAULT, display_thresh=DISPLAY_DEFAULT):
         p = self.p; dev = DEVICE; W, H = image.size; K = p.top_k_lesions
-        T = []
-        t = _sync_now()
+        tm = _StageTimer()
+        t = tm.tic()
         px = TF.normalize(TF.resize(TF.to_tensor(image), [p.res, p.res]),
                           p.means, p.stds).unsqueeze(0).to(dev)
         out = p.net(px)
@@ -694,17 +732,17 @@ class GrodSoftPipeline:
         # from objectness. Legacy sigmoid ckpt (p.gate=None) -> falls back to w.
         w_gate = p.gate(logits.unsqueeze(0))[0] if p.gate is not None else w
         scores, lidx = w.topk(min(K, w.numel()))
-        T.append(("① 影像分析與病灶偵測", (_sync_now() - t) * 1000))
+        tm.toc("① 影像分析與病灶偵測", t)
 
         # Two thresholds: abstain (健/病) + display (顯示選框). Aggregation always uses
         # all-Q (soft contract); CEAH always uses top-K; the thresholds only govern the
         # DISPLAY mask + abstain. Abstain = 健 iff max objectness < abstain_thresh.
-        t = _sync_now()
+        t = tm.tic()
         abstain = float(w.amax()) < abstain_thresh
         keep_mask = scores > display_thresh
-        T.append(("② 健康／異常判定", (_sync_now() - t) * 1000))
+        tm.toc("② 健康／異常判定", t)
         if abstain or int(keep_mask.sum().item()) == 0:
-            r = _empty_result(image, T); r["abstain"] = True
+            r = _empty_result(image, tm.finish()); r["abstain"] = True
             r["obj_all"] = w; r["boxes_all"] = boxes; return r
         Kk = lidx.numel()
         zk = z_all[lidx]                                   # [Kk,768] — full top-K for CEAH
@@ -715,30 +753,30 @@ class GrodSoftPipeline:
                   float(bw[i] * W), float(bh[i] * H)] for i in range(M)]
         crops = [scaled_rect_crop(image, b) for b in bxywh]
 
-        t = _sync_now()
+        t = tm.tic()
         cls = classify_against_anchors(zk[:M].float())
-        T.append(("③ 病灶症狀分類", (_sync_now() - t) * 1000))
+        tm.toc("③ 病灶症狀分類", t)
 
-        t = _sync_now()
+        t = tm.tic()
         # hard_gate (grod mode): binarize objectness at display_thresh → {0,1}, the
         # bytes-exact hard-gate degenerate. grod_soft uses the Region Gate weights.
         w_model = (w > display_thresh).float() if self.hard_gate else w_gate.float()
         zq = p.enc(g.float().unsqueeze(0), z_all.float().unsqueeze(0),
                    torch.tensor([w.numel()], device=dev), lesion_weights=w_model.unsqueeze(0))
         cand, topi, topw = _candidate_pool(zq, p.bank_z, p.memb, p.mlen, top_k_cases, dev)
-        T.append(("④ 相似案例檢索", (_sync_now() - t) * 1000))
+        tm.toc("④ 相似案例檢索", t)
 
-        t = _sync_now()
+        t = tm.tic()
         lw = ((scores > display_thresh).float() if self.hard_gate else w_gate[lidx].float()).unsqueeze(0)
         scored = _ceah_score(p.ceah, g.float(), zk.float(), cand, p.cause_embs,
                              text_emb, dev,
                              lesion_weights=lw.expand(int(cand.numel()), -1).contiguous())
-        T.append(("⑤ 病因評分與證據分析", (_sync_now() - t) * 1000))
+        tm.toc("⑤ 病因評分與證據分析", t)
 
-        t = _sync_now()
+        t = tm.tic()
         top_n_out, P = _fold_topn(scored, p.cause_texts, top_n,
                                   topi=topi, memb=p.memb, mlen=p.mlen)
-        T.append(("⑥ 病因彙整", (_sync_now() - t) * 1000))
+        tm.toc("⑥ 病因彙整", t)
 
         lesions = [{"idx": i, "bbox_xywh": bxywh[i], "det_score": float(scores[i]),
                     "crop": crops[i], "cls": cls[i]} for i in range(M)]
@@ -746,7 +784,7 @@ class GrodSoftPipeline:
                 "retrieved": _retrieved_cards(topi, topw, self.p.file_names, self.p.case_meta),
                 "top_n": top_n_out, "pool_size": P, "abstain": False,
                 "obj_all": w, "boxes_all": boxes,
-                "text_used": text_emb is not None, "timings": T}
+                "text_used": text_emb is not None, "timings": tm.finish()}
 
 
 class GrodPipeline(GrodSoftPipeline):
@@ -821,51 +859,51 @@ class BasePipeline:
     @torch.no_grad()
     def infer_rich(self, image, text_emb, top_k_cases, top_n,
                    abstain_thresh=ABSTAIN_DEFAULT, display_thresh=DISPLAY_DEFAULT):
-        dev = DEVICE; T = []; W, H = image.size
-        t = _sync_now()
+        dev = DEVICE; tm = _StageTimer(); W, H = image.size
+        t = tm.tic()
         # detect at the (lower) display threshold so both the heatmap and the box
         # display see all candidates; abstain on the max confidence.
         pred = self.det.predict([image], threshold=display_thresh)
         det = pred[0] if isinstance(pred, list) else pred
         dets = sorted([([float(b[0]), float(b[1]), float(b[2] - b[0]), float(b[3] - b[1])], float(s))
                        for b, s in zip(det.xyxy, det.confidence)], key=lambda x: -x[1])
-        T.append(("① 偵測 (RF-DETR)", (_sync_now() - t) * 1000))
+        tm.toc("① 偵測 (RF-DETR)", t)
         # obj_all / boxes_all (cxcywh-norm) for the heatmap display
         obj_all = torch.tensor([d[1] for d in dets], device=dev) if dets else torch.zeros(0, device=dev)
         boxes_all = torch.tensor([[(d[0][0] + d[0][2] / 2) / W, (d[0][1] + d[0][3] / 2) / H,
                                    d[0][2] / W, d[0][3] / H] for d in dets],
                                  device=dev) if dets else torch.zeros(0, 4, device=dev)
         if not dets or max(d[1] for d in dets) < abstain_thresh:   # 沒框/最高分未達 → 健康
-            r = _empty_result(image, T); r["abstain"] = True
+            r = _empty_result(image, tm.finish()); r["abstain"] = True
             r["obj_all"] = obj_all; r["boxes_all"] = boxes_all; return r
         bxywh = [d[0] for d in dets]; scores = [d[1] for d in dets]
         crops = [scaled_rect_crop(image, b) for b in bxywh]
 
-        t = _sync_now()
+        t = tm.tic()
         g = self._enc_global(image); L = self._enc_lesions(crops)
-        T.append(("② SigLIP2 編碼 (global+lesion)", (_sync_now() - t) * 1000))
+        tm.toc("② SigLIP2 編碼 (global+lesion)", t)
         N = L.size(0)
 
-        t = _sync_now()
+        t = tm.tic()
         cls = classify_against_anchors(L)
-        T.append(("③ 病灶分類 (lesion·anchor)", (_sync_now() - t) * 1000))
+        tm.toc("③ 病灶分類 (lesion·anchor)", t)
 
-        t = _sync_now()
+        t = tm.tic()
         boxes = torch.tensor(bxywh, dtype=torch.float32)
         Ls = L[torch.argsort(boxes[:, 2] * boxes[:, 3], descending=True)]
         lp = torch.zeros(1, max(N, 1), self.in_dim, device=dev); lp[0, :N] = Ls
         zq = self.enc(g.unsqueeze(0), lp, torch.tensor([N], device=dev)).float()
         cand, topi, topw = _candidate_pool(zq, self.bank_z, self.memb, self.mlen, top_k_cases, dev)
-        T.append(("④ 相似案例檢索", (_sync_now() - t) * 1000))
+        tm.toc("④ 相似案例檢索", t)
 
-        t = _sync_now()
+        t = tm.tic()
         scored = _ceah_score(self.ceah, g, L, cand, self.cause_embs, text_emb, dev)
-        T.append(("⑤ 病因評分與證據分析", (_sync_now() - t) * 1000))
+        tm.toc("⑤ 病因評分與證據分析", t)
 
-        t = _sync_now()
+        t = tm.tic()
         top_n_out, P = _fold_topn(scored, self.cause_texts, top_n,
                                   topi=topi, memb=self.memb, mlen=self.mlen)
-        T.append(("⑥ 病因彙整", (_sync_now() - t) * 1000))
+        tm.toc("⑥ 病因彙整", t)
 
         lesions = [{"idx": i, "bbox_xywh": bxywh[i], "det_score": scores[i],
                     "crop": crops[i], "cls": cls[i]} for i in range(N)]
@@ -873,7 +911,7 @@ class BasePipeline:
                 "retrieved": _retrieved_cards(topi, topw, self.file_names),
                 "top_n": top_n_out, "pool_size": P, "abstain": False,
                 "obj_all": obj_all, "boxes_all": boxes_all,
-                "text_used": text_emb is not None, "timings": T}
+                "text_used": text_emb is not None, "timings": tm.finish()}
 
 
 def _empty_result(image, T):
@@ -929,8 +967,8 @@ def render_detection_image(image, lesions):
     """
     img = image.copy().convert("RGB"); draw = ImageDraw.Draw(img)
     long_side = max(img.size)
-    lw = max(3, round(long_side / 200))          # 框線寬，隨解析度放大
-    font_size = max(16, round(long_side / 30))   # 標籤字級，隨解析度放大
+    lw = max(1, round(long_side / 200))
+    font_size = max(8, round(long_side / 30))
     for li, les in enumerate(lesions):
         x, y, w, h = [int(v) for v in les["bbox_xywh"]]
         draw.rectangle((x, y, x + w, y + h), outline=(220, 50, 50), width=lw)

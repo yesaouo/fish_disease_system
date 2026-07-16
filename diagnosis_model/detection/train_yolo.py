@@ -49,7 +49,7 @@ def main() -> None:
         batch=32,
         imgsz=640,
         # 不指定 optimizer / lr0 / lrf / momentum / warmup，讓 YOLO 用預設
-        project=args.output_dir,
+        project=os.path.abspath(args.output_dir),
         name="train",
         exist_ok=True,
     )
