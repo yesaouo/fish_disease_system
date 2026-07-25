@@ -97,6 +97,45 @@ def _load_thresholds():
 
 ABSTAIN_DEFAULT, DISPLAY_DEFAULT = _load_thresholds()
 
+# Display-only box cleanup. Two rules, both UI-only:
+#   (1) NMS drops highly-overlapping duplicates (keeps higher objectness).
+#       IoU=0.6 validated on val diseased: 0 real lesions killed, recall unchanged.
+#   (2) Containment drops any box mostly inside a larger one (keeps the outermost).
+DISPLAY_NMS_IOU = 0.6
+DISPLAY_CONTAIN = 0.8      # inner box ≥80% inside a larger box → drop the inner one
+
+
+def _display_nms(boxes_cxcywh, scores, W, H, iou_thr=DISPLAY_NMS_IOU,
+                 contain_thr=DISPLAY_CONTAIN):
+    """Clean the DISPLAY box set: (1) NMS drops highly-overlapping duplicates
+    (keeps higher objectness); (2) containment drops any box mostly inside a
+    larger box (keeps the outermost). Returns kept indices into the input, in the
+    original objectness-descending order. UI-only: the aggregation/CEAH paths keep
+    the full top-K / all-query sets untouched."""
+    from torchvision.ops import nms
+    if boxes_cxcywh.numel() == 0:
+        return torch.arange(0, dtype=torch.long, device=boxes_cxcywh.device)
+    cx, cy, bw, bh = boxes_cxcywh.unbind(-1)
+    xyxy = torch.stack([(cx - bw / 2) * W, (cy - bh / 2) * H,
+                        (cx + bw / 2) * W, (cy + bh / 2) * H], dim=-1)
+    keep = nms(xyxy, scores, iou_thr).sort().values            # near-duplicate dedup
+    # Containment: process largest-first, drop a box mostly inside a kept larger one.
+    areas = (bw * W).clamp(min=0) * (bh * H).clamp(min=0)
+    order = keep[torch.argsort(areas[keep], descending=True)]
+    survivors: list[int] = []
+    for i in order.tolist():
+        xi = xyxy[i]
+        nested = False
+        for j in survivors:                                    # survivors are all ≥ area
+            xj = xyxy[j]
+            iw = (torch.min(xi[2], xj[2]) - torch.max(xi[0], xj[0])).clamp(min=0)
+            ih = (torch.min(xi[3], xj[3]) - torch.max(xi[1], xj[1])).clamp(min=0)
+            if (iw * ih) / areas[i].clamp(min=1e-6) > contain_thr:
+                nested = True; break
+        if not nested:
+            survivors.append(i)
+    return torch.tensor(sorted(survivors), dtype=torch.long, device=boxes_cxcywh.device)
+
 
 def _font(size: int = 12) -> FontProperties:
     if os.path.exists(CJK_FONT_PATH):
@@ -746,15 +785,20 @@ class GrodSoftPipeline:
             r["obj_all"] = w; r["boxes_all"] = boxes; return r
         Kk = lidx.numel()
         zk = z_all[lidx]                                   # [Kk,768] — full top-K for CEAH
-        M = max(int(keep_mask.sum().item()), 1)
-        bn = boxes[lidx[:M]]
+        M0 = max(int(keep_mask.sum().item()), 1)
+        # Display-only cleanup: drop highly-overlapping duplicates (keep higher
+        # objectness) + drop nested boxes (keep the outermost). zk / zq / CEAH
+        # below keep the full top-K / all-query contract, so this is UI-only.
+        disp = _display_nms(boxes[lidx[:M0]], scores[:M0], W, H)
+        sel = lidx[:M0][disp]; dscores = scores[:M0][disp]; M = int(disp.numel())
+        bn = boxes[sel]
         cx, cy, bw, bh = bn.unbind(-1)
         bxywh = [[float((cx[i] - bw[i] / 2) * W), float((cy[i] - bh[i] / 2) * H),
                   float(bw[i] * W), float(bh[i] * H)] for i in range(M)]
         crops = [scaled_rect_crop(image, b) for b in bxywh]
 
         t = tm.tic()
-        cls = classify_against_anchors(zk[:M].float())
+        cls = classify_against_anchors(zk[:M0][disp].float())
         tm.toc("③ 病灶症狀分類", t)
 
         t = tm.tic()
@@ -778,7 +822,7 @@ class GrodSoftPipeline:
                                   topi=topi, memb=p.memb, mlen=p.mlen)
         tm.toc("⑥ 病因彙整", t)
 
-        lesions = [{"idx": i, "bbox_xywh": bxywh[i], "det_score": float(scores[i]),
+        lesions = [{"idx": i, "bbox_xywh": bxywh[i], "det_score": float(dscores[i]),
                     "crop": crops[i], "cls": cls[i]} for i in range(M)]
         return {"image_pil": image, "lesions": lesions, "n_lesions": M,
                 "retrieved": _retrieved_cards(topi, topw, self.p.file_names, self.p.case_meta),

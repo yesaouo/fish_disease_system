@@ -56,6 +56,47 @@ def minmax_norm(x: torch.Tensor) -> torch.Tensor:
     return (x - lo) / (hi - lo)
 
 
+def diff_set_recall_precision(
+    hybrid: torch.Tensor,
+    candidate_indices: List[int],
+    rel_by_idx: Dict[int, float],
+    pathology_idx=None,
+    mass_thresh: float = 0.01,
+):
+    """DDXPlus set-overlap differential metrics (official definition, Table 3).
+
+    Predicted differential = candidate causes whose sum-normalized score mass
+    exceeds `mass_thresh` (0.01, matching the DDXPlus post-processing that drops
+    pathologies with mass <= 0.01). GT differential = ddx entries with prob >
+    mass_thresh. Returns per-query ``(recall, precision, f1, gtpa)`` or
+    ``(None, None, None, None)`` when the query has no GT differential / empty
+    pool. ``f1`` is the PER-QUERY F1 (paper reports DDF1 = mean of these, NOT
+    the F1 of the averaged DDR/DDP). ``gtpa`` = 1 if the strict ground-truth
+    pathology falls inside the predicted differential set, else 0.
+    """
+    if len(candidate_indices) == 0 or not rel_by_idx:
+        return None, None, None, None
+    w = hybrid.detach().float().clamp_min(0.0)
+    total = float(w.sum().item())
+    if total <= 0:
+        return None, None, None, None
+    probs = (w / total).cpu().numpy()
+    pred_set = {
+        int(candidate_indices[j])
+        for j in range(len(candidate_indices))
+        if probs[j] > mass_thresh
+    }
+    gt_set = {int(i) for i, r in rel_by_idx.items() if r > mass_thresh}
+    if not gt_set:
+        return None, None, None, None
+    inter = len(pred_set & gt_set)
+    recall = inter / len(gt_set)
+    precision = inter / len(pred_set) if pred_set else 0.0
+    f1 = 2 * recall * precision / (recall + precision) if (recall + precision) > 0 else 0.0
+    gtpa = 1.0 if (pathology_idx is not None and int(pathology_idx) in pred_set) else 0.0
+    return recall, precision, f1, gtpa
+
+
 @torch.no_grad()
 def ceah_forward_for_pool(
     ceah: CEAH,
@@ -214,6 +255,10 @@ def main():
     ddx_mass_at_k: Dict[str, Dict[int, List[float | None]]] = {
         f"g={g:.2f}": {k: [] for k in args.ks} for g in args.gammas
     }
+    ddr_by_gamma: Dict[str, List[float]] = {f"g={g:.2f}": [] for g in args.gammas}
+    ddp_by_gamma: Dict[str, List[float]] = {f"g={g:.2f}": [] for g in args.gammas}
+    ddf1q_by_gamma: Dict[str, List[float]] = {f"g={g:.2f}": [] for g in args.gammas}
+    gtpa_by_gamma: Dict[str, List[float]] = {f"g={g:.2f}": [] for g in args.gammas}
     ddx_pool_mass_cov: List[float | None] = []
     pool_sizes: List[int] = []
     retained_case_counts: List[int] = []
@@ -295,6 +340,13 @@ def main():
             for k in args.ks:
                 ddx_ndcg[tag][k].append(ndcg_at_k(sorted_global, rel_by_idx, k))
                 ddx_mass_at_k[tag][k].append(relevance_mass_at_k(sorted_global, rel_by_idx, k))
+            ddr, ddp, ddf1q, gtpa = diff_set_recall_precision(
+                hybrid, candidate_indices, rel_by_idx, pidx)
+            if ddr is not None:
+                ddr_by_gamma[tag].append(ddr)
+                ddp_by_gamma[tag].append(ddp)
+                ddf1q_by_gamma[tag].append(ddf1q)
+                gtpa_by_gamma[tag].append(gtpa)
 
             if tag == dump_tag:
                 top_n = min(args.top_n_causes, len(sorted_global))
@@ -352,6 +404,17 @@ def main():
         arr = np.asarray(ranks, dtype=np.float64)
         block = summarize_rank_metric(arr, cov_by_gamma[tag])
         add_recall_at_ks(block, arr, args.ks)
+        ddr = float(np.mean(ddr_by_gamma[tag])) if ddr_by_gamma[tag] else None
+        ddp = float(np.mean(ddp_by_gamma[tag])) if ddp_by_gamma[tag] else None
+        # DDF1 (paper, Table 3) = mean of PER-QUERY F1; NOT F1 of the averaged DDR/DDP.
+        ddf1_meanf1 = float(np.mean(ddf1q_by_gamma[tag])) if ddf1q_by_gamma[tag] else None
+        # F1-of-means kept only for reference (not the paper definition).
+        if ddr is not None and ddp is not None and (ddr + ddp) > 0:
+            ddf1_of_means = 2.0 * ddr * ddp / (ddr + ddp)
+        else:
+            ddf1_of_means = None
+        # GTPA (paper) = strict ground-truth pathology falls inside predicted differential set.
+        gtpa = float(np.mean(gtpa_by_gamma[tag])) if gtpa_by_gamma[tag] else None
         metrics_by_gamma[tag] = {
             "pathology_exact": block,
             "differential_diagnosis": {
@@ -359,6 +422,13 @@ def main():
                 "relevance_mass_at_k": {
                     f"@{k}": mean_optional(ddx_mass_at_k[tag][k]) for k in args.ks
                 },
+                # DDXPlus official set-overlap metrics (mass>0.01 predicted/GT differential).
+                "DDR": ddr,
+                "DDP": ddp,
+                "DDF1": ddf1_meanf1,           # official = mean of per-query F1
+                "DDF1_of_means": ddf1_of_means,  # reference only
+                "GTPA": gtpa,                  # GT pathology in predicted differential set
+                "n_ddx_queries": len(ddr_by_gamma[tag]),
             },
         }
 
