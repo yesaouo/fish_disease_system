@@ -824,7 +824,7 @@ done
 
 ## H. Soft lesion evidence（no-hard-threshold）+ GROD-side abstain
 
-> 把 `gpu_infer.py` 的硬門檻 lesion 選取（`obj>det_thresh` 硬選、abstain＝零保留 box）改成
+> 把舊硬門檻 lesion 選取（`obj>det_thresh` 硬選、abstain＝零保留 box）改成
 > **soft**：GROD 一次 forward 出 300 個 query，每個帶 `w=sigmoid(objectness)`，全留、用 w 當連續
 > mask（Aggregator 加權 pooling、CEAM `α += log w` gate）。共用模型 `case_encoder.py` /
 > `ceah.py` 加可選 `lesion_weights`（不傳＝位元相同、傳 0/1＝退化回硬 mask；hard baseline 不受影響）。
@@ -926,23 +926,25 @@ GROD 凍結，warm-start enc+ceah，每 epoch：當前 enc 重編 bank → 重�
 > **結論：採用 staged，模組不需互相 fine-tune**（現成回答「為何不 end-to-end」）。production 維持
 > `encoder_grod_soft`+`ceah_grod_soft`；`e2e_soft/` 僅作此 ablation。
 
-### Table H6 — 候選池規模 top-$k$ 掃描（生產操作點 = k=3）★ 暫存／待併入 Ch5
+### Table H6 — 候選池規模 top-$k$ 掃描（生產操作點 = k=3）→ 已入 Ch5 表 20
 
-> ⚠ **暫存表（2026-06-21）**：跑在 **current 樹 artifacts**（`data/processed/current/artifacts`，
-> 15-class 定版）＋ **`cause_clusters_llm.json` 484 群**、γ=0（純 CEAM cascade）、1,573 valid。
-> 與本檔 A–F 表（舊樹 / 466 群）**世代不同、數字不可混用**——要併入論文須把相關表一律以 484 群重跑後同台比較。
+> **2026-07-27 定版**：改跑 **測試集**（`--split test`、1,603 筆）＋ gated 查詢（`soft_inputs_gated`）
+> ＋ `cause_clusters_llm.json` 475 群、γ=0（純 CEAM cascade）。此即論文 Ch5 表 20 之數字。
+> 與本檔 A–F 表（舊樹 / 466 群）**世代不同、數字不可混用**。
+> 舊紀錄（2026-06-21，驗證集 + 非 gated、484 群）已作廢：其 k=3 為 sem 67.3 / 群集 53.4。
 
 候選病因池 = Top-$k$ 相似案例之關聯病因聯集；γ=0 下由 CEAM 評分排序。掃 $k\in\{1,3,4,5,10,15,20\}$：
 
-| top-$k$ | sem R@1 | sem R@5 | sem R@10 | sem R@20 | sem MRR | NDCG@5 | cl R@10 | cl MRR |
-|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 1 | 18.5% | **51.0%** | 51.2% | 51.2% | 0.310 | 80.7% | 37.7% | 21.7 |
-| **3（生產）** | 20.1% | 48.5% | **67.3%** | 73.0% | **0.331** | 77.4% | **53.4%** | **23.7** |
-| 4 | 20.2% | 46.3% | 63.2% | 76.9% | 0.327 | 78.0% | 48.6% | 23.5 |
-| 5 | 20.0% | 44.2% | 59.5% | **78.5%** | 0.319 | 77.9% | 44.8% | 23.1 |
-| 10 | 20.6% | 39.9% | 49.8% | 65.5% | 0.307 | 79.4% | 36.0% | 22.3 |
-| 15 | **20.7%** | 38.0% | 46.5% | 58.1% | 0.299 | 80.6% | 33.1% | 21.5 |
-| 20 | 20.6% | 36.9% | 44.9% | 53.8% | 0.292 | **80.7%** | 31.9% | 20.9 |
+| top-$k$ | sem R@10 | sem MRR | P@5 | F1@5 | cl R@10 | cl MRR |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 53.2% | 0.318 | 0.530 | 0.528 | 43.3% | 0.258 |
+| **3（生產）** | **69.0%** | **0.336** | 0.727 | **0.589** | **56.8%** | **0.275** |
+| 5 | 59.7% | 0.330 | 0.771 | 0.567 | 47.5% | 0.271 |
+| 10 | 50.2% | 0.311 | 0.804 | 0.543 | 38.4% | 0.257 |
+| 20 | 45.5% | 0.294 | **0.812** | 0.521 | 34.6% | 0.244 |
+
+> **P@5 隨 $k$ 單調上升（0.530→0.812）、R@10 於 $k=3$ 達峰、F1@5 亦於 $k=3$ 達峰（0.589）**——
+> 候選池越大越容易在前五名填入受證據支持的病因，但整體涵蓋率被雜訊稀釋。兩個獨立指標同時選中 k=3。
 
 > **檢索品質對 $k$ 非單調、內部最佳在 $k=3$。** $k=3$ 取得 sem R@10、sem MRR、cluster R@10、cluster MRR
 > 四項全域最高；尤其疾病主題層級 **cluster R@10 由 $k=20$ 之 31.9% 升至 $k=3$ 之 53.4%（+21.5pp）**。
@@ -968,16 +970,16 @@ $PY -m diagnosis_model.grod.eval_faithfulness_soft_sweep      # H3(b) faithfulne
 $PY -m diagnosis_model.grod.train_disease_head                # disease_head.pt (col0)
 # --- 候選池規模 top-k 掃描（Table H6，eval-only；current 樹 484 群、γ=0） ---
 ART=data/processed/current/artifacts
-for K in 1 3 4 5 10 15 20; do $PY -m diagnosis_model.grod.eval_ceah_soft_paper \
-  --case_db_dir $ART/db/case_db_jointDistRawP --soft_dir $ART/db/soft_inputs \
+for K in 1 3 5 10 20; do $PY -m diagnosis_model.grod.eval_ceah_soft_paper \
+  --case_db_dir $ART/db/case_db_jointDistRawP --soft_dir $ART/db/soft_inputs_gated --split test \
   --encoder_ckpt $ART/models/encoder_grod_soft/best_encoder.pt \
   --bank_path $ART/models/encoder_grod_soft/bank_z_soft.pt \
   --ceah_ckpt $ART/models/ceah_grod_soft/best_ceah.pt \
   --cluster_json $ART/cause_clusters_llm.json --gammas 0.0 --top_k_cases $K; done
 # --- 輕量 end-to-end co-adaptive fine-tune（Table H5，negative result） ---
 $PY -m diagnosis_model.grod.finetune_e2e_soft --epochs 5      # -> outputs/e2e_soft (ablation only)
-# --- 端到端 soft cascade（對照 gpu_infer.py hard baseline） ---
-$PY -m diagnosis_model.grod.gpu_infer_soft --image <img> --verify
+# --- 端到端 soft cascade smoke ---
+# 見 BUILD_PIPELINE.md「Step 12. OAVLE smoke test」。
 ```
 
 ---
@@ -989,18 +991,22 @@ bank 檢索 → CEAM 病因評分（cascade **γ=0**），數字直接可比。�
 miss=+inf、occurrence-level cluster、`semantic_threshold=0.95`、`cause_clusters_llm`）與
 `eval_ceah_soft_paper` 完全一致（soft 列逐項相等，已交叉驗證）。
 
-### Table I1 — 整合式架構與區域門控消融（current 樹、valid 1583、γ=0、**top_k_cases=3** 生產操作點）
+### Table I1 — 整合式架構與區域門控消融（current 樹、**測試集 1603**、γ=0、**top_k_cases=3** 生產操作點）
 
-| 設定 | 參數量（M） | 延遲（ms） | Recall@10 | 群集 Recall@10 |
-|---|---:|---:|---:|---:|
-| 分離式基準（base） | 225 | 30.4 | **69.9%** | 55.6% |
-| OAVLE-Hard | 40.8 | 15.4 | 66.7% | 53.8% |
-| **OAVLE（soft・主）** | 40.8 | **12.2** | 68.6% | **56.0%** |
+| 設定 | 參數量（M） | 延遲（ms） | Recall@10 | P@5 | F1@5 | 群集 Recall@10 |
+|---|---:|---:|---:|---:|---:|---:|
+| 分離式基準（base） | 225 | 30.4 | **69.3%** | 0.718 | 0.582 | **57.0%** |
+| OAVLE-Hard | 40.8 | 15.4 | 67.8% | 0.708 | 0.574 | 56.0% |
+| **OAVLE（soft・主）** | 40.8 | **12.2** | 69.0% | **0.727** | **0.589** | 56.8% |
+
+> 舊驗證集紀錄（作廢）：base 69.9/55.6、hard 66.7/53.8、soft 68.6/56.0。
+> `display_thresh` 亦已由 train 校準的 0.322 改為驗證集 F2 argmax 的 **0.407**（hard 列受此影響）。
 
 > **參數量／延遲欄不出自本 eval**（另見第 §efficiency 節量測）；本表只負責 Recall@10 與群集 Recall@10。
-> 三列準確度持平（sem R@10 ±1.6pp、群集 R@10 ±2.2pp），符合論文主張「整合與軟門控之效益在體積／延遲／歸因，而非準確度」。
+> 三列準確度持平（sem R@10 ±1.5pp、群集 R@10 ±1.0pp），符合論文主張「整合與軟門控之效益在體積／延遲／歸因，而非準確度」。
+> 測試集上 base 之 R@10 與群集 R@10 均略高於 soft（0.3／0.2pp，雜訊內），但 soft 的 P@5／F1@5 為三者最高——論文據此改寫成「持平，且 OAVLE 於顯示操作點的精確率與 F1 最高」。
 >
-> **soft 用 gated（`soft_inputs_gated`，Region-Gate 權重）而非 raw `soft_inputs`。** 理由：`bank_z_soft` 是用 gated 訓出（BUILD_PIPELINE Step 8/9），生產 `GrodSoftPipeline` 也以 `w_gate` 查詢 → gated-query vs gated-bank 才自洽、才等於生產推論。**Hard 列** = 二值化 raw objectness（`sigmoid(obj)>display_thresh=0.322`）→{0,1} 查詢、沿用同一 gated `bank_z_soft`（demo hard 模式的 cross-feed 硬閘退化，不另建硬 bank）。
+> **soft 用 gated（`soft_inputs_gated`，Region-Gate 權重）而非 raw `soft_inputs`。** 理由：`bank_z_soft` 是用 gated 訓出（BUILD_PIPELINE Step 8/9），生產 `GrodSoftPipeline` 也以 `w_gate` 查詢 → gated-query vs gated-bank 才自洽、才等於生產推論。**Hard 列** = 二值化 raw objectness（`sigmoid(obj)>display_thresh=0.407`）→{0,1} 查詢、沿用同一 gated `bank_z_soft`（demo hard 模式的 cross-feed 硬閘退化，不另建硬 bank）。
 > 若改用非 gated `soft_inputs`（= Table H6 sweep 舊指令）查詢，soft 列 k=3 為 sem 67.0 / 群集 54.1（對應舊操作點紀錄 53.4），query/bank 不匹配、**非生產設定**，僅列此供對照。
 > `top_k_cases` 非單調，k=3 為內部最佳（見 Table H6）；k=20 對照：base 45.2/33.2、hard 44.7/32.9、soft 44.7/33.2。
 
@@ -1009,9 +1015,9 @@ miss=+inf、occurrence-level cluster、`semantic_threshold=0.95`、`cause_cluste
 ```bash
 PY=/home/lab603/anaconda3/envs/SDM/bin/python
 cd /mnt/ssd/YJ/fish_disease_system
-# 生產操作點 k=3（表 14）：
-$PY -m diagnosis_model.grod.eval_integration_ablation --top_k_cases 3
+# 生產操作點 k=3（論文表 15，測試集）：
+$PY -m diagnosis_model.grod.eval_integration_ablation --split test --top_k_cases 3
 # k=20 對照：
-$PY -m diagnosis_model.grod.eval_integration_ablation --top_k_cases 20
+$PY -m diagnosis_model.grod.eval_integration_ablation --split test --top_k_cases 20
 # 輸出 -> $ART/models/ceah_grod_soft/integration_ablation{,_k3}/metrics.json
 ```

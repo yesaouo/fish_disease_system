@@ -24,7 +24,7 @@ from diagnosis_model.cause_inference.models import CEAH
 from diagnosis_model.cause_inference.models.case_encoder import EncoderConfig, build_encoder
 from diagnosis_model.cause_inference.phase1_baseline import build_candidate_pool, select_positive_top_cases
 from diagnosis_model.grod.train_case_encoder_soft import encode_all_soft, load_soft
-from diagnosis_model.grod.eval_ceah_soft_paper import minmax, select_lesions
+from diagnosis_model.grod.soft_eval_common import minmax, topk_lesions as select_lesions
 from diagnosis_model.grod.pipeline import _fold_causes, FOLD_THRESH
 
 ART = "data/processed/current/artifacts"

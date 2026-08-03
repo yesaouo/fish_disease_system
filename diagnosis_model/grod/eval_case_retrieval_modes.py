@@ -159,7 +159,7 @@ def encode_mode(
             )
     else:
         # Match app_gradio.py: base forces fp32; grod follows the bf16 encoder
-        # config used by gpu_infer.py.
+        # config used by pipeline.py.
         dtype = torch.float32 if spec.name == "base" else torch.bfloat16
         enc = load_encoder(spec.encoder_ckpt, device, dtype_override=dtype)
         H_train = encode_all(enc, train_cases, device, batch_size=batch_size)

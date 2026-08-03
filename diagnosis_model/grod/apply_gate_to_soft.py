@@ -44,6 +44,8 @@ def main():
     ap.add_argument("--soft_dir", default=f"{ART}/db/soft_inputs")
     ap.add_argument("--out_dir", default=f"{ART}/db/soft_inputs_gated")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--splits", type=str, nargs="+", default=["train", "valid"],
+                    help="which {split}.pt to gate; the train bank is only rebuilt if 'train' is included")
     args = ap.parse_args()
 
     dev = args.device
@@ -57,7 +59,7 @@ def main():
     print(f"[gate] τ={gate.temp.item():.4f} ∅={gate.sink.item():+.4f}  (from {args.gate_ckpt})")
 
     g_tr = z_tr = None
-    for split in ("train", "valid"):
+    for split in args.splits:
         d = torch.load(Path(args.soft_dir) / f"{split}.pt", weights_only=False)
         wg = gate_weights(gate, d["w"].float(), dev)
         d["w"] = wg
@@ -67,6 +69,9 @@ def main():
         if split == "train":
             g_tr, z_tr, w_tr = d["g"], d["z_all"], wg
 
+    if g_tr is None:
+        print("[skip] bank_z_soft.pt not rebuilt (train not in --splits)")
+        return
     bank = encode_all_soft(enc, g_tr, z_tr, w_tr, dev)
     torch.save({"bank_z": bank, "encoder_ckpt": args.gate_ckpt}, out_dir / "bank_z_soft.pt")
     print(f"[save] {out_dir/'bank_z_soft.pt'}  bank={tuple(bank.shape)}")

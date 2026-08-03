@@ -53,7 +53,11 @@ def main():
     ap.add_argument("--clusters_json", default="data/processed/current/artifacts/cause_clusters_llm.json")
     ap.add_argument("--out", default="data/processed/current/thresholds.json")
     ap.add_argument("--n_queries", type=int, default=400)
-    ap.add_argument("--top_k_cases", type=int, default=20)
+    ap.add_argument("--top_k_cases", type=int, default=3)
+    ap.add_argument("--queries", choices=["valid", "train"], default="valid")
+    ap.add_argument("--soft_dir", default="data/processed/current/artifacts/db/soft_inputs_gated")
+    ap.add_argument("--encoder_ckpt",
+                    default="data/processed/current/artifacts/models/encoder_grod_soft/best_encoder.pt")
     ap.add_argument("--cut_grid", default="0.30:1.01:0.05",
                     help="start:stop:step (stop exclusive)")
     ap.add_argument("--seed", type=int, default=0)
@@ -82,13 +86,25 @@ def main():
 
     bank_n = F.normalize(bank_z, dim=-1)
     rng = np.random.default_rng(args.seed)
-    qids = rng.choice(len(tc), size=min(args.n_queries, len(tc)), replace=False)
+
+    if args.queries == "valid":
+        # 驗證查詢 × 訓練 bank = 生產檢索設定，且門檻校準不觸及訓練案例本身。
+        from diagnosis_model.grod.train_case_encoder_soft import load_soft, encode_all_soft
+        from diagnosis_model.grod.artifacts import load_encoder
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        enc = load_encoder(Path(args.encoder_ckpt), dev)
+        g_va, z_va, w_va, _ = load_soft(Path(args.soft_dir) / "valid.pt")
+        Q = F.normalize(encode_all_soft(enc, g_va, z_va, w_va, dev).float().cpu(), dim=-1)
+    else:
+        Q = bank_n
+    qids = rng.choice(Q.size(0), size=min(args.n_queries, Q.size(0)), replace=False)
 
     per_cut = {float(c): [] for c in cuts}
     n_used = 0
     for q in qids:
-        sims = (bank_n[q:q + 1] @ bank_n.t())[0].clone()
-        sims[q] = -1
+        sims = (Q[q:q + 1] @ bank_n.t())[0].clone()
+        if args.queries == "train":
+            sims[q] = -1                  # leave-one-out：查詢本身也在 bank 內
         topi = sims.topk(args.top_k_cases).indices.tolist()
         pool = sorted({i for ci in topi for i in memb[ci]})
         if len(pool) < 2:

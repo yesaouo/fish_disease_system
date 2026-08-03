@@ -558,10 +558,25 @@ Notes：
 
 ### Step 12. OAVLE smoke test
 
+推論核心 `GpuPipelineSoft` 在 `diagnosis_model/grod/pipeline.py`。從 repo root 跑
+（`python -` 會把 cwd 放進 sys.path）：
+
 ```bash
-$PY -m diagnosis_model.grod.gpu_infer_soft \
-    --image data/processed/current/full/test/<某張>.jpg --verify
+$PY - <<'EOF'
+from PIL import Image
+from diagnosis_model.grod.pipeline import load_shared, get_pipeline
+load_shared()                     # 必要：載 text anchors + raw SigLIP2
+r = get_pipeline("grod_soft").infer_rich(
+        Image.open("data/processed/current/full/test/40.jpg").convert("RGB"),
+        None, top_k_cases=3, top_n=5)
+print("abstain =", r["abstain"], "| lesions =", r["n_lesions"], "| pool =", r["pool_size"])
+for c in r["top_n"][:3]:
+    print(f"  {c['rank']} {c['score']:.3f}  {c['text'][:40]}")
+EOF
 ```
+
+健康圖／OOD 圖會 `abstain = True` 且沒有病灶，屬正常行為；要驗完整流程請挑
+`case_db_jointDistRawP/test_cases.pt` 裡有的檔名。
 
 ---
 
@@ -736,9 +751,9 @@ Depends on：
 Command：
 
 ```bash
-# 表 14 生產操作點 k=3；k=20 對照另跑一次
-$PY -m diagnosis_model.grod.eval_integration_ablation --top_k_cases 3
-$PY -m diagnosis_model.grod.eval_integration_ablation --top_k_cases 20
+# 論文表 15：測試集、生產操作點 k=3；k=20 對照另跑一次
+$PY -m diagnosis_model.grod.eval_integration_ablation --split test --top_k_cases 3
+$PY -m diagnosis_model.grod.eval_integration_ablation --split test --top_k_cases 20
 ```
 
 Produces：
@@ -770,22 +785,22 @@ $ART/models/joint_rfdetr/checkpoint_best_regular.pth
 
 - Step 4 `extract_z_joint`
 - Step 6 `extract_soft_inputs`
-- `gpu_infer_soft.py`
+- 推論核心 `grod/pipeline.py` 的 `GpuPipelineSoft`
 
 原因：
 
 - `best_total` 是 detection mAP 選出，semantic head 可能較弱。
 - `best_regular` 的 semantic head 訓練較完整。
 
-### 6.2 `lesion_threshold.json` 不是 CLI runtime config
+### 6.2 `lesion_threshold.json` 不是 runtime config
 
-CLI soft inference 仍使用程式內常數：
+soft inference 仍使用程式內常數：
 
 ```text
 DEFAULT_LESION_THRESH=0.5
 ```
 
-`lesion_threshold.json` 是離線推導與紀錄，不是 `gpu_infer_soft.py` runtime 讀取的檔案。
+`lesion_threshold.json` 是離線推導與紀錄，不是推論時讀取的檔案。
 
 ### 6.3 base 不套用 OAVLE τ
 
@@ -814,3 +829,77 @@ base 使用 Step 2 RF-DETR detector score；其 score scale 與 OAVLE joint obje
   - `$ART/models/encoder_grod_soft/bank_z_soft.pt`
   - `$ART/db/soft_inputs_gated`
 - 重跑 Step 3 後，下游 Step 4–11 原則上都應視為 stale。
+
+---
+
+## Step 12. 測試集分支（論文 Ch5 檢索／CEAM 全部跑在測試集）
+
+Purpose：Ch5 的檢索與 CEAM 評估（表 15 / 17 / 20 / γ 表 / 證據歸因）依評估協定必須跑在測試集，
+但 Step 6–9 預設只產 train/valid。以下四步補出 test 分支，模型與 bank **完全不重訓**——
+bank 永遠是 train 案例，測試集只作為查詢。
+
+```bash
+ART=data/processed/current/artifacts
+DET=data/processed/current/detection
+
+# 12a. test 的 OAVLE 語意 z（來源 case_db_raw 已含 test_cases.pt）
+$PY -m diagnosis_model.grod.extract_z_joint \
+    --case_db_dir $ART/db/case_db_raw \
+    --joint_ckpt $ART/models/joint_rfdetr/checkpoint_best_regular.pth \
+    --anchors $ART/models/text_anchors.pt \
+    --image_root $DET --output_dir $ART/db/z_joint --splits test
+
+# 12b. 把 z 換進 case_db（只動 test_cases.pt，train/valid 不碰）
+$PY -m diagnosis_model.grod.rebuild_case_db --from_joint \
+    --src_case_db $ART/db/case_db_raw --hs_dir $ART/db/z_joint \
+    --out_case_db $ART/db/case_db_jointDistRawP --splits test
+
+# 12c. test 的 soft inputs
+$PY -m diagnosis_model.grod.extract_soft_inputs --out_dir $ART/db/soft_inputs --splits test
+
+# 12d. 套 Region Gate（不含 train，故不重建 bank）
+$PY -m diagnosis_model.grod.apply_gate_to_soft \
+    --gate_ckpt $ART/models/encoder_grod_soft/best_encoder.pt \
+    --out_dir $ART/db/soft_inputs_gated --splits test
+```
+
+論文 eval。**這三支的預設就是生產操作點**（`ART` 路徑、gated soft inputs、`--split test`、
+`--top_k_cases 3`、faithfulness `--max_queries -1`＝整個 split），所以裸跑即為論文數字，
+下面把參數寫全只是為了可讀：
+
+```bash
+# 表 17 兩列 + γ 消融表（一次 γ 掃描）＝ 等同裸跑 eval_ceah_soft_paper
+$PY -m diagnosis_model.grod.eval_ceah_soft_paper \
+    --case_db_dir $ART/db/case_db_jointDistRawP --soft_dir $ART/db/soft_inputs_gated \
+    --encoder_ckpt $ART/models/encoder_grod_soft/best_encoder.pt \
+    --bank_path $ART/models/encoder_grod_soft/bank_z_soft.pt \
+    --ceah_ckpt $ART/models/ceah_grod_soft/best_ceah.pt \
+    --cluster_json $ART/cause_clusters_llm.json \
+    --split test --gammas 0.0 0.25 0.5 0.75 1.0 --top_k_cases 3
+
+# 表 20（k 掃描，同上指令換 --gammas 0.0 --top_k_cases {1,3,5,10,20}）
+# 證據歸因 ＝ 等同裸跑 faithfulness_eval_soft
+$PY -m diagnosis_model.grod.faithfulness_eval_soft \
+    --case_db_dir $ART/db/case_db_jointDistRawP --soft_dir $ART/db/soft_inputs_gated \
+    --encoder_ckpt $ART/models/encoder_grod_soft/best_encoder.pt \
+    --bank_path $ART/models/encoder_grod_soft/bank_z_soft.pt \
+    --ceah_ckpt $ART/models/ceah_grod_soft/best_ceah.pt \
+    --split test --top_k_cases 3 --max_queries 1603
+
+# 表 14 整合式消融三列 ＝ 裸跑
+$PY -m diagnosis_model.grod.eval_integration_ablation
+
+# 外觀表徵辨識（測試集）
+$PY -m diagnosis_model.grod.eval_lesion_symptom_cls \
+    --coco $DET/test/_annotations.coco.json --image_root $DET/test
+```
+
+### 坑
+
+- **要跑驗證集必須顯式加 `--split valid`**；預設是 `test`。舊筆記若沒帶 `--split`，數字是驗證集的。
+- **`--top_k_cases` 預設是生產的 3**。k=20 與 k=3 會讓 `no_global` 的正負號翻轉
+  （k=20 為 −0.0038、k=3 為 +0.0036），跑 k 掃描時才顯式指定其他值。
+- `faithfulness_eval_soft --max_queries` 預設 `-1` ＝整個 split。
+- `eval_integration_ablation --split test` 的 base 列會自動改讀 `case_db_base_test`。
+- 測試集 1,603 筆、驗證集 1,583 筆；`case_db_base_test` 為 1,603。
+- 表 12 圖文編碼器評測與骨幹消融**刻意留在驗證集**（選型用途，見評估協定表），不要一起改。

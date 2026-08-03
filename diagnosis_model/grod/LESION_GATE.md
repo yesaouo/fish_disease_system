@@ -1,18 +1,18 @@
 # GROD lesion gate — design rationale & history
 
-Single source of truth for how `gpu_infer.py` / `gpu_infer_soft.py` decide
-**which queries are lesions** and **when to abstain (healthy)**. The inference
-code itself is kept minimal — all the "why" lives here.
+Single source of truth for how the inference core (`pipeline.py`'s
+`GpuPipelineSoft`) decides **which queries are lesions** and **when to abstain
+(healthy)**. The inference code itself is kept minimal — all the "why" lives here.
 
 ## Current production behaviour
 
 A **fixed global threshold τ on objectness** `w_i = sigmoid(pred_logits[i,0])`:
 
-- **hard** (`gpu_infer.py`): keep queries with `w_i > τ`; if none kept ⟹ abstain (healthy).
-- **soft** (`gpu_infer_soft.py`): keep all queries with continuous weight `w`; abstain iff `max_i w_i < τ`.
+- **hard** (`hard_gate=True`): keep queries with `w_i > τ`; if none kept ⟹ abstain (healthy).
+- **soft** (production): keep all queries with continuous weight `w`; abstain iff `max_i w_i < τ`.
 
 `τ = DEFAULT_LESION_THRESH = 0.5`. No learned threshold, no disease head in the
-`gpu_infer*.py` CLI inference path.
+inference path.
 
 ### Demo (`demo/app_gradio.py`) — two decoupled thresholds + heatmap display
 
@@ -103,7 +103,7 @@ both numbers are train-set-optimistic). Current ckpt:
 Putting the bit on `g` directly (a "768+1" augmented dim) is the worst option — weakest
 substrate **and** it risks CEAM faithfulness; the neck head touches neither.
 
-**Not wired anywhere (2026-06-12).** Both `gpu_infer*.py` and `demo/app_gradio.py`
+**Not wired anywhere (2026-06-12).** Both `pipeline.py` and `demo/app_gradio.py`
 abstain on the constant objectness `abstain_thresh`. A held-out test-split A/B
 (incl. structured OOD: sashimi / SalmonScan) showed the neck head does **not** beat
 the constant — AUROC 0.9997 vs 0.9991, and OOD reject is ≤ the constant on every

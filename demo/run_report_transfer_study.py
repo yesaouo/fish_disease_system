@@ -15,11 +15,13 @@ estimate clinical sensitivity or specificity.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import sqlite3
 import sys
 import textwrap
+from collections import Counter
 from pathlib import Path
 
 import matplotlib
@@ -107,11 +109,7 @@ TARGETS = {
         },
     ],
     "AOD109313": [
-        {
-            "label": "甲狀腺增生",
-            "aliases": ["甲狀腺增生", "thyroid hyperplasia"],
-            "related_aliases": ["甲狀腺腫", "goiter", "goitre"],
-        },
+        {"label": "甲狀腺增生", "aliases": ["甲狀腺增生", "thyroid hyperplasia"]},
         {"label": "乳酸球菌", "aliases": ["乳酸球", "乳酸鏈球", "lactococc"]},
     ],
     "AOD109315": [
@@ -131,7 +129,6 @@ TARGETS = {
                 "缺碘性甲狀腺腫", "缺碘", "碘缺乏",
                 "iodine-deficiency", "iodine deficiency",
             ],
-            "related_aliases": ["甲狀腺腫", "goiter", "goitre"],
         },
     ],
     "AOD110211": [
@@ -144,7 +141,7 @@ TARGETS = {
         {"label": "弧菌", "aliases": ["弧菌", "vibrio"]},
     ],
     "AOD111324": [
-        {"label": "奴卡氏菌", "aliases": ["奴卡", "nocardi"]},
+        {"label": "奴卡氏菌", "aliases": ["努卡", "奴卡", "nocardi"]},
         {
             "label": "革蘭氏陰性桿菌",
             "aliases": ["革蘭氏陰性", "革蘭陰性", "gram-negative", "gram negative"],
@@ -154,13 +151,8 @@ TARGETS = {
         {
             "label": "創傷弧菌",
             "aliases": ["創傷弧菌", "v. vulnificus", "vibrio vulnificus", "vulnificus"],
-            "related_aliases": ["弧菌", "vibrio"],
         },
-        {
-            "label": "台灣石斑魚虹彩病毒",
-            "aliases": ["台灣石斑魚虹彩病毒", "tgiv"],
-            "related_aliases": ["虹彩病毒", "虹彩", "iridovirus"],
-        },
+        {"label": "台灣石斑魚虹彩病毒", "aliases": ["台灣石斑魚虹彩病毒", "tgiv"]},
     ],
     "LAM110079": [
         {"label": "鏈球菌", "aliases": ["鏈球", "streptococc"]},
@@ -168,20 +160,10 @@ TARGETS = {
     ],
 }
 
-INTERNAL_TERMS = (
-    "內臟",
-    "臟器",
-    "腹腔",
-    "肝",
-    "脾",
-    "腎",
-    "心",
-    "腦",
-    "腸",
-    "胃",
-    "膽",
-)
-NO_OBVIOUS_LESION_TERMS = ("正常", "無明顯", "並無", "未見")
+# Image composition is expert-labelled, not inferred from file names.  The CSV
+# holds one row per image: case,file,label with label in IMAGE_LABELS.
+IMAGE_LABELS_PATH = REPO_ROOT / "data" / "report" / "image_labels.csv"
+IMAGE_LABELS = ("healthy", "external_abnormal", "dissection")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 CJK_FONT = Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc")
 CASE_FIGURE_IDS = {
@@ -198,13 +180,24 @@ def _read_case_text(path: Path) -> tuple[str, str]:
     return lines[0], lines[1]
 
 
-def _image_modality(path: Path) -> str:
-    return "internal_or_dissection" if any(term in path.stem for term in INTERNAL_TERMS) else "external"
-
-
-def _finding_type(path: Path) -> str:
-    return ("no_obvious_lesion" if any(term in path.stem for term in NO_OBVIOUS_LESION_TERMS)
-            else "abnormal_or_unspecified")
+def _load_image_labels() -> dict[tuple[str, str], str]:
+    """Expert image labels keyed by (case directory name, file name)."""
+    if not IMAGE_LABELS_PATH.exists():
+        print(f"[transfer] no expert image labels at {IMAGE_LABELS_PATH}; "
+              f"composition counts will be empty")
+        return {}
+    labels = {}
+    with IMAGE_LABELS_PATH.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            label = (row.get("label") or "").strip()
+            if not label:                       # still being labelled by the expert
+                continue
+            if label not in IMAGE_LABELS:
+                raise ValueError(
+                    f"unexpected label {label!r} for {row.get('case')}/{row.get('file')}; "
+                    f"expected one of {IMAGE_LABELS}")
+            labels[(row["case"].strip(), row["file"].strip())] = label
+    return labels
 
 
 def _cause_haystack(cause: dict) -> str:
@@ -376,32 +369,24 @@ def _summarize_case(case: dict) -> dict:
     target_summary = []
     for target in case["targets"]:
         hits = [img for img in images if img["target_ranks"][target["label"]] is not None]
-        related_hits = [
-            img for img in images
-            if img["related_family_ranks"].get(target["label"]) is not None
-        ]
         target_summary.append({
             "label": target["label"],
             "images_with_display_hit": len(hits),
-            "external_hits": sum(img["modality"] == "external" for img in hits),
-            "internal_or_dissection_hits": sum(
-                img["modality"] == "internal_or_dissection" for img in hits),
+            "hits_by_label": {
+                label: sum(img["label"] == label for img in hits) for label in IMAGE_LABELS},
             "best_display_rank": min(
                 (img["target_ranks"][target["label"]] for img in hits), default=None),
-            "images_with_related_family_only": len(related_hits),
-            "best_related_family_rank": min(
-                (img["related_family_ranks"][target["label"]] for img in related_hits),
-                default=None),
         })
     return {
         "case_name": case["case_name"],
         "expert_diagnosis": case["expert_diagnosis"],
         "n_images": len(images),
-        "n_external": sum(img["modality"] == "external" for img in images),
-        "n_internal_or_dissection": sum(
-            img["modality"] == "internal_or_dissection" for img in images),
-        "n_no_obvious_lesion": sum(img["finding_type"] == "no_obvious_lesion" for img in images),
+        "n_by_label": {label: sum(img["label"] == label for img in images)
+                       for label in IMAGE_LABELS},
         "n_abstain": sum(img["abstain"] for img in images),
+        "n_abstain_by_label": {
+            label: sum(img["abstain"] and img["label"] == label for img in images)
+            for label in IMAGE_LABELS},
         "n_images_with_any_target": sum(
             any(rank is not None for rank in img["target_ranks"].values()) for img in images),
         "n_images_with_all_targets": sum(
@@ -413,15 +398,67 @@ def _summarize_case(case: dict) -> dict:
     }
 
 
-def _load_online_delta(pipe, data_root: Path) -> int:
+def _norm(text: str) -> str:
+    return "".join(ch for ch in str(text).casefold() if ch.isalnum())
+
+
+def _phash(path: Path) -> int:
+    """16x16 average hash; robust to the re-encode/resize the upload path applies."""
+    image = ImageOps.exif_transpose(Image.open(path)).convert("L").resize((16, 16))
+    pixels = list(image.getdata())
+    mean = sum(pixels) / len(pixels)
+    return sum(1 << i for i, value in enumerate(pixels) if value > mean)
+
+
+def _attribute_delta(records, case_dirs, diagnoses, hamming_max: int = 12) -> dict:
+    """Map every online-delta case back to the submitted report case (by expert
+    diagnosis text) and, within it, to the source image (by perceptual hash).
+
+    The delta cases are expert write-backs of these same report images, so this
+    attribution is what makes the leave-one-out protocols possible."""
+    report_hashes = {
+        case_dir.name: [(p.name, _phash(p)) for p in sorted(case_dir.iterdir())
+                        if p.suffix.lower() in IMAGE_SUFFIXES]
+        for case_dir in case_dirs
+    }
+    norm_diagnoses = {name: _norm(text) for name, text in diagnoses.items()}
+    attribution = {}
+    for record in records:
+        cause = _norm(" ".join(record.cause_texts))
+        case_name, best = None, 0.0
+        for name, diagnosis in norm_diagnoses.items():
+            common = sum((Counter(cause) & Counter(diagnosis)).values())
+            score = common / max(len(cause), len(diagnosis), 1)
+            if score > best:
+                case_name, best = name, score
+        if best < 0.8:                          # not a write-back of any report case
+            attribution[record.case_id] = {"case": None, "file": None, "score": round(best, 3)}
+            continue
+        delta_hash = _phash(Path(record.image_path))
+        file_name, distance = min(
+            ((name, bin(value ^ delta_hash).count("1")) for name, value in report_hashes[case_name]),
+            key=lambda pair: pair[1], default=(None, 999))
+        attribution[record.case_id] = {
+            "case": case_name,
+            "file": file_name if distance <= hamming_max else None,
+            "score": round(best, 3),
+            "hamming": distance,
+        }
+    return attribution
+
+
+def _load_online_delta(pipe, data_root: Path) -> list:
     """Populate the in-process retrieval bank with the annotation_web online
     increment (base ⊕ delta), so the study can see results including expert-
     submitted cases without promoting them to a new dataset version.
 
     Mirrors serve /bank/upsert exactly (encode_case + encode_cause_texts +
     bank_upsert), but reads the writable datasets (created_via:diagnosis) straight
-    off disk. Read-only on the annotation_web store; nothing is written back."""
-    n = 0
+    off disk. Read-only on the annotation_web store; nothing is written back.
+
+    Returns the upserted DeltaCase records so a leave-one-out protocol can remove
+    and restore them per query."""
+    loaded = []
     for meta_path in sorted(data_root.glob("*/meta.json")):
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -461,8 +498,8 @@ def _load_online_delta(pipe, data_root: Path) -> int:
                 image_path=str(img_path), file_name=img_path.name,
                 z=z, cause_texts=causes, cause_embs=encode_cause_texts(causes))
             pipe.p.bank_upsert(rec)
-            n += 1
-    return n
+            loaded.append(rec)
+    return loaded
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -475,10 +512,10 @@ def run(args: argparse.Namespace) -> dict:
     print(f"[transfer] cases={len(case_dirs)} device study starts")
     load_shared()
     pipe = get_pipeline("grod_soft")
-    n_delta = 0
+    delta_records = []
     if args.with_delta:
-        n_delta = _load_online_delta(pipe, args.data_root.resolve())
-        print(f"[transfer] online delta loaded: {n_delta} cases "
+        delta_records = _load_online_delta(pipe, args.data_root.resolve())
+        print(f"[transfer] online delta loaded: {len(delta_records)} cases "
               f"(bank_size={pipe.p.bank_size})")
     vocabulary = list(map(str, pipe.p.cause_texts))
     target_vocabulary = {}
@@ -486,16 +523,22 @@ def run(args: argparse.Namespace) -> dict:
         target_vocabulary[case_name] = []
         for target in targets:
             strict_aliases = [alias.casefold() for alias in target["aliases"]]
-            related_aliases = [alias.casefold() for alias in target.get("related_aliases", [])]
             target_vocabulary[case_name].append({
                 "label": target["label"],
                 "strict_vocabulary_matches": sum(
                     any(alias in text.casefold() for alias in strict_aliases)
                     for text in vocabulary),
-                "related_family_vocabulary_matches": sum(
-                    any(alias in text.casefold() for alias in related_aliases)
-                    for text in vocabulary),
             })
+    image_labels = _load_image_labels()
+    delta_by_id = {rec.case_id: rec for rec in delta_records}
+    attribution = {}
+    if args.loo != "none":
+        diagnoses = {case_dir.name: _read_case_text(case_dir / "病例病因.txt")[1]
+                     for case_dir in case_dirs}
+        attribution = _attribute_delta(delta_records, case_dirs, diagnoses)
+        mapped = sum(a["case"] is not None for a in attribution.values())
+        print(f"[transfer] leave-one-out={args.loo}: {mapped}/{len(delta_records)} "
+              f"delta cases attributed to a report case")
     cases = []
     for case_dir in case_dirs:
         history, diagnosis = _read_case_text(case_dir / "病例病因.txt")
@@ -503,9 +546,23 @@ def run(args: argparse.Namespace) -> dict:
         targets = TARGETS.get(case_dir.name, [])
         image_paths = sorted(
             path for path in case_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+        unlabelled = [p.name for p in image_paths if (case_dir.name, p.name) not in image_labels]
+        if unlabelled:
+            print(f"[transfer] {case_dir.name}: {len(unlabelled)} image(s) not yet labelled")
         records = []
         for image_path in image_paths:
             image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+            # Leave-one-out: the online delta cases are expert write-backs of these
+            # same report images, so retrieval would otherwise see the query's own
+            # annotation.  "image" hides only the write-back of this very image;
+            # "case" hides every write-back of the whole report case.
+            held_out = [
+                case_id for case_id, info in attribution.items()
+                if info["case"] == case_dir.name
+                and (args.loo == "case" or info["file"] == image_path.name)
+            ]
+            for case_id in held_out:
+                pipe.p.bank_delete(case_id)
             result = pipe.infer_rich(
                 image,
                 text_emb=text_emb,
@@ -514,6 +571,8 @@ def run(args: argparse.Namespace) -> dict:
                 abstain_thresh=ABSTAIN_DEFAULT,
                 display_thresh=DISPLAY_DEFAULT,
             )
+            for case_id in held_out:
+                pipe.p.bank_upsert(delta_by_id[case_id])
             causes = [_serialize_cause(cause) for cause in result.get("top_n", [])]
             obj_all = result.get("obj_all")
             max_objectness = (
@@ -533,31 +592,23 @@ def run(args: argparse.Namespace) -> dict:
                 target["label"]: _target_rank(causes, target["aliases"])
                 for target in targets
             }
-            related_family_ranks = {
-                target["label"]: (
-                    None if target_ranks[target["label"]] is not None
-                    else _target_rank(causes, target.get("related_aliases", []))
-                )
-                for target in targets
-            }
             records.append({
                 "file_name": image_path.name,
                 "image_path": str(image_path.resolve()),
                 "description": image_path.stem,
-                "modality": _image_modality(image_path),
-                "finding_type": _finding_type(image_path),
+                "label": image_labels.get((case_dir.name, image_path.name)),
                 "abstain": bool(result.get("abstain", False)),
                 "n_lesions": int(result.get("n_lesions", 0)),
                 "max_objectness": round(max_objectness, 6),
+                "held_out_delta": held_out,
                 "lesions": lesions,
                 "lesion_labels": [lesion["label"] for lesion in lesions],
                 "target_ranks": target_ranks,
-                "related_family_ranks": related_family_ranks,
                 "displayed_causes": causes,
             })
             print(
                 f"[transfer] case={case_dir.name} image={image_path.name} "
-                f"modality={records[-1]['modality']} abstain={records[-1]['abstain']} "
+                f"label={records[-1]['label']} abstain={records[-1]['abstain']} "
                 f"targets={target_ranks}"
             )
         case = {
@@ -577,11 +628,12 @@ def run(args: argparse.Namespace) -> dict:
     overall = {
         "n_cases": len(cases),
         "n_images": sum(summary["n_images"] for summary in summaries),
-        "n_external": sum(summary["n_external"] for summary in summaries),
-        "n_internal_or_dissection": sum(
-            summary["n_internal_or_dissection"] for summary in summaries),
-        "n_no_obvious_lesion": sum(summary["n_no_obvious_lesion"] for summary in summaries),
+        "n_by_label": {label: sum(summary["n_by_label"][label] for summary in summaries)
+                       for label in IMAGE_LABELS},
         "n_abstain": sum(summary["n_abstain"] for summary in summaries),
+        "n_abstain_by_label": {
+            label: sum(summary["n_abstain_by_label"][label] for summary in summaries)
+            for label in IMAGE_LABELS},
         "n_images_with_any_target": sum(
             summary["n_images_with_any_target"] for summary in summaries),
         "n_images_with_all_targets": sum(
@@ -600,7 +652,9 @@ def run(args: argparse.Namespace) -> dict:
             "model_mode": "grod_soft",
             "data_version": data_version(),
             "online_delta_included": bool(args.with_delta),
-            "online_delta_cases": n_delta,
+            "online_delta_cases": len(delta_records),
+            "leave_one_out": args.loo,
+            "delta_attribution": attribution,
             "bank_size": int(pipe.p.bank_size),
             "top_k_cases": args.top_k_cases,
             "top_n_causes": args.top_n_causes,
@@ -639,10 +693,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root", type=Path, default=REPO_ROOT / "data" / "annotation",
         help="annotation_web DATA_ROOT (writable datasets live here); used with --with-delta")
+    parser.add_argument(
+        "--loo", choices=("none", "image", "case"), default="none",
+        help="leave-one-out over the online delta (needs --with-delta): 'image' hides "
+             "the write-back of the query image itself, 'case' hides every write-back "
+             "of the query's report case. Writes to paper/demo/with_delta_loo_<mode>/.")
     parser.add_argument("--top-k-cases", type=int, default=3)
     parser.add_argument("--top-n-causes", type=int, default=3)
     args = parser.parse_args()
-    mode_dir = REPO_ROOT / "paper" / "demo" / ("with_delta" if args.with_delta else "base")
+    if args.loo != "none" and not args.with_delta:
+        parser.error("--loo requires --with-delta")
+    mode_dir = REPO_ROOT / "paper" / "demo" / (
+        f"with_delta_loo_{args.loo}" if args.loo != "none"
+        else "with_delta" if args.with_delta else "base")
     if args.output is None:
         args.output = mode_dir / "report_transfer_results.json"
     if args.figure_dir is None:

@@ -98,13 +98,16 @@ def main():
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0, help="smoke test: cap cases per split")
+    ap.add_argument("--splits", type=str, nargs="+", default=["train", "valid"],
+                    help="which {split}_cases.pt to extract from --case_db_dir")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     grod = Grod(args.joint_ckpt, args.global_sd, args.anchors, dev)
 
-    for fname, coco_split in [("train_cases.pt", "train"), ("valid_cases.pt", "valid")]:
+    for coco_split in args.splits:
+        fname = f"{coco_split}_cases.pt"
         cases = torch.load(Path(args.case_db_dir) / fname, weights_only=False)
         if args.limit:
             cases = cases[:args.limit]

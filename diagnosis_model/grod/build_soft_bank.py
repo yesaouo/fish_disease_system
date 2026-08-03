@@ -3,7 +3,7 @@ Aggregator over the soft inputs.
 
 bank_z_soft[i] = soft_encoder(g_i, z_all_i, w_i) for every train case, so the
 inference query (also soft-encoded) and the bank live in the same space.
-Precomputed to a small file so gpu_infer_soft.py needn't load the 5.6 GB
+Precomputed to a small file so the inference core needn't load the 5.6 GB
 soft_inputs at startup.
 
 Output: outputs/encoder_grod_soft/bank_z_soft.pt  ([Nt, 768] fp32)

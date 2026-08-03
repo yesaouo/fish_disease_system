@@ -38,11 +38,11 @@ def metric_at(ranked, gt, n):
 
 def main():
     be = build_soft_like("OAVLE", "soft_inputs_gated", None, 32, DEV)
-    train_cases = be["train_cases"]; cause_embs = be["cause_embs"]; ceah = be["ceah"]
-    bank_z = F.normalize(be["bank_z"].float(), dim=-1); H_va = F.normalize(be["H_va"].float(), dim=-1)
+    train_cases = be.train_cases; cause_embs = be.cause_embs; ceah = be.ceah
+    bank_z = F.normalize(be.bank_z.float(), dim=-1); H_va = F.normalize(be.H.float(), dim=-1)
     acc = {k: {n: {"p": [], "r": []} for n in NS} for k in KS}
-    for qi in range(be["n_valid"]):
-        gt, g_slot, text_emb, z_sel, w_sel = be["query"](qi)
+    for qi in range(be.n_queries):
+        gt, g_slot, text_emb, z_sel, w_sel = be.query(qi)
         if not gt:
             continue
         sims = (H_va[qi:qi + 1] @ bank_z.T)[0].cpu().numpy()

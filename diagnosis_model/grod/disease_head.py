@@ -4,7 +4,7 @@
 GROD forward; verdict p = sigmoid(scale·(max_i w_i − τ(g))), w_i =
 sigmoid(pred_logits[i,0]). Trained by train_disease_head.py.
 
-Kept for experiments / OOD work but **not** loaded by gpu_infer*.py — production
+Kept for experiments / OOD work but **not** loaded by pipeline.py — production
 uses a fixed constant threshold. See grod/LESION_GATE.md for why (the head
 over-selects as a lesion gate and only ties a constant on abstain).
 ``DiseaseHead`` + ``build_feat`` are the free-head ablation baseline

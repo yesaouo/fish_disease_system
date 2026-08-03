@@ -34,7 +34,7 @@ from diagnosis_model.cause_inference.phase1_baseline import (
 )
 from diagnosis_model.grod.train_case_encoder_soft import load_soft
 from diagnosis_model.grod.region_gate import RegionGate
-from diagnosis_model.grod.eval_ceah_soft_paper import select_lesions
+from diagnosis_model.grod.soft_eval_common import topk_lesions as select_lesions
 from diagnosis_model.grod.finetune_e2e_grace import recover_logits, encode_bank
 from diagnosis_model.grod.finetune_e2e_grace_l2 import (
     clone_heads, heads_forward, encode_bank as encode_bank_l2,

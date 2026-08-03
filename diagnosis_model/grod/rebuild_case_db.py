@@ -99,6 +99,8 @@ def main():
     ap.add_argument("--from_joint", action="store_true",
                     help="cache holds final trained z (z_{split}.pt from extract_z_joint.py); no head")
     ap.add_argument("--out_case_db", type=str, required=True)
+    ap.add_argument("--splits", type=str, nargs="+", default=["train", "valid"],
+                    help="which {split}_cases.pt to rebuild; needs a matching cache entry")
     ap.add_argument("--device", type=str,
                     default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -132,7 +134,7 @@ def main():
         print(f"[head] Linear({hidden_dim} -> {out_dim}) loaded from {args.head_path}")
 
     stats = {}
-    for split in ["train", "valid"]:
+    for split in args.splits:
         src_cases = torch.load(src / f"{split}_cases.pt", weights_only=False)
         hs_cache = torch.load(hs_dir / f"{cache_prefix}_{split}.pt", weights_only=False)
         s = rebuild_split(src_cases, hs_cache, head, device)

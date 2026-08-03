@@ -48,11 +48,11 @@ def agg(pq):
 
 def eval_ours():
     be = build_soft_like("OAVLE", "soft_inputs_gated", None, 32, DEV)
-    tc = be["train_cases"]; ce_all = be["cause_embs"]; ceah = be["ceah"]
-    bank_z = F.normalize(be["bank_z"].float(), dim=-1); H = F.normalize(be["H_va"].float(), dim=-1)
+    tc = be.train_cases; ce_all = be.cause_embs; ceah = be.ceah
+    bank_z = F.normalize(be.bank_z.float(), dim=-1); H = F.normalize(be.H.float(), dim=-1)
     pq = {k: [] for k in KS}
-    for qi in range(be["n_valid"]):
-        gt, g_slot, text_emb, z_sel, w_sel = be["query"](qi)
+    for qi in range(be.n_queries):
+        gt, g_slot, text_emb, z_sel, w_sel = be.query(qi)
         if not gt:
             continue
         sims = (H[qi:qi + 1] @ bank_z.T)[0].cpu().numpy()
@@ -107,7 +107,7 @@ def main():
     json.dump(res, open(OUT, "w"), indent=2, ensure_ascii=False)
     for k in KS:
         print(f"k={k}: " + " ".join(
-            f"{m.split('（')[0]} F1@5={res['methods'][m][k]['5']['F1']:.3f}"
+            f"{m.split('（')[0]} F1@5={res['methods'][m][k][5]['F1']:.3f}"
             for m in res["methods"]))
     print(f"[save] {OUT}")
 

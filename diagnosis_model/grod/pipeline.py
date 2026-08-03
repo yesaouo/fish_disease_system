@@ -539,8 +539,7 @@ class GpuPipelineSoft:
     gpu_infer_soft.py). Owns the GROD joint detector, Weighted DeepSets Aggregator,
     Region Gate, CEAH, and the base⊕delta retrieval bank (HITL hot update). The
     rich report layer (GrodSoftPipeline) wraps an instance of this; serve reaches
-    its bank ops via `.p.encode_case / .bank_upsert / .bank_delete`. The standalone
-    minimal-flow reference lives in diagnosis_model/grod/gpu_infer.py."""
+    its bank ops via `.p.encode_case / .bank_upsert / .bank_delete`."""
 
     def __init__(self, joint_ckpt, global_sd, anchors, enc_ckpt, ceah_ckpt,
                  case_db_dir, bank_path, top_k_lesions=32,
@@ -775,12 +774,16 @@ class GrodSoftPipeline:
 
         # Two thresholds: abstain (健/病) + display (顯示選框). Aggregation always uses
         # all-Q (soft contract); CEAH always uses top-K; the thresholds only govern the
-        # DISPLAY mask + abstain. Abstain = 健 iff max objectness < abstain_thresh.
+        # DISPLAY mask + abstain. Abstain = 健 iff max objectness < abstain_thresh —
+        # display_thresh must NOT feed this decision, or the effective health gate
+        # silently becomes max(abstain_thresh, display_thresh). An image that clears
+        # abstain but has no box above display_thresh still gets diagnosed; M0 below
+        # falls back to the single highest-objectness region for the display mask.
         t = tm.tic()
         abstain = float(w.amax()) < abstain_thresh
         keep_mask = scores > display_thresh
         tm.toc("② 健康／異常判定", t)
-        if abstain or int(keep_mask.sum().item()) == 0:
+        if abstain:
             r = _empty_result(image, tm.finish()); r["abstain"] = True
             r["obj_all"] = w; r["boxes_all"] = boxes; return r
         Kk = lidx.numel()

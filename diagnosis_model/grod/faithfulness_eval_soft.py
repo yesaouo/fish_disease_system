@@ -15,6 +15,11 @@ whether soft evidence preserves CEAH's lesion-grounding (vs reversing it).
 
 γ-free cascade (ranking = pure CEAH score, matches production).
 
+**Defaults are the production operating point**: current artifact tree
+(`artifacts.ART`), **gated** soft inputs, `--split test`, `--top_k_cases 3`,
+`--max_queries -1` (= whole split). A bare run reproduces the thesis table.
+`--top_k_cases` matters: k=20 flips the sign of `no_global` (−0.0038 vs +0.0036).
+
 Run from repo root (SDM env):
     $PY -m diagnosis_model.grod.faithfulness_eval_soft
 """
@@ -30,10 +35,10 @@ from typing import List
 import numpy as np
 import torch
 
-from diagnosis_model.cause_inference.models import CEAH
 from diagnosis_model.cause_inference.phase1_baseline import build_candidate_pool
 from diagnosis_model.cause_inference.faithfulness_eval import classify_cause
-from diagnosis_model.cause_inference.models.case_encoder import EncoderConfig, build_encoder
+from diagnosis_model.grod.artifacts import ART, load_case_db, load_ceah, load_encoder, load_bank
+from diagnosis_model.grod.soft_eval_common import faithfulness_drops, make_ceah_batch
 from diagnosis_model.grod.train_case_encoder_soft import encode_all_soft, load_soft
 from diagnosis_model.grod.train_ceah_soft import topk_by_w
 
@@ -44,15 +49,19 @@ def n_bucket(n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--case_db_dir", default="diagnosis_model/cause_inference/outputs/case_db_jointDistRawP")
-    ap.add_argument("--soft_dir", default="diagnosis_model/grod/outputs/soft_inputs")
-    ap.add_argument("--encoder_ckpt", default="diagnosis_model/cause_inference/outputs/encoder_grod_soft/best_encoder.pt")
-    ap.add_argument("--bank_path", default="diagnosis_model/cause_inference/outputs/encoder_grod_soft/bank_z_soft.pt")
-    ap.add_argument("--ceah_ckpt", default="diagnosis_model/cause_inference/outputs/ceah_grod_soft/best_ceah.pt")
-    ap.add_argument("--output_dir", default="diagnosis_model/cause_inference/outputs/ceah_grod_soft")
+    ap.add_argument("--case_db_dir", default=str(ART / "db/case_db_jointDistRawP"))
+    ap.add_argument("--soft_dir", default=str(ART / "db/soft_inputs_gated"))
+    ap.add_argument("--encoder_ckpt", default=str(ART / "models/encoder_grod_soft/best_encoder.pt"))
+    ap.add_argument("--bank_path", default=str(ART / "models/encoder_grod_soft/bank_z_soft.pt"))
+    ap.add_argument("--ceah_ckpt", default=str(ART / "models/ceah_grod_soft/best_ceah.pt"))
+    ap.add_argument("--output_dir", default=str(ART / "models/ceah_grod_soft"))
     ap.add_argument("--top_k_lesions", type=int, default=32)
-    ap.add_argument("--top_k_cases", type=int, default=20)
-    ap.add_argument("--max_queries", type=int, default=300)
+    ap.add_argument("--top_k_cases", type=int, default=3,
+                    help="production operating point. k=20 flips the sign of no_global.")
+    ap.add_argument("--split", default="test", choices=["valid", "test"],
+                    help="query split: {split}_cases.pt + <soft_dir>/{split}.pt")
+    ap.add_argument("--max_queries", type=int, default=-1,
+                    help="-1 = whole split (the paper setting)")
     ap.add_argument("--common_dim", type=int, default=256)
     ap.add_argument("--hidden_dim", type=int, default=512)
     ap.add_argument("--attribution_mode", default="softmax")
@@ -65,27 +74,20 @@ def main():
     device = args.device
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_cases = torch.load(Path(args.case_db_dir) / "train_cases.pt", weights_only=False)
-    valid_cases = torch.load(Path(args.case_db_dir) / "valid_cases.pt", weights_only=False)
-    cpack = torch.load(Path(args.case_db_dir) / "cause_text_embs.pt", weights_only=False)
-    cause_embs = cpack["embeddings"].float().to(device)
-    cause_texts = cpack["texts"]
-    in_dim = cause_embs.size(-1)
+    db = load_case_db(args.case_db_dir, args.split, device)
+    train_cases, valid_cases = db.train_cases, db.query_cases
+    cause_embs, cause_texts = db.cause_embs, db.cause_texts
 
-    g_va, z_va, w_va, _ = load_soft(Path(args.soft_dir) / "valid.pt")
+    g_va, z_va, w_va, _ = load_soft(Path(args.soft_dir) / f"{args.split}.pt")
 
-    enc_pkg = torch.load(args.encoder_ckpt, weights_only=False, map_location="cpu")
-    encoder = build_encoder(EncoderConfig(**enc_pkg["encoder_config"])).to(device).eval()
-    encoder.load_state_dict(enc_pkg["encoder_state"])
-    bank_z = torch.load(args.bank_path, weights_only=False)["bank_z"].to(device)
-
-    ceah = CEAH(global_dim=in_dim, text_dim=in_dim, lesion_dim=in_dim, cause_dim=in_dim,
-                common_dim=args.common_dim, hidden_dim=args.hidden_dim, dropout=0.0,
-                attribution_mode=args.attribution_mode, scoring_mode=args.scoring_mode).to(device).eval()
-    ceah.load_state_dict(torch.load(args.ceah_ckpt, map_location=device))
+    encoder = load_encoder(args.encoder_ckpt, device)
+    bank_z = load_bank(args.bank_path, device)
+    ceah = load_ceah(args.ceah_ckpt, db.in_dim, device,
+                     common_dim=args.common_dim, hidden_dim=args.hidden_dim,
+                     attribution_mode=args.attribution_mode, scoring_mode=args.scoring_mode)
 
     H_va = encode_all_soft(encoder, g_va, z_va, w_va, device)
-    nq = min(args.max_queries, len(valid_cases))
+    nq = len(valid_cases) if args.max_queries < 0 else min(args.max_queries, len(valid_cases))
     K = args.top_k_lesions
     drops_total = defaultdict(list)
     drops_bucket = defaultdict(lambda: defaultdict(list))
@@ -101,52 +103,27 @@ def main():
             return
         cand_embs = cause_embs[torch.as_tensor(cand_idx, device=device)]      # [P, D]
         z_k, w_k = topk_by_w(z_va[qi].float().to(device), w_va[qi].float().to(device), K)
-        g_e = g_va[qi].float().to(device).unsqueeze(0).expand(P, -1)
-        l_e = z_k.unsqueeze(0).expand(P, -1, -1).contiguous()
-        l_w = w_k.unsqueeze(0).expand(P, -1).contiguous()
-        l_m = torch.ones(P, z_k.size(0), dtype=torch.bool, device=device)
-        t_e = torch.zeros(P, in_dim, device=device)
-        t_p = torch.zeros(P, dtype=torch.bool, device=device)
-        scores, alphas, ev_mask = ceah(g_e, t_e, t_p, l_e, l_m, cand_embs, lesion_weights=l_w)
-        top1 = int(scores.argmax().item())
-        baseline = float(scores[top1])
-        base_alpha = alphas[top1].cpu().numpy()
-        max_Ne = ev_mask.size(1)
+        batch = make_ceah_batch(ceah, g_va[qi].float().to(device), z_k, w_k, cand_embs, device)
+        top1, baseline, drops = faithfulness_drops(batch, device)
+        baselines.append(baseline)
         bucket = classify_cause(cause_texts[cand_idx[top1]])
         bucket_count[bucket] += 1
 
-        def mask_score(positions):
-            fm = torch.ones(P, max_Ne, dtype=torch.bool, device=device)
-            for p in positions:
-                if p < max_Ne:
-                    fm[:, p] = False
-            s, _, _ = ceah(g_e, t_e, t_p, l_e, l_m, cand_embs, force_mask=fm, lesion_weights=l_w)
-            return float(s[top1])
-
-        lesion_pos = list(range(2, 2 + z_k.size(0)))
-        s_no_global = mask_score([0])
-        s_no_lesion = mask_score(lesion_pos)
-        # top-α among valid positions (global + lesions; text absent)
-        valid_pos = [0] + lesion_pos
-        top_a = max(valid_pos, key=lambda p: base_alpha[p])
-        s_no_top = mask_score([top_a])
-        others = [p for p in valid_pos if p != top_a]
-        s_rand = mask_score([int(np.random.choice(others))]) if others else baseline
-
-        for cond, val in [("no_global", baseline - s_no_global),
-                          ("no_lesion", baseline - s_no_lesion),
-                          ("no_top_α", baseline - s_no_top),
-                          ("no_random", baseline - s_rand)]:
+        for cond, val in drops.items():
             drops_total[cond].append(val)
             drops_bucket[bucket][cond].append(val)
 
+    baselines: list[float] = []
     for qi in range(nq):
         run(qi)
 
     conds = ["no_global", "no_lesion", "no_top_α", "no_random"]
     print(f"\n=== SOFT CEAH faithfulness (score drop = baseline - masked, n={nq}) ===")
     print(f"{'condition':<12}{'all':>10}{'global-type':>14}{'lesion-type':>14}")
-    summary = {"score_drop_by_condition": {}, "score_drop_by_bucket": {}, "bucket_counts": dict(bucket_count)}
+    mean_base = float(np.mean(baselines)) if baselines else 0.0
+    print(f"mean top-1 support score (baseline) = {mean_base:.4f}")
+    summary = {"mean_top1_support": mean_base,
+               "score_drop_by_condition": {}, "score_drop_by_bucket": {}, "bucket_counts": dict(bucket_count)}
     for cond in conds:
         allv = float(np.mean(drops_total[cond]))
         gt = drops_bucket.get("global-type", {}).get(cond, [])

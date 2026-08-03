@@ -9,6 +9,9 @@
   - `ceah_grod_soft`
   - gated bank
 - 操作點：`top_k_cases=3`
+- Split：**valid**（本文件全部數字皆為 1,584 valid / 471 clusters）。eval 腳本的 `--split` 預設是
+  `test`，故 `COMMON_BASE` 顯式帶 `--split valid` 把本文件釘在驗證集。
+  **Ch5 定版的測試集數字請走 `BUILD_PIPELINE.md` Step 12**（test 1,603）。
 - 評估原則：本文件只讀既有 artifacts，僅輸出 eval JSON / log，不覆蓋生產檔。
 
 與 `BUILD_PIPELINE.md` 分工：
@@ -41,6 +44,7 @@ COMMON_BASE="--case_db_dir $ART/db/case_db_jointDistRawP \
   --bank_path $ART/models/encoder_grod_soft/bank_z_soft.pt \
   --ceah_ckpt $ART/models/ceah_grod_soft/best_ceah.pt \
   --cluster_json $CLU \
+  --split valid \
   --text medical"
 
 COMMON_K3="$COMMON_BASE --top_k_cases $K"
@@ -250,6 +254,7 @@ $PY -m diagnosis_model.grod.eval_ceah_soft_paper \
   --ceah_ckpt $ART/models/ceah_grod_soft/best_ceah.pt \
   --cluster_json $CLU \
   --text medical \
+  --split valid \
   --top_k_cases 3 \
   --gammas 0.0 \
   --output_dir $ART/models/ceah_grod_soft/ch5/hard
@@ -311,6 +316,7 @@ $PY -m diagnosis_model.grod.faithfulness_eval_soft \
   --encoder_ckpt $ART/models/encoder_grod_soft/best_encoder.pt \
   --bank_path $ART/models/encoder_grod_soft/bank_z_soft.pt \
   --ceah_ckpt $ART/models/ceah_grod_soft/best_ceah.pt \
+  --split valid --top_k_cases 3 --max_queries -1 \
   --output_dir $ART/models/ceah_grod_soft/ch5/faithfulness
 ```
 

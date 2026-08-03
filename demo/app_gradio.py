@@ -206,7 +206,7 @@ def build_ui():
                                             label="abstain_thresh")
                     sld_display = gr.Slider(0.1, 0.9, value=DISPLAY_DEFAULT, step=0.01,
                                             label="display_thresh")
-                    sld_topk = gr.Slider(5, 50, value=20, step=1, label="top_k_cases")
+                    sld_topk = gr.Slider(1, 50, value=3, step=1, label="top_k_cases")
                     sld_topn = gr.Slider(1, MAX_TOPN_BUTTONS, value=5, step=1, label="top_n_causes")
                 btn_run = gr.Button("Run", variant="primary")
             with gr.Column(scale=2):
